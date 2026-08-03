@@ -59,11 +59,22 @@ dynamic frame-to-frame and this is not an artifact of one facing an easier bar.
 ~4,000 steps (+0.407) and *degrades* to +0.178 by 16,000 as it memorises its
 hour. 10h is still improving at 16,000 and is the best model here.
 
-**Do not read the inverse-dynamics AUC as a scaling signal.** The 1h→10h
-difference does not survive its bootstrap interval, and a replicate of the 5h
-run at identical seed and config differed by 0.015–0.018 AUC — the same size as
-the between-condition differences. Single-seed AUC comparisons at this scale are
-noise.
+**The inverse-dynamics AUC is not a useful metric at all.** Measured
+2026-08-03 during the full run: a *randomly initialised* model scores **0.6488**
+on held-out data — higher than the best trained model here (0.6419). A random
+ViT's features already let a linear probe recover buttons at that level, so the
+number reflects random-feature capacity rather than learned dynamics. That is
+why it sat at 0.63–0.66 across every condition in the table above: it was never
+separating them. Two earlier reasons to distrust it still hold (the 1h→10h
+difference does not survive its bootstrap interval, and a same-seed replicate
+differed by 0.015–0.018) but this supersedes both. Ignore the column.
+
+**`identity` is the diagnostic that matters, and it has a known scale.**
+Random init gives identity ≈ 0.0004 — consecutive frames map to nearly the same
+latent, a static representation with nothing to predict. A well-trained model
+reaches ≈ 0.09. Watching identity climb is how you tell an encoder is learning
+to represent motion; `skill` cannot go positive until it does, because
+copy-last-frame is unbeatable while the latent barely moves.
 
 ## Throughput (`bench_speed.txt`)
 
