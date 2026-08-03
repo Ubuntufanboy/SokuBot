@@ -138,3 +138,93 @@ def probe_model(
 ) -> ProbeResult:
     z, y, names = encode_episodes(model, episodes, cfg, **kwargs)
     return ridge_probe(z, y, names=names)
+
+
+# ---------------------------------------------------------------------------
+# Inverse dynamics -- the probe to use when there is no simulator state.
+# ---------------------------------------------------------------------------
+def _auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    """Rank-based (Mann-Whitney) AUC. 0.5 is chance; nan if one class is absent."""
+    pos = labels > 0.5
+    n_pos, n_neg = int(pos.sum()), int((~pos).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    order = np.argsort(scores, kind="mergesort")
+    ranks = np.empty(len(scores), dtype=np.float64)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    # average ranks over ties, else ties bias the statistic
+    s_sorted = scores[order]
+    i = 0
+    while i < len(s_sorted):
+        j = i
+        while j + 1 < len(s_sorted) and s_sorted[j + 1] == s_sorted[i]:
+            j += 1
+        if j > i:
+            ranks[order[i : j + 1]] = (i + j + 2) / 2.0
+        i = j + 1
+    return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
+
+@dataclass
+class InverseDynamicsResult:
+    auc: Dict[str, float]
+    auc_mean: float
+    base_rate: Dict[str, float]
+    n_train: int
+    n_test: int
+
+    def __str__(self) -> str:
+        return f"inverse-dynamics AUC {self.auc_mean:.3f} (n={self.n_test})"
+
+
+def inverse_dynamics_probe(
+    z_t: np.ndarray,
+    z_next: np.ndarray,
+    actions: np.ndarray,
+    names: Optional[Sequence[str]] = None,
+    train_frac: float = 0.8,
+    alpha: float = 1e-2,
+    seed: int = 0,
+) -> InverseDynamicsResult:
+    """Can a linear map read the action out of a pair of consecutive latents?
+
+    This is the probe for Soku, where there is no simulator state to regress
+    onto. If `(z_t, z_{t+1})` does not determine the buttons pressed between
+    them, the latent is not carrying dynamics -- and a world model whose latent
+    does not encode what the action did cannot support planning, because
+    planning is exactly the inverse question.
+
+    z_t, z_next: [N, D] latents. actions: [N, A] in {0, 1}.
+    Scored by AUC per button, which unlike accuracy is not fooled by buttons
+    that are pressed 3% of the time.
+    """
+    if not (len(z_t) == len(z_next) == len(actions)):
+        raise ValueError("z_t, z_next and actions must have the same length")
+    x = np.concatenate([z_t, z_next, z_next - z_t], axis=1)
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(x))
+    n_tr = int(len(x) * train_frac)
+    tr, te = perm[:n_tr], perm[n_tr:]
+
+    mu, sd = x[tr].mean(0), x[tr].std(0) + 1e-8
+    Xtr = np.concatenate([(x[tr] - mu) / sd, np.ones((len(tr), 1))], axis=1)
+    Xte = np.concatenate([(x[te] - mu) / sd, np.ones((len(te), 1))], axis=1)
+    Ytr = actions[tr]
+
+    reg = alpha * np.eye(Xtr.shape[1])
+    reg[-1, -1] = 0.0
+    W = np.linalg.solve(Xtr.T @ Xtr + reg, Xtr.T @ Ytr)
+    pred = Xte @ W
+
+    names = list(names) if names is not None else [f"a{i}" for i in range(actions.shape[1])]
+    auc = {n: _auc(pred[:, i], actions[te][:, i]) for i, n in enumerate(names)}
+    base = {n: float(actions[:, i].mean()) for i, n in enumerate(names)}
+    vals = [v for v in auc.values() if np.isfinite(v)]
+    return InverseDynamicsResult(
+        auc=auc,
+        auc_mean=float(np.mean(vals)) if vals else float("nan"),
+        base_rate=base,
+        n_train=len(tr),
+        n_test=len(te),
+    )
