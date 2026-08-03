@@ -24,6 +24,7 @@ Metrics per eval, all on the same cached val windows the model never trains on:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import time
 from pathlib import Path
@@ -112,7 +113,17 @@ def main() -> None:
     curve, t0 = [], time.time()
 
     def on_eval(m, step, hist):
-        ev = evaluate(m, cache, cfg)
+        # Evaluate a copy with BatchNorm statistics re-estimated against the
+        # current weights. With a long cosine schedule the learning rate stays
+        # near maximum for tens of thousands of steps, and the running stats lag
+        # far enough behind that held-out loss becomes meaningless -- this run
+        # reported val 1.1431 at step 30k while training loss was 0.058. The
+        # copy keeps training's own running stats untouched.
+        from scripts.eval_ckpt import recalibrate_bn
+        probe_model = copy.deepcopy(m)
+        recalibrate_bn(probe_model, cache)
+        ev = evaluate(probe_model, cache, cfg)
+        del probe_model
         ev["step"] = step
         tail = hist[-20:] if hist else []
         ev["train_pred"] = float(np.mean([h["l_pred"] for h in tail])) if tail else float("nan")
