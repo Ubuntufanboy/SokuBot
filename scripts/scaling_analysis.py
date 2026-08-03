@@ -80,7 +80,9 @@ def main() -> None:
         b = bl.get(r["hours"])
         if b:
             r["identity"] = b["identity"]
-            r["skill"] = b["skill_vs_identity"]
+            # scripts.baselines calls it skill_vs_identity, scripts.final_eval
+            # calls it skill; accept either so the analysis runs against both.
+            r["skill"] = b.get("skill", b.get("skill_vs_identity"))
 
     has_skill = all("skill" in r for r in rows)
     header = (f"{'hours':>7} {'caps':>5} {'train':>8} {'val':>8} {'gap':>8} "
