@@ -325,7 +325,30 @@ def combo_size(t: HudTrace, who: int) -> np.ndarray:
 
 
 def spellcard_events(t: HudTrace, who: int, min_gap: int = 45):
-    """Windows where `who` had a spell card active, with cost and outcome.
+    """DO NOT USE. Card-stock dimming does not detect spell cards.
+
+    Reviewed against footage: of 49 detections, **zero** were real casts. The
+    premise -- that casting consumes every lit card so the stock collapses -- is
+    documented and true, but the stock also dims in states that are far more
+    common, so the signal is swamped. Requiring a lit-to-dark transition removed
+    the round-intro false positives and still left 0 true positives.
+
+    THE APPROACH THAT SHOULD WORK, from a player who tracks this by eye:
+    the spell card's *name* appears under the casting player's health bar and
+    **rises at a constant speed** from just above the card slots to just below
+    the win indicator -- left-aligned for P1, right-aligned for P2. Colour alone
+    is a trap, because a red character flying through that region matches it;
+    the linear rise rate is what makes it near-perfect.
+
+    Confirmed by inspection: in replay 5278716 around frame 5300, P2's card
+    "Midnight King 'Dracula Cradle'" is rendered right-aligned at y~72-78, under
+    the health bar. Two things still to establish before implementing:
+      * the rise happens *before* frame 5300 -- the text is already settled
+        there, so the search window has to start earlier;
+      * that instance renders light/white with a dark outline rather than red,
+        so the colour may vary by card or character. Sample several casts and
+        find what is actually invariant.
+    """
 
     Casting consumes every lit card at once, so the stock collapses; the slots
     stay dim for a while after the card ends, so the window overruns and the
