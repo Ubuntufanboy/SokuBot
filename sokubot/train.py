@@ -36,13 +36,33 @@ def set_seed(seed: int) -> None:
 
 
 def effective_rank(z: torch.Tensor) -> float:
-    """Entropy-based effective rank of the latent covariance -- the collapse monitor.
+    """Entropy-based effective rank of the latent covariance.
 
-    A healthy latent uses most of its dimensions; a collapsing one concentrates
-    variance in a few. This is a diagnostic and must never be able to crash
-    training, hence float64 on CPU, diagonal jitter, and a bare except:
-    eigvalsh can fail to converge on an ill-conditioned covariance during a
-    transient loss spike, which is precisely when the number is most wanted.
+    DO NOT USE THIS TO DETECT COLLAPSE. It is logged because it is cheap and
+    occasionally suggestive, but measured on this codebase it is actively
+    misleading in both directions:
+
+        lambda    R^2 (probe)  latent_var   eff_rank
+        0.0            0.097       0.000      59.47   <- fully collapsed
+        0.03           0.092       0.000      45.18   <- fully collapsed
+        0.1            0.242       0.935       3.45   <- best
+        1.0            0.179       0.952      12.27   <- over-regularised
+
+    A collapsed latent scores *near the maximum*. Once the projector's output is
+    constant, BatchNorm divides it by ~zero and what survives is float noise --
+    which is isotropic, so its covariance spectrum is flat and its entropy is
+    high. Meanwhile the best model reads 3.45, because PushT genuinely has about
+    five degrees of freedom and a good encoder finds them; above that, rank
+    climbs with lambda as SIGReg pushes toward isotropy. The number tracks
+    lambda, not quality.
+
+    `latent_var` is the reliable cheap signal (0 means collapsed), and
+    `probe.py` is the real measure. See README.
+
+    This is a diagnostic and must never be able to crash training, hence float64
+    on CPU, diagonal jitter, and a bare except: eigvalsh can fail to converge on
+    an ill-conditioned covariance during a transient loss spike, which is
+    exactly when the number is most wanted.
     """
     try:
         with torch.autocast(device_type=z.device.type, enabled=False):

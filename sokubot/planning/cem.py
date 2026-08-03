@@ -31,6 +31,24 @@ from ..model.world_model import LeWorldModel
 CostWeights = Literal["final", "uniform", "linear"]
 
 
+def require_eval(model: LeWorldModel) -> None:
+    """Planning in train mode is silently wrong, so refuse it.
+
+    Both projectors end in a BatchNorm. In train mode it normalises by the
+    statistics of whatever batch it is handed -- and during planning that batch
+    is the candidate action sequences. Every candidate's cost would then depend
+    on the other candidates sampled alongside it, the ranking would shift with
+    the sample, and CEM would be optimising a moving target. The failure is
+    quiet: the planner still returns plausible-looking actions.
+    """
+    if model.training:
+        raise RuntimeError(
+            "planning requires model.eval(): BatchNorm would otherwise normalise "
+            "each rollout by the statistics of the candidate batch, making a "
+            "candidate's cost depend on the others sampled with it"
+        )
+
+
 def cost_weights(horizon: int, mode: CostWeights, device, dtype) -> torch.Tensor:
     """alpha_k in AdaJEPA Eq. 3.
 
@@ -79,6 +97,7 @@ class CEMPlanner:
         a_hist: Optional[torch.Tensor] = None,   # [H-1, ticks, action_dim]
     ) -> torch.Tensor:
         """Returns the optimised action chunk sequence, [P, ticks, action_dim]."""
+        require_eval(self.model)
         cfg = self.cfg
         if z_ctx.dim() == 2:
             z_ctx = z_ctx.unsqueeze(0)
@@ -144,6 +163,7 @@ class GDPlanner:
         z_goal: torch.Tensor,
         a_hist: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        require_eval(self.model)
         cfg = self.cfg
         if z_ctx.dim() == 2:
             z_ctx = z_ctx.unsqueeze(0)
@@ -158,12 +178,25 @@ class GDPlanner:
         # Detach the context: we optimise actions, not the encoder's output.
         ctx = z_ctx.detach()
         goal = z_goal.detach()
-        for _ in range(self.steps):
-            opt.zero_grad(set_to_none=True)
-            act = torch.sigmoid(a) if cfg.action_space == "binary" else torch.tanh(a)
-            cost = rollout_cost(self.model, ctx, act, goal, w, hist).sum()
-            cost.backward()
-            opt.step()
+
+        # backward() through the world model would otherwise accumulate into
+        # every model parameter. Left there, the next optimiser step -- training
+        # resumed, or AdaJEPA's adaptation step -- would apply planning
+        # gradients as if they were a learning signal. Freeze for the duration
+        # and restore exactly what was frozen before.
+        saved = [(p, p.requires_grad) for p in self.model.parameters()]
+        for p, _ in saved:
+            p.requires_grad_(False)
+        try:
+            for _ in range(self.steps):
+                opt.zero_grad(set_to_none=True)
+                act = torch.sigmoid(a) if cfg.action_space == "binary" else torch.tanh(a)
+                cost = rollout_cost(self.model, ctx, act, goal, w, hist).sum()
+                cost.backward()
+                opt.step()
+        finally:
+            for p, flag in saved:
+                p.requires_grad_(flag)
 
         with torch.no_grad():
             act = torch.sigmoid(a) if cfg.action_space == "binary" else torch.tanh(a)

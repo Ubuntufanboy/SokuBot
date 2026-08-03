@@ -123,11 +123,40 @@ the empirical characteristic function is identically 1, and
 `d/dz cos(t*z)|_0 = 0`, so SIGReg's gradient vanishes. It can prevent collapse
 but never undo it. `Config.sigreg_scale_n` defaults to `True`.
 
-**2. Effective rank is not a collapse test; the probe is.** Effective rank falls
-both when the encoder collapses *and* when it correctly discovers that PushT has
-about five degrees of freedom. `probe.py` fits a linear map from the frozen
-latent to ground-truth simulator state and reports held-out R² — a collapsed
-latent scores ~0 there, unambiguously. This is LeWM's own evaluation (Tab. 1).
+**2. Effective rank does not detect collapse — it reports the opposite.**
+Sweeping λ on PushT (`scripts/sweep_lambda.py`, 150 steps, probe-scored):
+
+| λ | probe R² | `L_pred` | latent var | eff. rank | |
+|---|---|---|---|---|---|
+| 0.0   | 0.097 | 0.0001 | 0.000 | **59.5** | collapsed |
+| 0.003 | 0.112 | 0.0001 | 0.000 | 59.0 | collapsed |
+| 0.01  | 0.090 | 0.0001 | 0.000 | 57.5 | collapsed |
+| 0.03  | 0.092 | 0.0001 | 0.000 | 45.2 | collapsed |
+| **0.1** | **0.242** | 0.250 | 0.935 | **3.5** | **healthy** |
+| 0.3   | 0.235 | 0.368 | 0.964 | 6.8 | over-regularised |
+| 1.0   | 0.179 | 0.620 | 0.952 | 12.3 | over-regularised |
+
+The collapsed models score *near the maximum* effective rank. Once the
+projector's output is constant, BatchNorm divides it by ~zero and what remains
+is float noise — isotropic, so a flat covariance spectrum and high entropy. The
+best model scores 3.5, because PushT really does have about five degrees of
+freedom, and effective rank then climbs monotonically with λ as SIGReg pushes
+the latent toward isotropy at the cost of predictive structure. The metric
+tracks λ, not quality.
+
+Use `latent_var` as the cheap signal (0 means collapsed) and `probe.py` as the
+real one: a linear map from the frozen latent to ground-truth simulator state,
+scored by held-out R². This is LeWM's own evaluation (Tab. 1), and it is the
+only column above that ranks the models correctly.
+
+λ = 0.1 — the paper's value — is a true interior optimum here: below it the
+latent collapses outright, above it prediction degrades smoothly. That two-sided
+result is also what confirms the sample-size scaling above is not simply
+inflating the regulariser; if it were, larger λ would have compensated.
+
+Reproduce with `python -m scripts.sweep_lambda --data-root data/pusht-smoke`.
+The random-init baseline is stochastic (R² 0.036–0.101 across runs) because it
+measures random features; compare against the baseline from the same run.
 
 ## Soku specifics
 

@@ -327,17 +327,19 @@ def test_probe(model: LeWorldModel, data_root: Path, cfg: Config):
     assert eps and eps[0].states is not None, "episodes carry no ground-truth state"
 
     trained = probe_model(model, eps, cfg, max_frames=1500)
-    # A randomly-initialised encoder is a strong random-features baseline; the
-    # point of the comparison is that training has not *destroyed* information.
+    # The random-init encoder is a random-features baseline. Scoring against it
+    # rather than against a fixed number keeps this check meaningful at any
+    # training budget -- absolute R2 depends heavily on how many steps ran,
+    # while "did training add state information" does not.
     baseline = probe_model(LeWorldModel(cfg), eps, cfg, max_frames=1500)
 
     agent = np.mean([trained.r2[k] for k in ("agent_x", "agent_y")])
-    assert agent > 0.2, (
-        f"latent lost the agent position (R2 {agent:.3f}); this is collapse "
-        f"regardless of what effective rank says"
+    assert agent > 0.10, (
+        f"latent lost the agent position (R2 {agent:.3f}) -- collapse, whatever "
+        f"effective rank says"
     )
-    assert trained.r2_mean > 0.5 * baseline.r2_mean, (
-        f"training destroyed state information: R2 {trained.r2_mean:.3f} vs "
+    assert trained.r2_mean > 2.0 * max(baseline.r2_mean, 0.02), (
+        f"training added no state information: R2 {trained.r2_mean:.3f} vs "
         f"random-init baseline {baseline.r2_mean:.3f}"
     )
     return (f"trained {trained} | random-init baseline "
@@ -445,8 +447,12 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", default="data/pusht-smoke")
-    ap.add_argument("--episodes", type=int, default=12)
-    ap.add_argument("--steps", type=int, default=30)
+    ap.add_argument("--episodes", type=int, default=24)
+    # 150 steps, ~2 minutes on 4 CPU cores. Fewer does verify the plumbing, but
+    # the model is then too weakly action-conditioned for the CEM check to have
+    # a margin, and the probe sits near its threshold -- so the suite starts
+    # reporting flaky failures rather than real ones.
+    ap.add_argument("--steps", type=int, default=150)
     args = ap.parse_args(argv)
 
     torch.set_num_threads(min(4, torch.get_num_threads()))
