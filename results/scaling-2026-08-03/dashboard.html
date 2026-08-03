@@ -1,0 +1,338 @@
+<title>SokuBot — 200-hour world model training</title>
+<style>
+:root{
+  --ink:#16131F; --paper:#F6F3F8; --bg:var(--paper); --fg:#211C2E;
+  --panel:#FFFFFF; --rule:#DDD7E4; --muted:#6E6780; --faint:#8B8496;
+  --gold:#B0821F; --sage:#3F7D63; --rose:#B33D53; --grid:#E7E2EE;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:var(--ink); --fg:#EAE5F2; --panel:#1E1A2A; --rule:#312A42; --muted:#9F98B2;
+  --faint:#7E7791; --gold:#D9A441; --sage:#6FA98D; --rose:#C4576B; --grid:#292235;
+}}
+:root[data-theme="dark"]{
+  --bg:var(--ink); --fg:#EAE5F2; --panel:#1E1A2A; --rule:#312A42; --muted:#9F98B2;
+  --faint:#7E7791; --gold:#D9A441; --sage:#6FA98D; --rose:#C4576B; --grid:#292235;
+}
+:root[data-theme="light"]{
+  --bg:var(--paper); --fg:#211C2E; --panel:#FFFFFF; --rule:#DDD7E4; --muted:#6E6780;
+  --faint:#8B8496; --gold:#B0821F; --sage:#3F7D63; --rose:#B33D53; --grid:#E7E2EE;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.mono{font-family:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace}
+.wrap{max-width:1080px;margin:0 auto;padding:48px 24px 96px}
+.eyebrow{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:11px;
+  letter-spacing:.22em;text-transform:uppercase;color:var(--faint)}
+h1{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-weight:700;
+  font-size:clamp(26px,4.4vw,44px);letter-spacing:-.01em;line-height:1.1;
+  margin:10px 0 8px;text-wrap:balance}
+h2{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px;font-weight:700;
+  letter-spacing:.18em;text-transform:uppercase;color:var(--gold);margin:0 0 4px}
+.sub{color:var(--muted);max-width:66ch;margin:0}
+.rule{height:1px;background:var(--rule);margin:36px 0}
+.panel{background:var(--panel);border:1px solid var(--rule);padding:22px 22px 18px;
+  margin-top:20px}
+.finding{color:var(--muted);font-size:14.5px;margin:2px 0 16px;max-width:74ch}
+.grid{display:grid;gap:20px}
+@media(min-width:760px){.g3{grid-template-columns:repeat(3,1fr)}
+  .g4{grid-template-columns:repeat(4,1fr)}}
+.stat{background:var(--panel);border:1px solid var(--rule);padding:16px 18px}
+.stat .k{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--faint)}
+.stat .v{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;
+  font-size:26px;font-weight:700;margin-top:6px;letter-spacing:-.02em}
+.stat .n{font-size:13px;color:var(--muted);margin-top:2px}
+.hero{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-end;
+  background:var(--panel);border:1px solid var(--rule);padding:26px}
+.big{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums;
+  font-size:clamp(52px,10vw,88px);font-weight:700;line-height:.92;color:var(--sage);
+  letter-spacing:-.03em}
+.meter{flex:1 1 300px;min-width:260px}
+.bar{height:15px;background:var(--grid);border:1px solid var(--rule);position:relative;
+  overflow:hidden}
+.bar i{position:absolute;inset:0 auto 0 0;background:var(--sage);display:block}
+.bar u{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--gold)}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);
+  margin-top:9px}
+.key{display:inline-flex;align-items:center;gap:7px}
+.key s{width:14px;height:3px;display:block;text-decoration:none}
+figure{margin:0}
+svg{display:block;width:100%;height:auto;overflow:visible}
+.tbl{width:100%;border-collapse:collapse;font-family:ui-monospace,Menlo,monospace;
+  font-size:13px;font-variant-numeric:tabular-nums}
+.tbl th{text-align:right;font-size:10.5px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--faint);font-weight:600;padding:0 0 8px;border-bottom:1px solid var(--rule)}
+.tbl th:first-child,.tbl td:first-child{text-align:left}
+.tbl td{padding:7px 0;border-bottom:1px solid var(--rule);text-align:right}
+.tbl tr:last-child td{border-bottom:0}
+.pill{display:inline-block;font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
+  padding:2px 7px;border:1px solid currentColor}
+.ok{color:var(--sage)} .bad{color:var(--rose)} .go{color:var(--gold)}
+.scroll{overflow-x:auto}
+footer{color:var(--faint);font-size:13px;margin-top:44px;border-top:1px solid var(--rule);
+  padding-top:18px}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">Touhou 12.3 Hisoutensoku &middot; LeWorldModel + AdaJEPA &middot; 2026-08-03</p>
+  <h1>A 15.6M-parameter world model,<br>trained on 200 hours of replays</h1>
+  <p class="sub">Held-out results from a 320,000-step run on one RTX 5090. The metric is
+  <strong>skill</strong> &mdash; the fraction of the copy-last-frame baseline's error the model
+  removes. Zero means the predictor learned nothing beyond &ldquo;the next frame looks like this
+  one&rdquo;; one would be perfect.</p>
+
+  <div class="rule"></div>
+
+  <div class="hero">
+    <div>
+      <p class="eyebrow" style="margin:0 0 8px">Best held-out skill</p>
+      <div class="big" id="bigSkill">+0.864</div>
+    </div>
+    <div class="meter">
+      <div class="bar"><i id="barFill"></i><u id="barRef"></u></div>
+      <div class="legend">
+        <span class="key"><s style="background:var(--sage)"></s> this run, step 225,000</span>
+        <span class="key"><s style="background:var(--gold)"></s> previous best (10&nbsp;h data) +0.520</span>
+      </div>
+      <p class="finding" style="margin-top:12px">86% of the trivial predictor's error removed &mdash;
+      a 66% improvement over the best model from the data-scaling study, which saw 10 hours.</p>
+    </div>
+  </div>
+
+  <div class="grid g4" style="margin-top:20px">
+    <div class="stat"><div class="k">Corpus</div><div class="v">202.6 h</div>
+      <div class="n">4,135 replays, 132 GB</div></div>
+    <div class="stat"><div class="k">Parameters</div><div class="v">15.6 M</div>
+      <div class="n">5.54M encoder / 9.94M predictor</div></div>
+    <div class="stat"><div class="k">Step time</div><div class="v">67.8 ms</div>
+      <div class="n">3.74&times; faster than first build</div></div>
+    <div class="stat"><div class="k">Failures</div><div class="v">0.27%</div>
+      <div class="n">11 of 4,135 captures</div></div>
+  </div>
+
+  <div class="rule"></div>
+
+  <section class="panel">
+    <h2>01 &nbsp;&mdash;&nbsp; Learning rate decided everything</h2>
+    <p class="finding">Two runs, same data, same architecture, same seed. The first used the
+    learning rate tuned on short runs (5&times;10<sup>&minus;4</sup>) and diverged at step 75,000:
+    a 320k-step cosine schedule leaves the model near peak LR far longer than the 16k-step runs it
+    was tuned on. Halving it to 2&times;10<sup>&minus;4</sup> fixed it outright.</p>
+    <figure><svg id="chartSkill" viewBox="0 0 900 340" role="img"
+      aria-label="Held-out skill against training step for both runs"></svg></figure>
+    <div class="legend">
+      <span class="key"><s style="background:var(--sage)"></s> lr 2e-4 &mdash; completed</span>
+      <span class="key"><s style="background:var(--rose)"></s> lr 5e-4 &mdash; diverged</span>
+      <span class="key"><s style="background:var(--gold)"></s> previous best (+0.520)</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>02 &nbsp;&mdash;&nbsp; Why skill alone can lie</h2>
+    <p class="finding">Skill is a ratio, so an exploding latent inflates both of its terms. During
+    the divergence it <em>rose</em> from +0.35 to +0.69 while absolute prediction error got six
+    times worse. The tell is <span class="mono">identity</span>: BatchNorm pins every latent
+    dimension to unit variance, so two uncorrelated latents can differ by at most about 2.0. The
+    failed run reached 7.68 &mdash; structurally impossible, and proof the normalisation had
+    collapsed.</p>
+    <figure><svg id="chartMech" viewBox="0 0 900 320" role="img"
+      aria-label="Prediction error and identity baseline over training"></svg></figure>
+    <div class="legend">
+      <span class="key"><s style="background:var(--sage)"></s> val prediction error</span>
+      <span class="key"><s style="background:var(--gold)"></s> identity baseline (the bar to beat)</span>
+      <span class="key"><s style="background:var(--rose)"></s> latent variance, failed run</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>03 &nbsp;&mdash;&nbsp; Data is the constraint, not compute</h2>
+    <p class="finding">At a fixed 4,000 steps more data looks worthless &mdash; and at 10 hours it
+    collapses, because the model sees under one epoch. Give both 16,000 steps and the picture
+    inverts: 10 hours reaches +0.497 while 1 hour <em>degrades</em> to +0.178, having spent the
+    extra compute memorising. That result is what justified collecting 200 hours.</p>
+    <div class="scroll"><figure><svg id="chartScale" viewBox="0 0 900 300" role="img"
+      aria-label="Skill by dataset size at two compute budgets"></svg></figure></div>
+    <div class="legend">
+      <span class="key"><s style="background:var(--faint)"></s> 4,000 steps</span>
+      <span class="key"><s style="background:var(--sage)"></s> 16,000 steps</span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>04 &nbsp;&mdash;&nbsp; Throughput</h2>
+    <p class="finding">Three changes mattered. Sending frames to the GPU as uint8 instead of
+    float32 cut PCIe traffic per batch from 308&nbsp;MB to 77&nbsp;MB and is bit-identical. Gating
+    the training diagnostics removed a GPU synchronisation on every step. The rest was
+    <span class="mono">torch.compile</span>. TF32, fused AdamW and batched SIGReg each measured as
+    no-ops here.</p>
+    <div class="scroll"><figure><svg id="chartPerf" viewBox="0 0 900 250" role="img"
+      aria-label="Milliseconds per training step across optimisations"></svg></figure></div>
+  </section>
+
+  <section class="panel">
+    <h2>05 &nbsp;&mdash;&nbsp; Run detail</h2>
+    <div class="scroll"><table class="tbl" id="tbl">
+      <thead><tr><th>Step</th><th>Epochs</th><th>Train</th><th>Val</th>
+        <th>Identity</th><th>Skill</th><th>Latent var</th></tr></thead>
+      <tbody></tbody></table></div>
+  </section>
+
+  <footer>
+    <p>Every figure is held out: 64 replays / 3.04 hours, split by capture so no two windows from
+    the same match straddle the split. Evaluation recalibrates BatchNorm statistics first &mdash;
+    without it, a model mid-schedule is scored against statistics describing itself several hundred
+    steps earlier, which produced a reported validation loss of 1.14 while training loss sat at
+    0.058.</p>
+  </footer>
+</div>
+
+<script>
+const D = {"good": [{"s": 5000, "sk": 0.1975, "v": 0.02866, "id": 0.03571, "var": 0.999, "tr": 0.03388}, {"s": 10000, "sk": 0.3541, "v": 0.02156, "id": 0.03337, "var": 1.0, "tr": 0.02328}, {"s": 15000, "sk": 0.4577, "v": 0.01648, "id": 0.03038, "var": 1.0, "tr": 0.01944}, {"s": 20000, "sk": 0.52, "v": 0.01517, "id": 0.0316, "var": 1.0, "tr": 0.01669}, {"s": 25000, "sk": 0.6136, "v": 0.01441, "id": 0.0373, "var": 1.0, "tr": 0.01557}, {"s": 30000, "sk": 0.6973, "v": 0.01257, "id": 0.04152, "var": 1.0, "tr": 0.01396}, {"s": 35000, "sk": 0.7215, "v": 0.01229, "id": 0.04414, "var": 1.0, "tr": 0.01255}, {"s": 40000, "sk": 0.7503, "v": 0.01116, "id": 0.04472, "var": 1.0, "tr": 0.01224}, {"s": 45000, "sk": 0.7781, "v": 0.01049, "id": 0.04728, "var": 1.0, "tr": 0.01147}, {"s": 50000, "sk": 0.7762, "v": 0.01052, "id": 0.04701, "var": 1.0, "tr": 0.01133}, {"s": 55000, "sk": 0.797, "v": 0.00958, "id": 0.04719, "var": 1.0, "tr": 0.00962}, {"s": 60000, "sk": 0.7922, "v": 0.00975, "id": 0.04693, "var": 1.0, "tr": 0.01047}, {"s": 65000, "sk": 0.7949, "v": 0.00973, "id": 0.04744, "var": 1.0, "tr": 0.00923}, {"s": 70000, "sk": 0.8117, "v": 0.00877, "id": 0.04657, "var": 1.0, "tr": 0.01041}, {"s": 75000, "sk": 0.8181, "v": 0.00835, "id": 0.04591, "var": 1.0, "tr": 0.01009}, {"s": 80000, "sk": 0.816, "v": 0.0085, "id": 0.04621, "var": 1.0, "tr": 0.01027}, {"s": 85000, "sk": 0.8243, "v": 0.00806, "id": 0.04586, "var": 1.0, "tr": 0.00946}, {"s": 90000, "sk": 0.8232, "v": 0.00806, "id": 0.04559, "var": 1.0, "tr": 0.00937}, {"s": 95000, "sk": 0.8227, "v": 0.00795, "id": 0.04481, "var": 1.0, "tr": 0.00861}, {"s": 100000, "sk": 0.8287, "v": 0.0077, "id": 0.04495, "var": 1.0, "tr": 0.00889}, {"s": 105000, "sk": 0.8258, "v": 0.00768, "id": 0.04409, "var": 1.0, "tr": 0.00963}, {"s": 110000, "sk": 0.8273, "v": 0.00747, "id": 0.04327, "var": 1.0, "tr": 0.00899}, {"s": 115000, "sk": 0.8344, "v": 0.00721, "id": 0.04352, "var": 1.0, "tr": 0.0076}, {"s": 120000, "sk": 0.8356, "v": 0.00729, "id": 0.04436, "var": 1.0, "tr": 0.0083}, {"s": 125000, "sk": 0.8359, "v": 0.00711, "id": 0.04332, "var": 1.0, "tr": 0.00843}, {"s": 130000, "sk": 0.8395, "v": 0.00682, "id": 0.04249, "var": 1.0, "tr": 0.00871}, {"s": 135000, "sk": 0.8441, "v": 0.00686, "id": 0.04401, "var": 1.0, "tr": 0.00849}, {"s": 140000, "sk": 0.8442, "v": 0.00665, "id": 0.04267, "var": 1.0, "tr": 0.00809}, {"s": 145000, "sk": 0.8387, "v": 0.00702, "id": 0.04353, "var": 1.0, "tr": 0.00807}, {"s": 150000, "sk": 0.8409, "v": 0.00684, "id": 0.04296, "var": 1.0, "tr": 0.00794}, {"s": 155000, "sk": 0.8392, "v": 0.00684, "id": 0.04255, "var": 1.0, "tr": 0.00762}, {"s": 160000, "sk": 0.8566, "v": 0.00615, "id": 0.04289, "var": 1.0, "tr": 0.00763}, {"s": 165000, "sk": 0.8402, "v": 0.00672, "id": 0.04204, "var": 1.0, "tr": 0.00671}, {"s": 170000, "sk": 0.8425, "v": 0.00666, "id": 0.0423, "var": 1.0, "tr": 0.00754}, {"s": 175000, "sk": 0.8515, "v": 0.00626, "id": 0.04214, "var": 1.0, "tr": 0.00729}, {"s": 180000, "sk": 0.8496, "v": 0.0063, "id": 0.04186, "var": 1.0, "tr": 0.00694}, {"s": 185000, "sk": 0.8567, "v": 0.00604, "id": 0.04214, "var": 1.0, "tr": 0.00738}, {"s": 190000, "sk": 0.8405, "v": 0.00673, "id": 0.04218, "var": 1.0, "tr": 0.007}, {"s": 195000, "sk": 0.8587, "v": 0.00594, "id": 0.04202, "var": 1.0, "tr": 0.00685}, {"s": 200000, "sk": 0.8565, "v": 0.00604, "id": 0.04206, "var": 1.0, "tr": 0.00725}, {"s": 205000, "sk": 0.8575, "v": 0.00598, "id": 0.04199, "var": 1.0, "tr": 0.00667}, {"s": 210000, "sk": 0.8605, "v": 0.0058, "id": 0.04157, "var": 1.0, "tr": 0.00659}, {"s": 215000, "sk": 0.8617, "v": 0.00568, "id": 0.04109, "var": 1.0, "tr": 0.00662}, {"s": 220000, "sk": 0.8581, "v": 0.00584, "id": 0.04118, "var": 1.0, "tr": 0.0061}, {"s": 225000, "sk": 0.8642, "v": 0.00549, "id": 0.04041, "var": 1.0, "tr": 0.00594}, {"s": 230000, "sk": 0.8583, "v": 0.00594, "id": 0.04195, "var": 1.0, "tr": 0.00768}, {"s": 235000, "sk": 0.858, "v": 0.00591, "id": 0.0416, "var": 1.0, "tr": 0.00849}, {"s": 240000, "sk": 0.8564, "v": 0.00592, "id": 0.04125, "var": 1.0, "tr": 0.0086}, {"s": 245000, "sk": 0.8596, "v": 0.00585, "id": 0.04168, "var": 1.0, "tr": 0.0091}, {"s": 250000, "sk": 0.8596, "v": 0.00569, "id": 0.04051, "var": 1.0, "tr": 0.00875}, {"s": 255000, "sk": 0.8411, "v": 0.00649, "id": 0.04082, "var": 1.0, "tr": 0.00992}, {"s": 260000, "sk": 0.8543, "v": 0.00593, "id": 0.0407, "var": 1.0, "tr": 0.0092}, {"s": 265000, "sk": 0.8614, "v": 0.00559, "id": 0.04037, "var": 1.0, "tr": 0.00991}, {"s": 270000, "sk": 0.8569, "v": 0.00593, "id": 0.0414, "var": 1.0, "tr": 0.01014}, {"s": 275000, "sk": 0.8527, "v": 0.00617, "id": 0.04188, "var": 1.0, "tr": 0.01122}, {"s": 280000, "sk": 0.8614, "v": 0.00582, "id": 0.04194, "var": 1.0, "tr": 0.01108}, {"s": 285000, "sk": 0.8536, "v": 0.00622, "id": 0.04247, "var": 1.0, "tr": 0.01276}, {"s": 290000, "sk": 0.8569, "v": 0.00598, "id": 0.04182, "var": 1.0, "tr": 0.01177}, {"s": 295000, "sk": 0.8577, "v": 0.0059, "id": 0.04143, "var": 1.0, "tr": 0.01344}], "bad": [{"s": 5000, "sk": -0.0689, "v": 0.02732, "id": 0.02556, "var": 1.0, "tr": 0.03095}, {"s": 10000, "sk": -0.0409, "v": 0.03217, "id": 0.03091, "var": 1.0, "tr": 0.0265}, {"s": 15000, "sk": -0.4087, "v": 0.03334, "id": 0.02367, "var": 1.0, "tr": 0.02796}, {"s": 20000, "sk": -0.0243, "v": 0.02479, "id": 0.02421, "var": 1.0, "tr": 0.02537}, {"s": 25000, "sk": -0.862, "v": 0.12679, "id": 0.06809, "var": 1.0, "tr": 0.03442}, {"s": 30000, "sk": -19.3209, "v": 1.1431, "id": 0.05625, "var": 1.0, "tr": 0.05005}, {"s": 35000, "sk": -0.6479, "v": 0.07871, "id": 0.04776, "var": 1.0, "tr": 0.05775}, {"s": 40000, "sk": 0.0609, "v": 0.0243, "id": 0.02587, "var": 1.0, "tr": 0.02397}, {"s": 45000, "sk": 0.0976, "v": 0.02146, "id": 0.02378, "var": 1.0, "tr": 0.02539}, {"s": 50000, "sk": 0.212, "v": 0.05041, "id": 0.06398, "var": 1.0, "tr": 0.08511}, {"s": 55000, "sk": -0.0218, "v": 0.06543, "id": 0.06403, "var": 1.0, "tr": 0.03929}, {"s": 60000, "sk": 0.0869, "v": 0.03248, "id": 0.03557, "var": 1.0, "tr": 0.02924}, {"s": 65000, "sk": -0.5503, "v": 0.08363, "id": 0.05395, "var": 1.0, "tr": 0.03798}, {"s": 70000, "sk": -10.2297, "v": 1.97995, "id": 0.17631, "var": 1.0, "tr": 0.07205}, {"s": 75000, "sk": -45.9585, "v": 19.52933, "id": 0.41589, "var": 1.0, "tr": 0.17813}, {"s": 80000, "sk": -44.8579, "v": 33.24472, "id": 0.72495, "var": 0.829, "tr": 0.62551}, {"s": 85000, "sk": -43.8313, "v": 344.09729, "id": 7.67537, "var": 0.699, "tr": 0.55291}, {"s": 90000, "sk": -96.7407, "v": 90.49945, "id": 0.92591, "var": 0.751, "tr": 0.55785}], "best": {"val_pred": 0.0054875066944892635, "identity": 0.040409508882358086, "skill": 0.8642025887900611, "inv_dyn_auc": 0.7346661411592884, "n": 1719, "step": 225000, "train_pred": 0.005944902100600303, "latent_var": 1.0, "elapsed_h": 4.4275297851032684, "eta_h": 1.86940146482138, "diverged": false}, "scaling": [{"h": 1, "steps": 4000, "skill": 0.4072399569011357, "ident": 0.0721193965940971}, {"h": 2, "steps": 4000, "skill": 0.44040428354639605, "ident": 0.07747343201860926}, {"h": 5, "steps": 4000, "skill": 0.4379490884200308, "ident": 0.07522490039110108}, {"h": 10, "steps": 4000, "skill": 0.11247858734641447, "ident": 0.06641237496793158}, {"h": 1, "steps": 16000, "skill": 0.17772314757197527, "ident": 0.08496666766481918}, {"h": 10, "steps": 16000, "skill": 0.4964990744401505, "ident": 0.08478513615122342}], "throughput": [{"label": "original (fp32 loader, per-step metrics)", "ms": 253.7}, {"label": "uint8 frames to GPU (bit-identical)", "ms": 141.4}, {"label": "+ metrics every 50 steps", "ms": 93.6}, {"label": "+ TF32 / fused AdamW / batched SIGReg", "ms": 93.1}, {"label": "+ torch.compile", "ms": 72.1}, {"label": "+ max-autotune", "ms": 67.8}]};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const SVGNS = "http://www.w3.org/2000/svg";
+function el(t, a){const e=document.createElementNS(SVGNS,t);
+  for(const k in a) e.setAttribute(k,a[k]); return e;}
+function txt(x,y,s,o={}){const t=el("text",Object.assign({x,y,
+  "font-family":'ui-monospace,Menlo,monospace',"font-size":o.size||11,
+  fill:o.fill||css("--faint"),"text-anchor":o.anchor||"start"},o.attr||{}));
+  t.textContent=s; return t;}
+
+function axes(svg,P,W,H,xs,ys,xfmt,yfmt){
+  ys.forEach(v=>{const y=P.y(v);
+    svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:y,y2:y,stroke:css("--grid"),"stroke-width":1}));
+    svg.appendChild(txt(P.l-9,y+4,yfmt(v),{anchor:"end"}));});
+  xs.forEach(v=>{const x=P.x(v);
+    svg.appendChild(txt(x,H-P.b+18,xfmt(v),{anchor:"middle"}));});
+  svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:H-P.b,y2:H-P.b,
+    stroke:css("--rule"),"stroke-width":1}));
+}
+function line(svg,pts,color,w){
+  if(!pts.length) return;
+  const d = pts.map((p,i)=>(i?"L":"M")+p[0].toFixed(1)+" "+p[1].toFixed(1)).join(" ");
+  svg.appendChild(el("path",{d,fill:"none",stroke:color,"stroke-width":w||2.2,
+    "stroke-linejoin":"round","stroke-linecap":"round"}));
+}
+
+function drawSkill(){
+  const svg=document.getElementById("chartSkill"); svg.textContent="";
+  const W=900,H=340,P={l:52,r:16,t:14,b:34};
+  const maxS=320000, lo=-1.0, hi=1.0;
+  P.x=v=>P.l+(v/maxS)*(W-P.l-P.r);
+  P.y=v=>P.t+(1-(v-lo)/(hi-lo))*(H-P.t-P.b);
+  axes(svg,P,W,H,[0,80000,160000,240000,320000],[-1,-0.5,0,0.5,1],
+    v=>v?(v/1000)+"k":"0", v=>v.toFixed(1));
+  // zero line
+  svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:P.y(0),y2:P.y(0),
+    stroke:css("--rule"),"stroke-width":1,"stroke-dasharray":"3 3"}));
+  // reference
+  svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:P.y(0.520),y2:P.y(0.520),
+    stroke:css("--gold"),"stroke-width":1.5,"stroke-dasharray":"6 4"}));
+  svg.appendChild(txt(W-P.r,P.y(0.520)-7,"previous best +0.520",
+    {anchor:"end",fill:css("--gold")}));
+  const clamp=v=>Math.max(lo,Math.min(hi,v));
+  line(svg,D.bad.map(r=>[P.x(r.s),P.y(clamp(r.sk))]),css("--rose"),2.2);
+  line(svg,D.good.map(r=>[P.x(r.s),P.y(clamp(r.sk))]),css("--sage"),2.6);
+  const b=D.good.reduce((a,c)=>c.sk>a.sk?c:a);
+  svg.appendChild(el("circle",{cx:P.x(b.s),cy:P.y(b.sk),r:4.5,fill:css("--sage")}));
+  svg.appendChild(txt(P.x(b.s)-8,P.y(b.sk)-12,"+"+b.sk.toFixed(3),
+    {anchor:"end",fill:css("--sage"),size:12,attr:{"font-weight":"700"}}));
+  const d=D.bad[D.bad.length-1];
+  svg.appendChild(txt(P.x(d.s)+8,P.y(clamp(d.sk))+4,"diverged \u2014 latent scale broke",
+    {fill:css("--rose")}));
+  svg.appendChild(txt(P.l,H-4,"training step",{fill:css("--faint")}));
+}
+
+function drawMech(){
+  const svg=document.getElementById("chartMech"); svg.textContent="";
+  const W=900,H=320,P={l:52,r:16,t:14,b:34};
+  const maxS=320000, hi=0.09;
+  P.x=v=>P.l+(v/maxS)*(W-P.l-P.r);
+  P.y=v=>P.t+(1-v/hi)*(H-P.t-P.b);
+  axes(svg,P,W,H,[0,80000,160000,240000,320000],[0,0.03,0.06,0.09],
+    v=>v?(v/1000)+"k":"0", v=>v.toFixed(2));
+  line(svg,D.good.map(r=>[P.x(r.s),P.y(Math.min(hi,r.id))]),css("--gold"),2.4);
+  line(svg,D.good.map(r=>[P.x(r.s),P.y(Math.min(hi,r.v))]),css("--sage"),2.4);
+  // failed run latent variance, on a 0-1 scale mapped into the same box
+  line(svg,D.bad.map(r=>[P.x(r.s),P.y(hi*r.var)]),css("--rose"),1.8);
+  svg.appendChild(txt(P.x(300000),P.y(0.046)-9,"identity \u2014 the bar",
+    {anchor:"end",fill:css("--gold")}));
+  svg.appendChild(txt(P.x(300000),P.y(0.0058)-9,"val error",
+    {anchor:"end",fill:css("--sage")}));
+  svg.appendChild(txt(P.x(92000)+8,P.y(hi*0.75),"latent variance collapsing",
+    {fill:css("--rose")}));
+  svg.appendChild(txt(P.l,H-4,"training step",{fill:css("--faint")}));
+}
+
+function drawScale(){
+  const svg=document.getElementById("chartScale"); svg.textContent="";
+  const W=900,H=300,P={l:52,r:16,t:16,b:52};
+  const hours=[1,2,5,10], lo=0, hi=0.9;
+  const bw=(W-P.l-P.r)/hours.length;
+  P.y=v=>P.t+(1-(v-lo)/(hi-lo))*(H-P.t-P.b);
+  [0,0.3,0.6,0.9].forEach(v=>{const y=P.y(v);
+    svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:y,y2:y,stroke:css("--grid")}));
+    svg.appendChild(txt(P.l-9,y+4,v.toFixed(1),{anchor:"end"}));});
+  hours.forEach((h,i)=>{
+    const x0=P.l+i*bw, cx=x0+bw/2;
+    const a=D.scaling.find(r=>r.h===h&&r.steps===4000);
+    const b=D.scaling.find(r=>r.h===h&&r.steps===16000);
+    const mk=(rec,off,col)=>{
+      if(!rec) return;
+      const y=P.y(Math.max(0,rec.skill)), base=P.y(0);
+      svg.appendChild(el("rect",{x:cx+off-26,y:Math.min(y,base),width:52,
+        height:Math.abs(base-y),fill:col,opacity:.92}));
+      svg.appendChild(txt(cx+off,Math.min(y,base)-7,
+        (rec.skill>=0?"+":"")+rec.skill.toFixed(2),
+        {anchor:"middle",fill:col,size:12,attr:{"font-weight":"700"}}));};
+    mk(a,b?-29:0,css("--faint"));
+    mk(b,29,css("--sage"));
+    svg.appendChild(txt(cx,H-P.b+20,h+" h",{anchor:"middle",size:12,fill:css("--fg")}));
+  });
+  svg.appendChild(el("line",{x1:P.l,x2:W-P.r,y1:P.y(0),y2:P.y(0),stroke:css("--rule")}));
+  svg.appendChild(txt(P.l,H-8,"training data (footage-hours)",{fill:css("--faint")}));
+}
+
+function drawPerf(){
+  const svg=document.getElementById("chartPerf"); svg.textContent="";
+  const W=900,H=250,P={l:300,r:56,t:10,b:24};
+  const rows=D.throughput, max=260, rh=(H-P.t-P.b)/rows.length;
+  rows.forEach((r,i)=>{
+    const y=P.t+i*rh, w=(r.ms/max)*(W-P.l-P.r);
+    const col = i===0?css("--rose"):(i>=4?css("--sage"):css("--faint"));
+    svg.appendChild(el("rect",{x:P.l,y:y+5,width:w,height:rh-12,fill:col,opacity:.9}));
+    svg.appendChild(txt(P.l-10,y+rh/2+4,r.label,{anchor:"end",size:11.5,fill:css("--fg")}));
+    svg.appendChild(txt(P.l+w+8,y+rh/2+4,r.ms.toFixed(1)+" ms",
+      {size:12,fill:col,attr:{"font-weight":"700"}}));
+  });
+}
+
+function fillTable(){
+  const tb=document.querySelector("#tbl tbody"); tb.textContent="";
+  const pick=D.good.filter((r,i)=>i%6===0||r===D.good[D.good.length-1]);
+  const best=D.good.reduce((a,c)=>c.sk>a.sk?c:a);
+  pick.forEach(r=>{
+    const tr=document.createElement("tr");
+    const cells=[r.s.toLocaleString(),(r.s*128/10777320).toFixed(2),
+      r.tr.toFixed(4),r.v.toFixed(4),r.id.toFixed(4),
+      (r.sk>=0?"+":"")+r.sk.toFixed(4),r.var.toFixed(3)];
+    cells.forEach((c,i)=>{const td=document.createElement("td");td.textContent=c;
+      if(i===5&&r.s===best.s){td.style.color=css("--sage");td.style.fontWeight="700";}
+      tr.appendChild(td);});
+    tb.appendChild(tr);
+  });
+}
+
+function draw(){
+  const b=D.good.reduce((a,c)=>c.sk>a.sk?c:a);
+  document.getElementById("bigSkill").textContent="+"+b.sk.toFixed(3);
+  document.getElementById("barFill").style.width=(b.sk*100).toFixed(1)+"%";
+  document.getElementById("barRef").style.left="52%";
+  drawSkill(); drawMech(); drawScale(); drawPerf(); fillTable();
+}
+draw();
+matchMedia("(prefers-color-scheme:dark)").addEventListener("change",draw);
+new MutationObserver(draw).observe(document.documentElement,
+  {attributes:true,attributeFilter:["data-theme"]});
+</script>
