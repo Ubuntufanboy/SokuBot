@@ -1,0 +1,14 @@
+# Core -- everything the model, losses, training loop and planner need.
+torch>=2.4
+numpy>=1.24
+
+# PushT smoke-test environment.
+#
+# pymunk must stay below 7: gym_pusht 0.1.6 calls Space.add_collision_handler,
+# which pymunk 7 removed in favour of Space.on_collision. With pymunk 7 the
+# environment raises AttributeError on the first reset().
+gymnasium>=1.0
+gym_pusht>=0.1.6
+pymunk>=6.6,<7
+
+# Soku dataset loader shells out to ffmpeg/ffprobe; no Python binding needed.

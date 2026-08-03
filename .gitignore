@@ -1,0 +1,26 @@
+# virtualenv
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# data + artefacts -- never commit these.
+# Anchored with a leading slash: a bare `data/` also matches `sokubot/data/`,
+# which is source code.
+/data/
+/datasets/
+/checkpoints/
+/runs/
+*.npz
+*.mp4
+*.rep
+*.pt
+*.ckpt
+
+# scratch
+*.log
+.DS_Store
