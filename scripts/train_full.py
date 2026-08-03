@@ -87,11 +87,15 @@ def main() -> None:
     ap.add_argument("--log", type=Path, default=Path("/root/train_log.json"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--lr", type=float, default=2e-4,
+                    help="peak LR. The 5e-4 tuned on 16k-step runs diverged at "
+                         "75k of a 320k-step schedule -- see module docstring.")
+    ap.add_argument("--warmup", type=int, default=5_000)
     args = ap.parse_args()
 
     cfg = Config.soku(device=args.device, batch_size=args.batch_size,
                       num_workers=args.num_workers, total_steps=args.steps,
-                      warmup_steps=2_000, seed=args.seed)
+                      warmup_steps=args.warmup, lr=args.lr, seed=args.seed)
     cache = torch.load(args.corpus / "val.pt", map_location="cpu", weights_only=False)
     print(f"val cache: {cache['obs'].shape[0]} windows", flush=True)
 
@@ -131,8 +135,33 @@ def main() -> None:
         el = time.time() - t0
         ev["elapsed_h"] = el / 3600
         ev["eta_h"] = (el / max(step, 1)) * (args.steps - step) / 3600
+        # Divergence guard. BatchNorm pins each latent dimension to unit
+        # variance, so two *uncorrelated* latents can differ by at most ~2.0 in
+        # mean-squared terms. identity above that is structurally impossible and
+        # means the normalisation has broken down -- pre-BN variance has fallen
+        # to the order of eps, so BatchNorm has stopped normalising and started
+        # amplifying. The first run hit identity 7.68 at step 85k.
+        #
+        # This has to be checked explicitly because `skill` does not catch it:
+        # skill is a ratio, and an exploding latent inflates numerator and
+        # denominator together. During that divergence skill *rose* from +0.35
+        # to +0.69 while absolute prediction error got 6x worse.
+        ev["diverged"] = bool(ev["identity"] > 2.0 or ev["latent_var"] < 0.85)
+        if ev["diverged"]:
+            print(f"  *** DIVERGENCE at step {step}: identity {ev['identity']:.3f} "
+                  f"(max ~2.0), latent_var {ev['latent_var']:.3f} (want ~1.0) ***",
+                  flush=True)
         curve.append(ev)
         args.log.write_text(json.dumps(curve, indent=2))
+
+        # Keep the best model, not just the most recent. The first run
+        # overwrote one file every 5k steps, so when it diverged at 75k the
+        # healthy step-65k model was already gone.
+        healthy = [c for c in curve if not c["diverged"]]
+        if healthy and ev is healthy[-1] and ev["skill"] >= max(c["skill"] for c in healthy):
+            torch.save({"model": m.state_dict(), "cfg": cfg, "step": step,
+                        "eval": ev}, Path(args.ckpt_dir) / "best.pt")
+            print(f"  saved best.pt (skill {ev['skill']:+.4f} at step {step})", flush=True)
         print(f"  [eval] step {step:6d} | train {ev['train_pred']:.4f} "
               f"| val {ev['val_pred']:.4f} | identity {ev['identity']:.4f} "
               f"| skill {ev['skill']:+.4f} | AUC {ev['inv_dyn_auc']:.4f} "
