@@ -1,0 +1,11 @@
+baseline (uint8 loader only)          93.6 ms  10.68 st/s     1368 win/s  12.0 GB
++ metrics every 50 steps              93.9 ms  10.65 st/s     1364 win/s  12.0 GB  (1.00x cumulative)
++ TF32 / cudnn.benchmark              93.5 ms  10.69 st/s     1369 win/s  12.0 GB  (1.00x cumulative)
++ fused AdamW                         93.1 ms  10.74 st/s     1375 win/s  12.0 GB  (1.01x cumulative)
++ batched SIGReg                      93.1 ms  10.74 st/s     1374 win/s  12.0 GB  (1.00x cumulative)
++ torch.compile                       72.1 ms  13.88 st/s     1776 win/s  12.0 GB  (1.30x cumulative)
++ torch.compile max-autotune          67.8 ms  14.74 st/s     1887 win/s  12.4 GB  (1.38x cumulative)
+batch 128                             67.9 ms  14.73 st/s     1885 win/s  11.8 GB
+batch 192                            102.6 ms   9.75 st/s     1872 win/s  17.8 GB
+batch 256                          OOM
+batch 384                          FAILED: AssertionError: 
