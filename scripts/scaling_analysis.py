@@ -60,23 +60,44 @@ def fit_power_law(D: np.ndarray, L: np.ndarray):
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--results", default="runs/scaling.json")
+    ap.add_argument("--baselines", default="runs/baselines.json",
+                    help="output of scripts.baselines; adds the identity-skill column")
     ap.add_argument("--targets", default="20,50,100,200",
                     help="footage-hours to extrapolate to")
     args = ap.parse_args()
 
     rows = json.loads(Path(args.results).read_text())
     rows.sort(key=lambda r: r["hours"])
-    D = np.array([r["hours"] for r in rows], dtype=float)
-    L = np.array([r["val_pred"] for r in rows], dtype=float)
-    T = np.array([r["train_pred"] for r in rows], dtype=float)
-    AUC = np.array([r["inv_dyn_auc"] for r in rows], dtype=float)
 
-    print(f"{'hours':>7} {'caps':>5} {'train':>8} {'val':>8} {'gap':>8} "
-          f"{'corr':>8} {'invdyn':>8}")
+    # Merge in the trivial-predictor baselines. Raw val_pred and correlation
+    # both look excellent on 15 Hz video for a model that has learned nothing
+    # but pass-through, so `skill` is the column to read.
+    bl = {}
+    bp = Path(args.baselines)
+    if bp.exists():
+        bl = {b["hours"]: b for b in json.loads(bp.read_text())}
     for r in rows:
-        print(f"{r['hours']:7.0f} {r['captures']:5d} {r['train_pred']:8.4f} "
-              f"{r['val_pred']:8.4f} {r['val_pred'] - r['train_pred']:+8.4f} "
-              f"{r['val_corr']:+8.4f} {r['inv_dyn_auc']:8.4f}")
+        b = bl.get(r["hours"])
+        if b:
+            r["identity"] = b["identity"]
+            r["skill"] = b["skill_vs_identity"]
+
+    has_skill = all("skill" in r for r in rows)
+    header = (f"{'hours':>7} {'caps':>5} {'train':>8} {'val':>8} {'gap':>8} "
+              f"{'corr':>8} {'invdyn':>8}")
+    if has_skill:
+        header += f" {'identity':>9} {'skill':>8}"
+    print(header)
+    for r in rows:
+        line = (f"{r['hours']:7.0f} {r['captures']:5d} {r['train_pred']:8.4f} "
+                f"{r['val_pred']:8.4f} {r['val_pred'] - r['train_pred']:+8.4f} "
+                f"{r['val_corr']:+8.4f} {r['inv_dyn_auc']:8.4f}")
+        if has_skill:
+            line += f" {r['identity']:9.4f} {r['skill']:+8.4f}"
+        print(line)
+    if not has_skill:
+        print("\n  (no baselines.json -- run scripts.baselines first; without it")
+        print("   val_pred cannot be told apart from a pass-through predictor)")
 
     if len(rows) < 3:
         print("\nneed at least 3 sizes to fit a scaling law")
@@ -110,6 +131,23 @@ def main() -> None:
               f"({(AUC[-1] - 0.5) / max(AUC[0] - 0.5, 1e-9):.2f}x the margin over chance)")
     gap = L - T
     print(f"generalisation gap: {gap[0]:+.4f} at {D[0]:.0f}h -> {gap[-1]:+.4f} at {D[-1]:.0f}h")
+
+    if has_skill:
+        S = np.array([r["skill"] for r in rows], dtype=float)
+        print(f"skill over identity: {S[0]:+.4f} at {D[0]:.0f}h "
+              f"-> {S[-1]:+.4f} at {D[-1]:.0f}h")
+        # Fit the *skill gap* (1 - skill), the fraction of the pass-through
+        # error still unexplained. This is the scaling curve that is not
+        # inflated by how similar consecutive video frames happen to be.
+        gap_skill = 1.0 - S
+        if np.all(gap_skill > 0) and len(S) >= 3:
+            fs = fit_power_law(D, gap_skill)
+            print(f"fit  (1-skill)(D) = {fs['L_inf']:.4f} + {fs['A']:.4f} * "
+                  f"D^-{fs['alpha']:.3f}   (R2 {fs['r2']:.4f})")
+            print(f"\n{'hours':>8} {'predicted skill':>17}")
+            for t in [float(x) for x in args.targets.split(",")]:
+                g = fs["L_inf"] + fs["A"] * t ** (-fs["alpha"])
+                print(f"{t:8.0f} {1 - g:17.4f}")
 
 
 if __name__ == "__main__":
