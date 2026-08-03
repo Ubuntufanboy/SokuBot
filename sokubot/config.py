@@ -141,19 +141,34 @@ class Config:
     # Paying that per step costs more than the diagnostics are worth; 0 means
     # every step, which is only useful when debugging a specific run.
     metrics_every: int = 50
-    # TF32 matmuls/convs on Ampere+. Under bf16 autocast most matmuls are
-    # already reduced precision, so this mainly affects the fp32 residue.
+    # Measured on an RTX 5090, batch 128, 10h Soku corpus (scripts/bench_speed):
+    #
+    #   per-step metrics        141.4 ms
+    #   metrics every 50         93.6 ms   1.51x   <- the big one
+    #   + TF32/cudnn.benchmark   93.5 ms   1.00x
+    #   + fused AdamW            93.1 ms   1.01x
+    #   + batched SIGReg         93.1 ms   1.00x
+    #   + torch.compile          72.1 ms   1.30x
+    #   + compile max-autotune   67.8 ms   1.38x   <- and this one
+    #
+    # Only metrics gating and compile matter. Batch 192 was also measured and
+    # gives no throughput gain over 128 (1872 vs 1885 windows/s) at 1.5x the
+    # memory, so the model is at its compute roofline and a larger batch buys
+    # only recompiles.
+
+    # No measurable effect under bf16 autocast, which has already demoted the
+    # matmuls. Left on because it is free.
     tf32: bool = True
-    # torch.compile the model. Costs ~1-2 min of graph capture on the first
-    # steps and recompiles when a shape changes (e.g. the eval batch size).
-    compile: bool = False
-    compile_mode: str = "default"      # "default" | "max-autotune"
-    # Fused AdamW: one kernel for the whole parameter update instead of a
-    # foreach loop. Pure win on CUDA.
+    # 1.38x. Costs graph capture plus autotuning on the first steps, and
+    # recompiles on any shape change -- keep evaluation on the uncompiled module
+    # or it will recompile for the eval batch size every time.
+    compile: bool = True
+    compile_mode: str = "max-autotune"   # "default" is 72.1 ms vs 67.8 ms
+    # 1.01x. Free, so on.
     fused_optimizer: bool = True
-    # Compute SIGReg for all timesteps in one batched call rather than looping.
-    # Same statistic, T times fewer kernel launches, T times the peak memory.
-    sigreg_batched: bool = True
+    # No gain (SIGReg's launch overhead is noise at this size) and T times the
+    # peak memory, so off. The looped form remains correct and cheaper.
+    sigreg_batched: bool = False
     amp_dtype: str = "bf16"       # "bf16" | "fp16" | "fp32"
 
     # ---------------- planning (LeWM App. D / AdaJEPA Sec. 4.1) ----------------
@@ -259,6 +274,9 @@ class Config:
             # sync it costs is irrelevant at this size and skipping it leaves
             # a 150-step run with four recorded points.
             metrics_every=0,
+            # Compiling a 1M-parameter model for a 150-step test costs far more
+            # than it saves, and the smoke test runs on CPU.
+            compile=False,
             # SIGReg is a *distributional* test applied per timestep, so its
             # sample size is the batch, not batch x time. 8 embeddings in 96
             # dimensions carry almost no distributional signal; 32 is the
