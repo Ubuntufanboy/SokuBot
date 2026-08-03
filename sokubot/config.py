@@ -126,6 +126,13 @@ class Config:
     grad_clip: float = 1.0
     batch_size: int = 128
     num_workers: int = 0
+    # Ship frames to the GPU as uint8 and do the /255 there. Pure throughput --
+    # the arithmetic is identical, see data/window.frames_to_chw.
+    loader_uint8: bool = True
+    # Batches each worker keeps queued. The default of 2 leaves the GPU waiting
+    # whenever a worker hits a slow capture (a new ffmpeg process, a seek); more
+    # queued batches absorb that jitter at the cost of host RAM.
+    prefetch_factor: int = 6
     amp_dtype: str = "bf16"       # "bf16" | "fp16" | "fp32"
 
     # ---------------- planning (LeWM App. D / AdaJEPA Sec. 4.1) ----------------

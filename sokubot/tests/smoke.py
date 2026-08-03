@@ -267,7 +267,11 @@ def test_soku_loader():
             f"bad action shape {tuple(s['actions'].shape)}"
 
         # Decimation: decision frame k is source frame k*skip -> grey 4*k*skip.
-        means = [float(s["obs"][k].mean() * 255) for k in range(cfg.seq_len)]
+        # obs is uint8 when cfg.loader_uint8, float in [0,1] otherwise.
+        o = s["obs"].float()
+        if s["obs"].dtype != torch.uint8:
+            o = o * 255.0
+        means = [float(o[k].mean()) for k in range(cfg.seq_len)]
         want = [4 * k * cfg.frame_skip for k in range(cfg.seq_len)]
         err = max(abs(a - b) for a, b in zip(means, want))
         assert err < 8, f"frame decimation drifted: got {means}, expected {want}"

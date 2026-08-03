@@ -264,7 +264,7 @@ class SokuWindowDataset(IterableDataset):
                 for k in range(T)
             ])                                     # [T, skip, 20]
             yield {
-                "obs": frames_to_chw(np.stack(frame_buf)),
+                "obs": frames_to_chw(np.stack(frame_buf), as_uint8=cfg.loader_uint8),
                 "actions": torch.from_numpy(chunks).float(),
             }
 

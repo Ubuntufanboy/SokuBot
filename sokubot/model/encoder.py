@@ -53,6 +53,14 @@ class ViTEncoder(nn.Module):
         projector's BatchNorm sees batch *and* time in the same statistics,
         matching LeWM's Alg. 3 (``emb = encoder(obs)`` over the full sequence).
         """
+        # Accept raw uint8 frames and normalise here, on whatever device the
+        # tensor is already on. The loader ships uint8 to keep PCIe traffic and
+        # worker CPU down (see cfg.loader_uint8), and putting the single
+        # conversion at the model boundary means no call site -- training,
+        # evaluation, probing, planning -- has to know which dtype it holds.
+        if x.dtype == torch.uint8:
+            x = x.float().div_(255.0)
+
         lead = x.shape[:-3]
         flat = x.reshape(-1, *x.shape[-3:])
 

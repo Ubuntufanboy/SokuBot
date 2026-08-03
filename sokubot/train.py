@@ -108,6 +108,8 @@ def compute_losses(
     model: LeWorldModel, batch: Dict, cfg: Config
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     device = next(model.parameters()).device
+    # obs may arrive as uint8 (cfg.loader_uint8); the encoder normalises it on
+    # device, so nothing here needs to know which.
     obs = batch["obs"].to(device, non_blocking=True)          # [B, T, 3, S, S]
     actions = batch["actions"].to(device, non_blocking=True)  # [B, T, ticks, A]
 
@@ -130,14 +132,18 @@ def compute_losses(
 
 def make_loader(dataset: Dataset, cfg: Config) -> DataLoader:
     iterable = isinstance(dataset, IterableDataset)
+    kw = {}
+    if cfg.num_workers > 0:
+        kw["persistent_workers"] = True
+        kw["prefetch_factor"] = cfg.prefetch_factor
     return DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         shuffle=not iterable,
         drop_last=True,
         num_workers=cfg.num_workers,
-        persistent_workers=cfg.num_workers > 0,
-        pin_memory=(cfg.device.startswith("cuda")),
+        pin_memory=cfg.device.startswith("cuda"),
+        **kw,
     )
 
 

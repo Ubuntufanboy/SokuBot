@@ -24,10 +24,23 @@ from ..config import Config
 from .episode import Episode
 
 
-def frames_to_chw(frames: np.ndarray) -> torch.Tensor:
-    """uint8 [N, H, W, 3] -> float32 [N, 3, H, W] in [0, 1]."""
-    t = torch.from_numpy(np.ascontiguousarray(frames)).float().div_(255.0)
-    return t.permute(0, 3, 1, 2).contiguous()
+def frames_to_chw(frames: np.ndarray, as_uint8: bool = False) -> torch.Tensor:
+    """uint8 [N, H, W, 3] -> [N, 3, H, W], float32 in [0, 1] or raw uint8.
+
+    ``as_uint8=True`` keeps the tensor in its original dtype and defers the
+    ``/255`` to the GPU. That is worth doing on the hot path: converting here
+    inflates the tensor 4x *inside the DataLoader worker*, so the worker pays for
+    a float cast and a second full-size copy for ``contiguous()``, and then 4x
+    the bytes cross PCIe. For a batch of 128 four-frame windows at 224x224 that
+    is 308 MB per step instead of 77 MB.
+
+    The result is bit-identical either way -- dividing an exactly representable
+    0..255 integer by 255 is a correctly-rounded IEEE single-precision operation
+    on both host and device -- so this changes speed and nothing else.
+    """
+    t = torch.from_numpy(np.ascontiguousarray(frames))
+    t = t.permute(0, 3, 1, 2).contiguous()
+    return t if as_uint8 else t.float().div_(255.0)
 
 
 class EpisodeWindowDataset(Dataset):
@@ -73,6 +86,7 @@ class EpisodeWindowDataset(Dataset):
         ep = self._episode(ei)
         T = self.cfg.seq_len
         return {
-            "obs": frames_to_chw(ep.frames[s : s + T]),                 # [T,3,S,S]
+            "obs": frames_to_chw(ep.frames[s : s + T],
+                                 as_uint8=self.cfg.loader_uint8),       # [T,3,S,S]
             "actions": torch.from_numpy(ep.actions[s : s + T]).float(), # [T,ticks,A]
         }

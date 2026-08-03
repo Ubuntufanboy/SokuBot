@@ -42,7 +42,11 @@ def main() -> None:
 
     obs, acts, n = [], [], 0
     for sample in ds:
-        obs.append((sample["obs"] * 255.0).round().to(torch.uint8))
+        o = sample["obs"]
+        # The loader may already hand back uint8 (cfg.loader_uint8); only scale
+        # when it is float, or the cache would be built from 255x overflow.
+        obs.append(o if o.dtype == torch.uint8
+                   else (o * 255.0).round().to(torch.uint8))
         acts.append(sample["actions"].to(torch.uint8))
         n += 1
         if n >= args.windows:
