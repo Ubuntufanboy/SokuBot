@@ -150,7 +150,19 @@ def train(
     ckpt_every: int = 1000,
     model: Optional[LeWorldModel] = None,
     verbose: bool = True,
+    callback=None,
+    callback_every: int = 0,
 ):
+    """Train `model` on `dataset` for `steps` optimiser steps.
+
+    `callback(model, step, history)` runs every `callback_every` steps and at the
+    end. Use it for periodic evaluation rather than calling this function in
+    chunks: a fresh call rebuilds the optimiser (discarding Adam's moments) and
+    restarts `step` at 0, which restarts the warmup and the cosine decay. Chunked
+    training therefore does not produce the same model as one continuous run, and
+    the difference is not small -- it is a sawtooth learning rate with periodic
+    loss of momentum.
+    """
     set_seed(cfg.seed)
     device = torch.device(cfg.device)
     steps = steps or cfg.total_steps
@@ -208,6 +220,8 @@ def train(
 
         if ckpt_dir and ckpt_every and step > 0 and step % ckpt_every == 0:
             save_checkpoint(model, cfg, ckpt_dir, step)
+        if callback and callback_every and (step + 1) % callback_every == 0:
+            callback(model, step + 1, history)
         if verbose and (step % log_every == 0 or step == steps - 1):
             print(
                 f"step {step:6d} | loss {metrics['loss']:8.4f} "

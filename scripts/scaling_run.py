@@ -134,22 +134,29 @@ def main() -> None:
 
         ds = build_soku_dataset(cfg, [str(root)], shuffle_buffer=1024, seed=args.seed)
 
+        # Evaluate through a callback inside one continuous run. Calling train()
+        # in chunks would rebuild the optimiser and restart the LR schedule at
+        # every eval point, turning the schedule into a sawtooth and throwing
+        # away Adam's moments each time.
         curve = []
         t0 = time.time()
-        done = 0
-        while done < args.steps:
-            chunk = min(args.eval_every, args.steps - done)
-            model, hist = train(cfg, ds, steps=chunk, model=model,
-                                log_every=max(1, chunk // 2), verbose=True)
-            done += chunk
-            ev = evaluate(model, cache, cfg)
-            ev["step"] = done
+
+        def on_eval(m, step, hist):
+            ev = evaluate(m, cache, cfg)
+            ev["step"] = step
             ev["train_pred"] = float(np.mean([h["l_pred"] for h in hist[-50:]]))
             ev["latent_var"] = float(np.mean([h["latent_var"] for h in hist[-50:]]))
             curve.append(ev)
-            print(f"  [{tag}] step {done:5d} | train_pred {ev['train_pred']:.4f} "
+            print(f"  [{tag}] step {step:5d} | train_pred {ev['train_pred']:.4f} "
                   f"| val_pred {ev['val_pred']:.4f} | corr {ev['val_corr']:+.4f} "
-                  f"| invdyn AUC {ev['inv_dyn_auc']:.4f} | var {ev['latent_var']:.3f}")
+                  f"| invdyn AUC {ev['inv_dyn_auc']:.4f} | var {ev['latent_var']:.3f}",
+                  flush=True)
+
+        model, hist = train(cfg, ds, steps=args.steps, model=model,
+                            log_every=max(50, args.steps // 20), verbose=True,
+                            callback=on_eval, callback_every=args.eval_every)
+        if not curve:
+            on_eval(model, args.steps, hist)
 
         final = curve[-1]
         results.append({
