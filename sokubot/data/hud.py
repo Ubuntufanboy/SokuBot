@@ -347,7 +347,13 @@ def spellcard_events(t: HudTrace, who: int, min_gap: int = 45):
         j = i
         while j < n and active[j]:
             j += 1
-        if j - i >= min_gap:
+        # A cast is a transition from lit to dark. Requiring the stock to have
+        # been lit just before rejects round intros, where the cards are not
+        # drawn at all and the strip is dark from the start -- that alone
+        # accounted for most of the 90 false events across six replays.
+        pre = cards[max(0, i - 40):i]
+        was_lit = len(pre) > 0 and pre.max() > 0.5 * base
+        if j - i >= min_gap and was_lit:
             # trim the trailing dim tail: end where the stock resumes climbing
             k = j
             while k > i + 1 and cards[k - 1] <= cards[min(n - 1, k)] * 0.9:
