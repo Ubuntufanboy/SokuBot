@@ -254,6 +254,11 @@ class Config:
             act_hidden=64,
             sigreg_dirs=128,
             sigreg_points=33,
+            # Dense diagnostics. This preset exists for the smoke test and for
+            # debugging, where the training history is the output; the per-step
+            # sync it costs is irrelevant at this size and skipping it leaves
+            # a 150-step run with four recorded points.
+            metrics_every=0,
             # SIGReg is a *distributional* test applied per timestep, so its
             # sample size is the batch, not batch x time. 8 embeddings in 96
             # dimensions carry almost no distributional signal; 32 is the

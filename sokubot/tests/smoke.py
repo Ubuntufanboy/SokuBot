@@ -306,7 +306,11 @@ def test_learns(data_root: Path, steps: int = 30):
     ds = EpisodeWindowDataset(cfg, data_root)
     model, hist = train(cfg, ds, steps=steps, log_every=max(1, steps // 3), verbose=True)
 
-    n = max(3, steps // 5)
+    # Metrics may be recorded sparsely (cfg.metrics_every), so the window has to
+    # be sized from the history rather than the step count -- otherwise the two
+    # slices overlap and the check silently compares a set of rows to itself.
+    n = max(1, min(steps // 5, len(hist) // 3))
+    assert len(hist) >= 3, f"only {len(hist)} metric points recorded; cannot judge a trend"
     first = float(np.mean([h["l_pred"] for h in hist[:n]]))
     last = float(np.mean([h["l_pred"] for h in hist[-n:]]))
     rank = float(np.mean([h["eff_rank"] for h in hist[-n:]]))

@@ -38,11 +38,20 @@ def bench(cfg: Config, data_root: str, steps: int = 50, warmup: int = 15,
     loader = make_loader(ds, cfg)
     it = iter(loader)
 
+    # `i` mirrors the real loop's step counter so metrics fire on the same
+    # cadence training would use. Hardcoding want_metrics=False here made the
+    # metrics_every row identical to the baseline and hid the single largest
+    # lever -- the benchmark has to run the step the trainer actually runs.
+    state = {"i": 0}
+
     def one():
         b = next(it)
+        i = state["i"]
+        state["i"] = i + 1
+        want = cfg.metrics_every <= 0 or i % cfg.metrics_every == 0
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            total, _ = compute_losses(step_model, b, cfg, want_metrics=False)
+            total, _ = compute_losses(step_model, b, cfg, want_metrics=want)
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
