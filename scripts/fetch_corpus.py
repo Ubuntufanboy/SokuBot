@@ -62,6 +62,9 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--cache", type=Path, default=Path("/root/hf_cache"))
     ap.add_argument("--min-free-gb", type=float, default=15.0)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="fetch at most N shards; 0 = all. For rehearsing the "
+                         "fetch on a machine that cannot hold the corpus.")
     args = ap.parse_args()
 
     from huggingface_hub import HfApi
@@ -77,6 +80,8 @@ def main() -> int:
     if not work:
         print("no shards found", file=sys.stderr)
         return 1
+    if args.limit:
+        work = work[: args.limit]
     print(f"{len(work)} shards across {len(args.repos)} repos", flush=True)
 
     total, done, t0 = 0, 0, time.time()
