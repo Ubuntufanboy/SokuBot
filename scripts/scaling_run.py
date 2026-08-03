@@ -112,7 +112,21 @@ def main() -> None:
     print(f"val cache: {cache['obs'].shape[0]} windows")
 
     sizes = [float(s) for s in args.sizes.split(",")]
+
+    # Merge with whatever is already in the results file. A four-run study takes
+    # over an hour, and losing the finished runs because the last one was
+    # interrupted means paying for them twice. Sizes requested now replace their
+    # old entries; sizes not requested are carried through untouched.
+    out = Path(args.out)
     results = []
+    if out.exists():
+        try:
+            prior = json.loads(out.read_text())
+            results = [r for r in prior if r["hours"] not in sizes]
+            if results:
+                print(f"carrying forward {[r['hours'] for r in results]} from {out}")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            print(f"warning: could not parse {out}, starting fresh")
 
     for size in sizes:
         tag = f"train_{size:g}h"
@@ -171,12 +185,13 @@ def main() -> None:
         if args.ckpt_dir:
             save_checkpoint(model, cfg, Path(args.ckpt_dir) / tag, args.steps)
 
-        out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
+        results.sort(key=lambda r: r["hours"])
         out.write_text(json.dumps(results, indent=2))
         del model
         torch.cuda.empty_cache()
 
+    results.sort(key=lambda r: r["hours"])
     print("\n" + "=" * 78)
     print(f"{'hours':>7} {'caps':>5} {'train_pred':>11} {'val_pred':>9} "
           f"{'val_corr':>9} {'invdyn AUC':>11} {'gap':>7}")
