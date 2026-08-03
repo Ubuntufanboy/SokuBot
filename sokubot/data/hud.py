@@ -54,9 +54,32 @@ HP_FULL_PX = 189
 MIN_LIT_ROWS = 8            # half the band; rejects one-row specular glints
 GREEN_SPLIT = 130           # yellow (health) above, red (combo damage) below
 
-SPIRIT_ROWS = (440, 468)
-P1_SPIRIT_X = (115, 222)
-P2_SPIRIT_X = (260, 347)
+# Spirit is five discrete hexagons per player, NOT a continuous bar, and they
+# sit in a squiggle -- even indices ride ~5 px higher than odd ones. Measuring
+# the strip as one bar under-reports badly and never reaches 1.0 (a full gauge
+# read 0.72-0.77), because the gaps between hexagons are always unlit.
+#
+# Each hexagon is one of: blue (full, 1.0), a purple/grey mix (recovering, worth
+# the purple share), or fully grey (crushed or spent, 0.0).
+P1_SPIRIT_X = (120, 218)
+P2_SPIRIT_X = (263, 363)
+SPIRIT_N = 5
+SPIRIT_CY_EVEN = 452
+SPIRIT_CY_ODD = 457
+SPIRIT_BOX = (5, 6)          # half-height, half-width of the sample inside a hexagon
+
+# Card stock. Casting consumes every lit card, so all slots dim at once -- that
+# is the spell-card activation signal. The gold borders on the stock show the
+# cost of the currently selected card.
+P1_CARD_X = (42, 112)
+P2_CARD_X = (370, 436)
+CARD_ROWS = (428, 470)
+
+# Red never reads exactly zero: the bar's own border columns are misclassified,
+# giving a floor of 0.011-0.016 (about two columns of 189) whenever the player is
+# alive. Confirmed by a player who checked the footage -- red only truly hits 0
+# on a KO. Subtracting the floor makes "no combo" read as no combo.
+RED_FLOOR = 0.018
 
 HEAL_JUMP = 0.10            # yellow rising by more than this is a heal, not play
 
@@ -95,6 +118,8 @@ class HudTrace:
     combo2: np.ndarray
     spirit1: np.ndarray
     spirit2: np.ndarray
+    cards1: np.ndarray       # lit fraction of P1's card stock
+    cards2: np.ndarray
     healing: np.ndarray      # bool; end-of-match heal, exclude from rewards
     flash: np.ndarray        # bool; screen effect washed out the HUD, reading held
     clamped: np.ndarray      # bool; a physically impossible drop was rejected
@@ -140,12 +165,39 @@ def _monotone_within_rounds(hp: np.ndarray, heal: np.ndarray) -> np.ndarray:
     return out
 
 
-def _orb_fraction(band: np.ndarray, width: int) -> np.ndarray:
-    r = band[..., 0].astype(np.int16)
-    g = band[..., 1].astype(np.int16)
-    b = band[..., 2].astype(np.int16)
-    lit = ((b > 140) & ((b - r) > 45) & (g > 60)).any(axis=1)
-    return lit.sum(axis=1) / width
+def _spirit(frames: np.ndarray, xs) -> np.ndarray:
+    """Per-hexagon spirit: blue = 1.0, purple/grey mix = purple share, grey = 0."""
+    x0, x1 = xs
+    pitch = (x1 - x0) / SPIRIT_N
+    hy, hx = SPIRIT_BOX
+    out = np.zeros(len(frames), dtype=np.float32)
+    for k in range(SPIRIT_N):
+        cx = int(x0 + pitch * (k + 0.5))
+        cy = SPIRIT_CY_EVEN if k % 2 == 0 else SPIRIT_CY_ODD
+        box = frames[:, cy - hy:cy + hy + 1, cx - hx:cx + hx + 1].astype(np.int16)
+        r, g, b = box[..., 0], box[..., 1], box[..., 2]
+        blue = ((b > 120) & ((b - r) > 40)).mean(axis=(1, 2))
+        purple = ((b > 70) & (r > 60) & ((b - g) > 25) & ((r - g) > 15)).mean(axis=(1, 2))
+        grey = ((np.abs(r - g) < 28) & (np.abs(g - b) < 28) & (b < 150)).mean(axis=(1, 2))
+        denom = purple + grey
+        partial = np.where(denom > 0.05, purple / np.maximum(denom, 1e-6), 0.0)
+        out += np.where(blue > 0.60, 1.0, partial)
+    return out / SPIRIT_N
+
+
+def _cards_lit(frames: np.ndarray, xs) -> np.ndarray:
+    """Fraction of the card-stock strip that is lit (coloured rather than dim).
+
+    Every lit card is consumed on cast, so this collapses when a spell card is
+    activated and recovers when it ends -- with a lag, since the slots stay dim
+    for a moment after.
+    """
+    band = frames[:, CARD_ROWS[0]:CARD_ROWS[1], xs[0]:xs[1]].astype(np.int16)
+    r, g, b = band[..., 0], band[..., 1], band[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    lit = (mx > 90) & ((mx - mn) > 45)          # bright and saturated
+    return lit.mean(axis=(1, 2))
 
 
 def read_trace(frames: np.ndarray, flip: bool = True, smooth: int = 3) -> HudTrace:
@@ -163,11 +215,10 @@ def read_trace(frames: np.ndarray, flip: bool = True, smooth: int = 3) -> HudTra
     fr, fc = FILL_ROWS
     y1, r1 = _split_bar(frames[:, fr:fc, P1_HP_X[0]:P1_HP_X[1]])
     y2, r2 = _split_bar(frames[:, fr:fc, P2_HP_X[0]:P2_HP_X[1]])
-    sr0, sr1 = SPIRIT_ROWS
-    s1 = _orb_fraction(frames[:, sr0:sr1, P1_SPIRIT_X[0]:P1_SPIRIT_X[1]],
-                       P1_SPIRIT_X[1] - P1_SPIRIT_X[0])
-    s2 = _orb_fraction(frames[:, sr0:sr1, P2_SPIRIT_X[0]:P2_SPIRIT_X[1]],
-                       P2_SPIRIT_X[1] - P2_SPIRIT_X[0])
+    s1 = _spirit(frames, P1_SPIRIT_X)
+    s2 = _spirit(frames, P2_SPIRIT_X)
+    k1 = _cards_lit(frames, P1_CARD_X)
+    k2 = _cards_lit(frames, P2_CARD_X)
 
     if smooth and smooth > 1 and len(y1) >= smooth:
         def med(a):
@@ -223,7 +274,7 @@ def read_trace(frames: np.ndarray, flip: bool = True, smooth: int = 3) -> HudTra
     repaired = (np.abs(y1 - raw1) > 0.02) | (np.abs(y2 - raw2) > 0.02)
 
     return HudTrace(hp1=y1, hp2=y2, combo1=r1, combo2=r2,
-                    spirit1=s1, spirit2=s2, healing=healing,
+                    spirit1=s1, spirit2=s2, cards1=k1, cards2=k2, healing=healing,
                     flash=repaired, clamped=repaired)
 
 
@@ -270,4 +321,40 @@ def combo_size(t: HudTrace, who: int) -> np.ndarray:
     """
     c = (t.combo1 if who == 1 else t.combo2).copy()
     c[t.healing] = 0.0
-    return c
+    return np.maximum(0.0, c - RED_FLOOR)
+
+
+def spellcard_events(t: HudTrace, who: int, min_gap: int = 45):
+    """Windows where `who` had a spell card active, with cost and outcome.
+
+    Casting consumes every lit card at once, so the stock collapses; the slots
+    stay dim for a while after the card ends, so the window overruns and the
+    trailing dim frames are trimmed back to where the stock starts recovering.
+
+    Returns [(start, end, cost, damage_dealt)] with cost in card slots.
+    """
+    cards = t.cards1 if who == 1 else t.cards2
+    foe = damage_events(t, 2 if who == 1 else 1)
+    base = float(np.median(cards[cards > 0])) if (cards > 0).any() else 0.0
+    if base <= 0:
+        return []
+    active = cards < 0.35 * base
+    out, i, n = [], 0, len(cards)
+    while i < n:
+        if not active[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and active[j]:
+            j += 1
+        if j - i >= min_gap:
+            # trim the trailing dim tail: end where the stock resumes climbing
+            k = j
+            while k > i + 1 and cards[k - 1] <= cards[min(n - 1, k)] * 0.9:
+                k -= 1
+            lit_before = cards[max(0, i - 30):i]
+            cost = int(round((lit_before.max() if len(lit_before) else base) /
+                             max(base, 1e-6) * 5)) if base > 0 else 0
+            out.append((i, k, max(1, min(5, cost)), float(foe[i:k].sum())))
+        i = j
+    return out
