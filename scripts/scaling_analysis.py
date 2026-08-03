@@ -68,6 +68,10 @@ def main() -> None:
 
     rows = json.loads(Path(args.results).read_text())
     rows.sort(key=lambda r: r["hours"])
+    D = np.array([r["hours"] for r in rows], dtype=float)
+    L = np.array([r["val_pred"] for r in rows], dtype=float)
+    T = np.array([r["train_pred"] for r in rows], dtype=float)
+    AUC = np.array([r["inv_dyn_auc"] for r in rows], dtype=float)
 
     # Merge in the trivial-predictor baselines. Raw val_pred and correlation
     # both look excellent on 15 Hz video for a model that has learned nothing
@@ -105,20 +109,29 @@ def main() -> None:
         print("\nneed at least 3 sizes to fit a scaling law")
         return
 
-    fit = fit_power_law(D, L)
-    print(f"\nfit  L(D) = {fit['L_inf']:.4f} + {fit['A']:.4f} * D^-{fit['alpha']:.3f}"
-          f"   (R2 {fit['r2']:.4f} over {len(D)} points, 1 dof)")
-
-    # Doubling gain: what one more doubling of data buys, in the measured range.
-    if fit["alpha"] > 0:
-        frac = 1 - 2 ** (-fit["alpha"])
-        print(f"each doubling removes {frac * 100:.1f}% of the reducible loss "
-              f"(the part above L_inf)")
-
-    print(f"\n{'hours':>8} {'predicted val_pred':>20} {'predicted corr':>16}")
-    for t in [float(x) for x in args.targets.split(",")]:
-        pred = fit["L_inf"] + fit["A"] * t ** (-fit["alpha"])
-        print(f"{t:8.0f} {pred:20.4f} {1 - pred / 2:16.4f}")
+    # Only fit if loss actually falls with data. A power law forced onto a flat
+    # or rising curve returns numbers -- an exponent, an extrapolation to 200h --
+    # that look like findings and are not. Refusing to fit is the result.
+    if L[-1] >= L[0]:
+        print(f"\nNO SCALING FIT: held-out loss does not improve with data "
+              f"({L[0]:.4f} at {D[0]:.0f}h -> {L[-1]:.4f} at {D[-1]:.0f}h).")
+        print("Under fixed compute this is the expected shape once the largest")
+        print("dataset stops being revisited: more data is more distribution to")
+        print("fit with the same number of gradient steps. Compute, not data, is")
+        print("the binding constraint here -- extrapolating to 200h from these")
+        print("points would be extrapolating a compute limit.")
+    else:
+        fit = fit_power_law(D, L)
+        print(f"\nfit  L(D) = {fit['L_inf']:.4f} + {fit['A']:.4f} * D^-{fit['alpha']:.3f}"
+              f"   (R2 {fit['r2']:.4f} over {len(D)} points, 1 dof)")
+        if fit["alpha"] > 0:
+            frac = 1 - 2 ** (-fit["alpha"])
+            print(f"each doubling removes {frac * 100:.1f}% of the reducible loss "
+                  f"(the part above L_inf)")
+        print(f"\n{'hours':>8} {'predicted val_pred':>20} {'predicted corr':>16}")
+        for t in [float(x) for x in args.targets.split(",")]:
+            pred = fit["L_inf"] + fit["A"] * t ** (-fit["alpha"])
+            print(f"{t:8.0f} {pred:20.4f} {1 - pred / 2:16.4f}")
 
     print("\nCaveats")
     print("  * 4 points, 3 parameters -- read the exponent as a trend, not a value.")
