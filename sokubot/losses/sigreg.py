@@ -90,4 +90,39 @@ def sigreg_stepwise(z: torch.Tensor, cfg: Config) -> torch.Tensor:
     phase of the trajectory maps to the same point.
     """
     B, T, D = z.shape
-    return torch.stack([sigreg(z[:, t], cfg) for t in range(T)]).mean()
+    if not cfg.sigreg_batched:
+        return torch.stack([sigreg(z[:, t], cfg) for t in range(T)]).mean()
+
+    # Batched form: identical statistic, one set of kernels instead of T.
+    # Each timestep still gets its own independently sampled directions, which
+    # is what the loop did -- sharing one sketch across time would let the
+    # encoder satisfy those particular projections at every step and nothing
+    # else. Peak memory is T x the loop's, since the [T,B,M,P] intermediate is
+    # materialised at once.
+    A = torch.randn(T, D, cfg.sigreg_dirs, device=z.device, dtype=z.dtype)
+    A = A / A.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    h = torch.einsum("btd,tdm->tbm", z, A)                       # [T, B, M]
+
+    t = torch.linspace(-cfg.sigreg_range, cfg.sigreg_range, cfg.sigreg_points,
+                       device=z.device, dtype=z.dtype)
+    ht = h.unsqueeze(-1) * t.view(1, 1, 1, -1)                   # [T, B, M, P]
+    ecf_re = torch.cos(ht).mean(dim=1)                           # [T, M, P]
+    ecf_im = torch.sin(ht).mean(dim=1)
+
+    N = B
+    if dist.is_available() and dist.is_initialized():
+        world = dist.get_world_size()
+        dist.all_reduce(ecf_re, op=dist.ReduceOp.SUM)
+        dist.all_reduce(ecf_im, op=dist.ReduceOp.SUM)
+        ecf_re, ecf_im = ecf_re / world, ecf_im / world
+        N = B * world
+
+    phi0 = torch.exp(-0.5 * t * t)
+    w = torch.exp(-0.5 * t * t / cfg.sigreg_lambda_w)
+    integrand = ((ecf_re - phi0.view(1, 1, -1)) ** 2 + ecf_im ** 2) * w.view(1, 1, -1)
+    stat = torch.trapz(integrand, t, dim=-1)                     # [T, M]
+
+    out = stat.mean()
+    if cfg.sigreg_scale_n:
+        out = out * N
+    return out

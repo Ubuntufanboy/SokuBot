@@ -133,6 +133,27 @@ class Config:
     # whenever a worker hits a slow capture (a new ffmpeg process, a seek); more
     # queued batches absorb that jitter at the cost of host RAM.
     prefetch_factor: int = 6
+
+    # ---------------- throughput (all change numerics, none change the method) ----
+    # How often to compute training diagnostics. Every one of them ends in
+    # .item(), which synchronises the GPU and drains the pipeline, and
+    # effective_rank additionally runs a 192x192 eigendecomposition on the CPU.
+    # Paying that per step costs more than the diagnostics are worth; 0 means
+    # every step, which is only useful when debugging a specific run.
+    metrics_every: int = 50
+    # TF32 matmuls/convs on Ampere+. Under bf16 autocast most matmuls are
+    # already reduced precision, so this mainly affects the fp32 residue.
+    tf32: bool = True
+    # torch.compile the model. Costs ~1-2 min of graph capture on the first
+    # steps and recompiles when a shape changes (e.g. the eval batch size).
+    compile: bool = False
+    compile_mode: str = "default"      # "default" | "max-autotune"
+    # Fused AdamW: one kernel for the whole parameter update instead of a
+    # foreach loop. Pure win on CUDA.
+    fused_optimizer: bool = True
+    # Compute SIGReg for all timesteps in one batched call rather than looping.
+    # Same statistic, T times fewer kernel launches, T times the peak memory.
+    sigreg_batched: bool = True
     amp_dtype: str = "bf16"       # "bf16" | "fp16" | "fp32"
 
     # ---------------- planning (LeWM App. D / AdaJEPA Sec. 4.1) ----------------

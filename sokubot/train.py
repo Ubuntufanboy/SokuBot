@@ -94,6 +94,7 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
             no_decay.append(p)
         else:
             decay.append(p)
+    fused = cfg.fused_optimizer and cfg.device.startswith("cuda")
     return torch.optim.AdamW(
         [
             {"params": decay, "weight_decay": cfg.weight_decay},
@@ -101,11 +102,22 @@ def build_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
         ],
         lr=cfg.lr,
         betas=cfg.betas,
+        fused=fused or None,
     )
 
 
+def enable_fast_math(cfg: Config) -> None:
+    """Backend switches that trade a little precision for throughput."""
+    if cfg.tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    # Fixed shapes every step, so let cuDNN pick the best algorithm once.
+    torch.backends.cudnn.benchmark = True
+
+
 def compute_losses(
-    model: LeWorldModel, batch: Dict, cfg: Config
+    model: LeWorldModel, batch: Dict, cfg: Config, want_metrics: bool = True
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     device = next(model.parameters()).device
     # obs may arrive as uint8 (cfg.loader_uint8); the encoder normalises it on
@@ -117,6 +129,12 @@ def compute_losses(
     l_pred = prediction_loss(out.zhat, out.z)
     l_sig = sigreg_stepwise(out.z, cfg)
     total = l_pred + cfg.lambda_sigreg * l_sig
+
+    # Every entry below ends in .item(), which synchronises the GPU and drains
+    # the pipeline, and effective_rank runs a CPU eigendecomposition on top.
+    # Skipping it on non-logging steps is most of what `metrics_every` buys.
+    if not want_metrics:
+        return total, {}
 
     with torch.no_grad():
         flat = out.z.reshape(-1, cfg.latent_dim)
@@ -173,9 +191,17 @@ def train(
     device = torch.device(cfg.device)
     steps = steps or cfg.total_steps
 
+    enable_fast_math(cfg)
     model = (model or LeWorldModel(cfg)).to(device)
     loader = make_loader(dataset, cfg)
+    # Build the optimiser against the eager module: torch.compile returns a
+    # wrapper sharing the same parameters, but binding the optimiser to the
+    # original keeps checkpointing and the AdaJEPA adapter working on plain
+    # module paths.
     opt = build_optimizer(model, cfg)
+    step_model = model
+    if cfg.compile:
+        step_model = torch.compile(model, mode=cfg.compile_mode)
 
     use_amp = device.type == "cuda" and cfg.amp_dtype in ("bf16", "fp16")
     amp_dtype = torch.bfloat16 if cfg.amp_dtype == "bf16" else torch.float16
@@ -185,6 +211,8 @@ def train(
     history = []
     it = iter(loader)
     t0 = time.time()
+    nonfinite = torch.zeros((), dtype=torch.long, device=device)
+    seen_bad = 0
 
     for step in range(steps):
         try:
@@ -197,17 +225,28 @@ def train(
             g["lr"] = lr_at(step, cfg)
         opt.zero_grad(set_to_none=True)
 
+        want = (cfg.metrics_every <= 0 or step % cfg.metrics_every == 0
+                or step % log_every == 0 or step == steps - 1
+                or (callback_every and (step + 1) % callback_every == 0))
         if use_amp:
             with torch.autocast("cuda", dtype=amp_dtype):
-                total, metrics = compute_losses(model, batch, cfg)
+                total, metrics = compute_losses(step_model, batch, cfg, want_metrics=want)
         else:
-            total, metrics = compute_losses(model, batch, cfg)
+            total, metrics = compute_losses(step_model, batch, cfg, want_metrics=want)
 
-        # A single non-finite step must not poison the weights.
-        if not torch.isfinite(total):
-            if verbose:
-                print(f"step {step:6d} | non-finite loss, skipped")
-            continue
+        # Non-finite detection without a per-step sync. `if not torch.isfinite(x)`
+        # reads a GPU scalar on the host and drains the pipeline exactly like the
+        # metrics do, so instead the count accumulates on device and is read on
+        # metric steps. A bad step still lands in the weights, but bf16 carries
+        # fp32's exponent range and gradients are clipped, so this has not fired
+        # in any run so far -- and it is reported rather than silently ignored.
+        nonfinite += (~torch.isfinite(total.detach())).long()
+        if want:
+            n_bad = int(nonfinite.item())
+            if n_bad > seen_bad:
+                print(f"step {step:6d} | WARNING: {n_bad - seen_bad} non-finite "
+                      f"loss(es) since last check")
+                seen_bad = n_bad
 
         if use_amp:
             scaler.scale(total).backward()
@@ -220,15 +259,16 @@ def train(
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
 
-        metrics["step"] = step
-        metrics["lr"] = opt.param_groups[0]["lr"]
-        history.append(metrics)
+        if metrics:
+            metrics["step"] = step
+            metrics["lr"] = opt.param_groups[0]["lr"]
+            history.append(metrics)
 
         if ckpt_dir and ckpt_every and step > 0 and step % ckpt_every == 0:
             save_checkpoint(model, cfg, ckpt_dir, step)
         if callback and callback_every and (step + 1) % callback_every == 0:
             callback(model, step + 1, history)
-        if verbose and (step % log_every == 0 or step == steps - 1):
+        if verbose and metrics and (step % log_every == 0 or step == steps - 1):
             print(
                 f"step {step:6d} | loss {metrics['loss']:8.4f} "
                 f"| pred {metrics['l_pred']:7.4f} | sigreg {metrics['l_sigreg']:7.4f} "
