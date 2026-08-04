@@ -81,6 +81,45 @@ from sokubot.model.world_model import LeWorldModel
 from sokubot.train import build_optimizer, enable_fast_math, make_loader, set_seed
 
 
+def health_counterfactual_loss(model: LeWorldModel, z: torch.Tensor,
+                               act: torch.Tensor, W: torch.Tensor,
+                               n_neg: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """The same contest, judged only on the health the reward actually reads.
+
+    The latent counterfactual term reached 0.118 nats -- the model can say which
+    action produced a transition. It did not help, because scripts/aggression_test
+    shows the *consequences* still do not depend on the action: across 32
+    realistic sampled rollouts from one start, damage varies by 0.011 while
+    varying 0.51 across starts, and correlates with attacking at -0.0001. The
+    model knows the button was pressed and not whether it connected.
+
+    Distances here are measured after projecting onto the probe's health
+    directions, so the pressure lands on the two numbers the reward is computed
+    from instead of being spread over all 192 dimensions, where it can be
+    satisfied by detail nothing downstream reads.
+
+    `W` is the health block of the fitted probe, held fixed. It goes stale as the
+    latent space moves, which is a real cost and the reason this runs at a low
+    learning rate on top of an already-trained model rather than from scratch.
+    """
+    z_next = z[:, 1:]
+
+    def dist(a: torch.Tensor) -> torch.Tensor:
+        zhat = model.predictor(z, model.action_encoder(a))
+        d = (zhat[:, :-1] - z_next) @ W          # [B, T-1, 2] in health units
+        return (d ** 2).mean(dim=-1)
+
+    d_true = dist(act)
+    negs = [dist(act.roll(int(torch.randint(1, max(2, z.shape[0]), (1,)).item()),
+                          dims=0)) for _ in range(n_neg)]
+    all_d = torch.stack([d_true, *negs], dim=-1)
+    tau = d_true.detach().mean().clamp_min(1e-8)
+    flat = (-all_d / tau).reshape(-1, 1 + n_neg)
+    target = torch.zeros(flat.shape[0], dtype=torch.long, device=z.device)
+    acc = (flat.argmax(dim=-1) == 0).float().mean()
+    return F.cross_entropy(flat, target), acc
+
+
 def counterfactual_loss(model: LeWorldModel, z: torch.Tensor, act: torch.Tensor,
                         n_neg: int) -> tuple[torch.Tensor, torch.Tensor]:
     """-> (loss, accuracy). Chance is ln(1+n_neg) nats and 1/(1+n_neg).
@@ -131,6 +170,10 @@ def main() -> int:
                          "everything else -- and skill fell from +0.864 to -0.220 "
                          "in a thousand steps. This keeps it an auxiliary.")
     ap.add_argument("--n-neg", type=int, default=3)
+    ap.add_argument("--lambda-health", type=float, default=0.0,
+                    help="weight on the counterfactual judged in probe health "
+                         "space; needs --probe")
+    ap.add_argument("--probe", type=Path, default=None)
     ap.add_argument("--min-skill", type=float, default=0.80,
                     help="floor for keeping a checkpoint; a world model that "
                          "predicts worse than copy-last-latent cannot plan either")
@@ -162,6 +205,18 @@ def main() -> int:
     print(f"loaded {a.ckpt} (step {blob.get('step','?')})", flush=True)
     print(f"action-blind baseline for cf: {chance:.4f} nats, "
           f"accuracy {1/(1+a.n_neg):.3f}", flush=True)
+
+    W_health = None
+    if a.lambda_health > 0:
+        if a.probe is None:
+            raise SystemExit("--lambda-health needs --probe")
+        pd = np.load(a.probe, allow_pickle=True)
+        names = [str(x) for x in pd["names"]]
+        cols = [names.index("hp1"), names.index("hp2")]
+        # W is [latent+1, targets]; drop the intercept row and keep health.
+        W_health = torch.tensor(pd["W"][:-1, cols], dtype=torch.float32,
+                                device=device)
+        print(f"health counterfactual on columns {cols} of {names}", flush=True)
 
     opt = build_optimizer(model, cfg)
     ds = build_soku_dataset(cfg, [str(a.corpus / "train")], shuffle_buffer=4096,
@@ -206,8 +261,12 @@ def main() -> int:
         l_pred = prediction_loss(zhat, z)
         l_sig = sigreg_stepwise(z, cfg)
         l_cf, acc = counterfactual_loss(model, z.detach(), act, a.n_neg)
-
         loss = l_pred + cfg.lambda_sigreg * l_sig + a.lambda_cf * l_cf
+        if W_health is not None:
+            l_h, acc_h = health_counterfactual_loss(model, z.detach(), act,
+                                                    W_health, a.n_neg)
+            loss = loss + a.lambda_health * l_h
+            acc = acc_h                       # report the one being targeted
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
