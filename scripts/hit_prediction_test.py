@@ -80,8 +80,15 @@ def fit_and_score(make_batch, n_train, n_val, dev, model, steps, lr=3e-4, bs=256
         if step % 200 == 0:
             with torch.no_grad():
                 model.eval()
-                xs, ys, pw = make_batch("val", min(n_val, 8192))
-                lo = model(xs).squeeze(-1)
+                # Chunked: 8192 frames at 448px in one forward is about 20 GB of
+                # activations, which is how the first run died after three hours
+                # of decoding.
+                los, yss = [], []
+                for _ in range(max(1, min(n_val, 8192) // 512)):
+                    xs, ys, pw = make_batch("val", 512)
+                    los.append(model(xs).squeeze(-1))
+                    yss.append(ys)
+                lo, ys = torch.cat(los), torch.cat(yss)
                 vl = float(F.binary_cross_entropy_with_logits(lo, ys, pos_weight=pw))
                 if vl < best_vl:
                     best_vl = vl
