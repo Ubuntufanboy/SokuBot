@@ -78,7 +78,15 @@ class GRPOConfig:
     # action sequence gives exactly one return, so differences within a group are
     # entirely caused by the actions sampled. There is no observation noise for
     # exploration to average out, and the gradient is small rather than noisy.
-    entropy_coef: float = 0.005
+    # Anchor to the initial policy, not to the uniform distribution. An entropy
+    # bonus rewards spreading mass evenly, which actively undoes the corpus
+    # prior: the first prior-initialised run started at 15.0 nats and climbed to
+    # 18.0 within fifty steps, walking back out of the distribution the world
+    # model was trained on. A KL penalty toward the reference keeps the policy
+    # near human-like play while leaving it free to prefer better actions within
+    # that neighbourhood -- the same construction RLHF uses, for the same reason.
+    entropy_coef: float = 0.0
+    kl_ref_coef: float = 0.05
     # Passes over each batch of rollouts. With one pass the sampling policy *is*
     # the current policy, so the ratio is identically 1 and both the clipping and
     # the KL penalty are inert -- the update degenerates to REINFORCE with a
@@ -251,8 +259,17 @@ def group_advantages(reward: torch.Tensor, alive: torch.Tensor,
 
 
 def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
-              old_logp: torch.Tensor, cfg: GRPOConfig) -> tuple[torch.Tensor, dict]:
-    """Clipped surrogate with a k3 KL penalty back to the sampling policy."""
+              old_logp: torch.Tensor, cfg: GRPOConfig,
+              ref_logp: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, dict]:
+    """Clipped surrogate, a k3 KL back to the sampling policy, and optionally a
+    second KL back to a fixed reference.
+
+    The two KLs do different jobs. The one against `old_logp` is a trust region:
+    it keeps each update small relative to the policy the rollouts were drawn
+    from. The one against `ref_logp` is an anchor: it keeps the policy near the
+    behaviour the world model can be trusted to simulate, however many updates
+    accumulate.
+    """
     B, T = adv.shape
     H, latent = traj["obs"].shape[2], traj["obs"].shape[3]
     obs = traj["obs"].reshape(B * T, H, latent)
@@ -281,8 +298,15 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
     log_r = -log_ratio
     kl = torch.exp(log_r) - 1 - log_r
 
+    if ref_logp is not None:
+        log_r_ref = (ref_logp - logp).clamp(-cfg.max_log_ratio, cfg.max_log_ratio)
+        kl_ref = torch.exp(log_r_ref) - 1 - log_r_ref
+    else:
+        kl_ref = torch.zeros_like(kl)
+
     denom = alive.sum().clamp(min=1.0)
-    loss = (((pg + cfg.kl_coef * kl - cfg.entropy_coef * ent) * alive).sum() / denom)
+    loss = (((pg + cfg.kl_coef * kl + cfg.kl_ref_coef * kl_ref
+              - cfg.entropy_coef * ent) * alive).sum() / denom)
     with torch.no_grad():
         stats = {
             "pg": float((pg * alive).sum() / denom),
@@ -290,6 +314,7 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
             "entropy": float((ent * alive).sum() / denom),
             "ratio": float((ratio * alive).sum() / denom),
             "clip_frac": float((((ratio - 1).abs() > cfg.clip_eps) * alive).sum() / denom),
+            "kl_ref": float((kl_ref * alive).sum() / denom),
         }
     return loss, stats
 

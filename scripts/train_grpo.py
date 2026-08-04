@@ -293,8 +293,18 @@ def main() -> int:
                 traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
 
         skipped = 0
+        # The reference is the prior-initialised policy, frozen at step 0. It is
+        # both the yardstick the eval measures against and the anchor the KL
+        # penalty pulls toward, which is the same object by design: "has it
+        # improved" and "has it wandered off-distribution" are questions about
+        # the same starting point.
+        with torch.no_grad():
+            ref_logp = reference.log_prob_of(
+                traj["obs"].reshape(-1, cfg.history, cfg.latent_dim), flat_side,
+                traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
+
         for _ in range(gcfg.epochs):
-            loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg)
+            loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg, ref_logp)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
@@ -341,7 +351,8 @@ def main() -> int:
                       f"{ev['net']:+.5f} | as P1 {ev['p1_dealt']:+.4f}/"
                       f"{ev['p1_taken']:+.4f} | as P2 {ev['p2_dealt']:+.4f}/"
                       f"{ev['p2_taken']:+.4f} | idle {rec['idle_rate']:.3f} "
-                      f"press {rec['press_rate']:.3f} atk {rec['attack_rate']:.3f}",
+                      f"press {rec['press_rate']:.3f} atk {rec['attack_rate']:.3f} "
+                      f"| klref {rec.get('kl_ref', 0.0):.4f}",
                       flush=True)
             # Damage is the term the whole reward is denominated in, so track
             # both halves of the exchange rather than only the net.
