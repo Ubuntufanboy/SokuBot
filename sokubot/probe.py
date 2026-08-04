@@ -42,6 +42,74 @@ class ProbeResult:
         return f"R2 mean {self.r2_mean:.3f} ({per})"
 
 
+@dataclass
+class LinearProbe:
+    """A fitted latent -> state readout, reusable on latents it was not fit on.
+
+    This is the object GRPO actually deploys: the probe is fit once on latents
+    encoded from *real* frames, then queried inside imagined rollouts, where the
+    latents have drifted off the manifold it was fit on. Scoring that honestly
+    requires keeping the fitted coefficients rather than a summary number, which
+    is why this exists alongside :func:`ridge_probe`.
+    """
+
+    zmu: np.ndarray
+    zsd: np.ndarray
+    ymu: np.ndarray
+    ysd: np.ndarray
+    W: np.ndarray                 # [D+1, K], operating on standardised targets
+    names: list[str]
+
+    def predict(self, z: np.ndarray) -> np.ndarray:
+        """[N, D] latents -> [N, K] predictions in the targets' original units."""
+        x = np.concatenate([(z - self.zmu) / self.zsd, np.ones((len(z), 1))], axis=1)
+        return (x @ self.W) * self.ysd + self.ymu
+
+    def r2(self, z: np.ndarray, y: np.ndarray, min_std: float = 0.0) -> Dict[str, float]:
+        """Per-target R^2 against the evaluation set's own mean.
+
+        R^2 divides by the evaluation set's variance, so a target that barely
+        moves across the sample produces an enormous negative number from a
+        tiny absolute error -- an artefact of the denominator, not a real
+        failure. ``min_std`` returns NaN for such targets instead, which is the
+        honest reading: on this sample the target is unmeasurable.
+        """
+        pred = self.predict(z)
+        ss_res = ((y - pred) ** 2).sum(0)
+        centred = y - y.mean(0)
+        ss_tot = (centred ** 2).sum(0)
+        r2 = 1.0 - ss_res / np.maximum(ss_tot, 1e-12)
+        if min_std > 0.0:
+            r2 = np.where(y.std(0) < min_std, np.nan, r2)
+        return {n: float(v) for n, v in zip(self.names, r2)}
+
+
+def fit_ridge(
+    z: np.ndarray,
+    y: np.ndarray,
+    names: Optional[Sequence[str]] = None,
+    alpha: float = 1e-2,
+) -> LinearProbe:
+    """Closed-form ridge fit of z -> y, returning the readout itself.
+
+    Inputs and targets are standardised on the data given here, so the caller
+    must pass only the training split -- there is no held-out logic inside.
+    """
+    if len(z) != len(y):
+        raise ValueError(f"z has {len(z)} rows, y has {len(y)}")
+    zmu, zsd = z.mean(0), z.std(0) + 1e-8
+    ymu, ysd = y.mean(0), y.std(0) + 1e-8
+    X = np.concatenate([(z - zmu) / zsd, np.ones((len(z), 1))], axis=1)
+    T = (y - ymu) / ysd
+
+    reg = alpha * np.eye(X.shape[1])
+    reg[-1, -1] = 0.0                               # never penalise the intercept
+    W = np.linalg.solve(X.T @ X + reg, X.T @ T)
+
+    names = list(names) if names is not None else [f"y{i}" for i in range(y.shape[1])]
+    return LinearProbe(zmu=zmu, zsd=zsd, ymu=ymu, ysd=ysd, W=W, names=names)
+
+
 def ridge_probe(
     z: np.ndarray,
     y: np.ndarray,
@@ -53,6 +121,11 @@ def ridge_probe(
     """Fit z -> y with ridge regression; report held-out R^2 per target.
 
     z: [N, D] latents. y: [N, K] targets.
+
+    Note the split is over *rows*. When rows are consecutive frames of one
+    episode this leaks -- neighbouring frames are near-duplicates, so the
+    held-out set is not independent. Split by episode upstream when that matters
+    (see scripts/horizon_ablation.py).
     """
     if len(z) != len(y):
         raise ValueError(f"z has {len(z)} rows, y has {len(y)}")
@@ -63,30 +136,11 @@ def ridge_probe(
     if len(te) < 2:
         raise ValueError("not enough held-out samples to score a probe")
 
-    Ztr, Zte = z[tr], z[te]
-    Ytr, Yte = y[tr], y[te]
-
-    # Standardise inputs and targets on the *training* split only.
-    zmu, zsd = Ztr.mean(0), Ztr.std(0) + 1e-8
-    ymu, ysd = Ytr.mean(0), Ytr.std(0) + 1e-8
-    Xtr = np.concatenate([(Ztr - zmu) / zsd, np.ones((len(Ztr), 1))], axis=1)
-    Xte = np.concatenate([(Zte - zmu) / zsd, np.ones((len(Zte), 1))], axis=1)
-    Ttr, Tte = (Ytr - ymu) / ysd, (Yte - ymu) / ysd
-
-    D = Xtr.shape[1]
-    reg = alpha * np.eye(D)
-    reg[-1, -1] = 0.0                               # never penalise the intercept
-    W = np.linalg.solve(Xtr.T @ Xtr + reg, Xtr.T @ Ttr)
-
-    pred = Xte @ W
-    ss_res = ((Tte - pred) ** 2).sum(0)
-    ss_tot = ((Tte - Tte.mean(0)) ** 2).sum(0) + 1e-12
-    r2 = 1.0 - ss_res / ss_tot
-
-    names = list(names) if names is not None else [f"y{i}" for i in range(y.shape[1])]
+    probe = fit_ridge(z[tr], y[tr], names=names, alpha=alpha)
+    r2 = probe.r2(z[te], y[te])
     return ProbeResult(
-        r2={n: float(v) for n, v in zip(names, r2)},
-        r2_mean=float(r2.mean()),
+        r2=r2,
+        r2_mean=float(np.mean(list(r2.values()))),
         n_train=len(tr),
         n_test=len(te),
     )
