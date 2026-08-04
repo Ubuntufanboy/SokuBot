@@ -127,10 +127,34 @@ frame. The encoder is per-frame by construction and history enters only later,
 at the predictor, so the latents it consumes may individually lack the motion
 that decides a hit.
 
-The cheap next experiment is that same test on a three-frame latent history.
-If AUC moves, the fix is giving the encoder motion -- frame stacking or a
-difference channel -- rather than more pixels. If it does not move, whether a
-hit lands may not be predictable at 15 Hz at all.
+**Not motion either.** `scripts/temporal_test.py` ran that experiment. Same
+target, same head, same by-replay split, base rate 0.1367:
+
+| features | AUC |
+|---|---|
+| one latent | 0.5961 |
+| three latents concatenated | 0.6070 |
+| latent plus its two differences | 0.6248 |
+| CNN, one frame | 0.5940 |
+| CNN, frame stacked with one two steps back | 0.5256 |
+
+Latent history buys 0.029. Giving the CNN a second frame made it *worse*.
+Nothing tried -- more pixels, the full patch grid, a purpose-trained CNN, three
+frames of history, explicit motion -- anticipates a hit above about 0.62.
+
+**Which points at the decision rate.** `frame_skip = 4` puts decisions at 15 Hz
+against a game running at 60. Whether an attack connects is settled inside two
+or three frames, so the moment that decides it falls *between* decision steps
+and is not in any observation the model receives, at any resolution and with
+any amount of history. That would explain every measurement above at once, and
+it is a consequence of a choice made at milestone 3 for training cost.
+
+Testing it is cheap in principle and expensive in practice: re-derive a corpus
+subset at `frame_skip = 1` or 2 and repeat `hit_prediction_test`. If AUC climbs
+sharply, the decision rate is the blocker and the world model needs retraining
+at a finer step -- which multiplies both sequence length and training cost. If
+it does not climb, whether a hit lands is not visible from these captures at
+all, and the route to a Soku agent is not a pixel world model.
 
 **Reconsider the frame rate.** Decisions run at 15 Hz against a 60 Hz game.
 Whether an attack connects is often decided within two or three frames, which is
