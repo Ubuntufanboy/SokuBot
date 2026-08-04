@@ -101,19 +101,36 @@ not the part that is broken.
 
 In order of how much evidence supports them.
 
-**Retrain the encoder at higher effective resolution.** Smaller patches, a
-larger input, or both. This is the direct implication of measurements 4 and 5.
-It is expensive — token count drives attention quadratically, so 448px at patch
-14 is roughly 4x the tokens and considerably more than 4x the time — and it is
-the only change the evidence actually points at.
-`scripts/hit_prediction_test.py` was written to price it before committing: it
-compares [CLS], patch tokens, a CNN at 224 and the same CNN at 448 on the
-objective target "is the opponent about to lose health", which is what the
-reward needs and what behaviour cloning cannot cleanly measure.
+**Not resolution.** That was the obvious reading of measurements 4 and 5, and
+`scripts/hit_prediction_test.py` was written to price it before spending GPU
+hours. It puts four representations through the same head and split on the
+objective target the reward is built from -- is the opponent about to lose
+health within 0.4 s, base rate 0.1385:
 
-**Check whether the signal is temporal rather than spatial.** If no
-single-frame representation anticipates a hit, resolution will not supply it and
-the encoder needs motion — frame stacking or explicit velocity.
+| features | AUC |
+|---|---|
+| [CLS] latent, 192-d | 0.6205 |
+| all 256 patch tokens | 0.6460 |
+| CNN from scratch, 224px | 0.6538 |
+| same CNN, 448px | **0.6327** |
+
+Doubling the resolution made it *worse*, and a CNN trained from scratch beats
+the pretrained encoder by 0.033. Everything caps between 0.62 and 0.65. The
+encoder is already extracting close to what a single frame contains, so a
+larger or finer-grained encoder is not the fix -- and this was a cheap way to
+learn that rather than an expensive one.
+
+**Temporal, most likely.** Whether an attack connects depends on which
+animation frame each character occupies and how fast they are moving, and a
+still frame shows neither. Every representation above was given exactly one
+frame. The encoder is per-frame by construction and history enters only later,
+at the predictor, so the latents it consumes may individually lack the motion
+that decides a hit.
+
+The cheap next experiment is that same test on a three-frame latent history.
+If AUC moves, the fix is giving the encoder motion -- frame stacking or a
+difference channel -- rather than more pixels. If it does not move, whether a
+hit lands may not be predictable at 15 Hz at all.
 
 **Reconsider the frame rate.** Decisions run at 15 Hz against a 60 Hz game.
 Whether an attack connects is often decided within two or three frames, which is
