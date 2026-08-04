@@ -149,12 +149,45 @@ and is not in any observation the model receives, at any resolution and with
 any amount of history. That would explain every measurement above at once, and
 it is a consequence of a choice made at milestone 3 for training cost.
 
-Testing it is cheap in principle and expensive in practice: re-derive a corpus
-subset at `frame_skip = 1` or 2 and repeat `hit_prediction_test`. If AUC climbs
-sharply, the decision rate is the blocker and the world model needs retraining
-at a finer step -- which multiplies both sequence length and training cost. If
-it does not climb, whether a hit lands is not visible from these captures at
-all, and the route to a Soku agent is not a pixel world model.
+**Not the frame rate either.** `scripts/frame_rate_test.py` encodes every game
+frame -- 53,510 latents at 60 Hz -- and asks the same question at a range of
+distances:
+
+| lookahead | seconds | base rate | AUC |
+|---|---|---|---|
+| 2 frames | 0.033 | 0.0153 | 0.5900 |
+| 8 | 0.133 | 0.0575 | 0.6194 |
+| 16 | 0.267 | 0.1052 | **0.6825** |
+| 48 | 0.800 | 0.2296 | 0.6728 |
+
+AUC **rises** with distance. A hit two frames away is *harder* to call than one
+0.8 s away, which is the exact reverse of what a short-lived signal discarded by
+15 Hz would produce. Sampling more often would not help.
+
+## What that leaves
+
+The pattern across all four experiments is consistent: the latent tracks
+something slow and situational -- roughly, that a player is under pressure and
+damage is likely soon -- and does not represent the mechanics that decide whether
+a particular attack connects. More pixels, the full patch grid, a
+purpose-trained CNN, three frames of history, explicit motion and four times the
+sampling rate each failed to change that, and they cover every axis available
+without changing what is being encoded.
+
+Whether an attack lands is a function of hitboxes, animation frames, invulnerability
+windows and exact positions. Those are discrete game state. They are rendered
+into pixels only incidentally, and evidently not recoverably at this scale.
+
+**The route worth taking is reading that state directly.** SokuLib exposes
+character position, animation state and hit detection, and `dll/src/session.cpp`
+already calls into the game's own structures for the replay bypass and reads
+`SWRCHARINPUT` for the input log. A world model over a few dozen exact state
+variables is a far smaller problem than one over pixels, its rewards need no
+probe, and the action-consequence link this whole document is about would be
+present by construction rather than hoped for.
+
+That is a redesign of milestone 3's observation space, not a tuning change, and
+it is the honest recommendation rather than a fifth attempt at the same thing.
 
 **Reconsider the frame rate.** Decisions run at 15 Hz against a 60 Hz game.
 Whether an attack connects is often decided within two or three frames, which is
