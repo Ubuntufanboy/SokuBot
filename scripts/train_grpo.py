@@ -145,6 +145,8 @@ def main() -> int:
     ap.add_argument("--eval-starts", type=int, default=1024)
     ap.add_argument("--ckpt-every", type=int, default=1000)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--uniform-init", action="store_true",
+                    help="skip the corpus action prior and start uniform")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -195,6 +197,25 @@ def main() -> int:
     At = torch.from_numpy(A).to(a.device)
 
     policy = SokuPolicy(cfg.latent_dim, cfg.history, cfg.action_ticks).to(a.device)
+    if not a.uniform_init:
+        # Start from the corpus's own button statistics so the first rollouts sit
+        # where the world model was trained. A uniform policy holds 44% of
+        # buttons per tick against a human 9.85%, and is vertically neutral 33%
+        # of the time against 82% -- every rollout from a uniform start is
+        # extrapolation, and that is what GRPO has been optimising against.
+        p1 = A.astype(np.float32).reshape(-1, cfg.action_dim)[:, :10]
+        lr_p = np.array([float(((1 - p1[:, 2]) * (1 - p1[:, 3])).mean()),
+                         float(p1[:, 2].mean()), float(p1[:, 3].mean())])
+        ud_p = np.array([float(((1 - p1[:, 0]) * (1 - p1[:, 1])).mean()),
+                         float(p1[:, 0].mean()), float(p1[:, 1].mean())])
+        policy.set_action_prior(lr_p / lr_p.sum(), ud_p / ud_p.sum(),
+                                p1[:, 4:10].mean(0))
+        with torch.no_grad():
+            samp = policy(torch.zeros(512, cfg.history, cfg.latent_dim,
+                                      device=a.device),
+                          torch.zeros(512, dtype=torch.long, device=a.device))
+        print(f"policy prior: press rate {float(samp.actions.mean()):.4f} "
+              f"(corpus {float(p1.mean()):.4f}, uniform ~0.44)", flush=True)
     opt = torch.optim.AdamW(policy.parameters(), lr=a.lr)
     arena = ImaginedArena(wm, ProbeHead(probe).to(a.device), gcfg,
                           cfg.history, cfg.action_ticks)

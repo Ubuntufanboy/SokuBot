@@ -36,6 +36,31 @@ def test_damage_dealt_is_positive_and_scaled():
     assert r[0, 0] > 0
 
 
+def test_oscillating_health_is_not_damage():
+    """A flat-but-noisy health trace must not read as damage.
+
+    The probe's per-step residual is around 0.14 of a bar, so an imagined health
+    trajectory wobbles even when nothing is happening. Summing per-step clamped
+    decreases rectifies that wobble into a large fake damage total which no
+    action can influence -- the reward the policy could actually move ends up
+    buried under it. Net mode differences the endpoints instead, so a trace that
+    returns to where it started scores nothing.
+    """
+    wobble = [full(hp2=1.0), full(hp2=0.9), full(hp2=1.0), full(hp2=0.9),
+              full(hp2=1.0)]
+    net = compute_rewards(*make(wobble), RewardConfig(damage_mode="net"))[2]
+    step = compute_rewards(*make(wobble), RewardConfig(damage_mode="step"))[2]
+    assert net["dealt"].sum().item() == 0.0
+    assert step["dealt"].sum().item() > 0.19        # two rectified 0.1 dips
+
+    # A real drop must still be scored, and by the same amount either way.
+    fall = [full(hp2=1.0), full(hp2=0.9), full(hp2=0.8), full(hp2=0.7)]
+    net_d = compute_rewards(*make(fall), RewardConfig(damage_mode="net"))[2]
+    step_d = compute_rewards(*make(fall), RewardConfig(damage_mode="step"))[2]
+    assert abs(net_d["dealt"].sum().item() - 0.3) < 1e-5
+    assert abs(step_d["dealt"].sum().item() - 0.3) < 1e-5
+
+
 def test_side_symmetry():
     """The same events from P2's chair must pay P2 exactly what they paid P1."""
     cfg = RewardConfig()

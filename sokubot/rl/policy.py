@@ -65,7 +65,29 @@ class SokuPolicy(nn.Module):
         # Per tick: 3 lr logits + 3 ud logits + 6 button logits.
         self.head = nn.Linear(width, ticks * (3 + 3 + N_FREE))
         nn.init.zeros_(self.head.bias)
-        nn.init.normal_(self.head.weight, std=0.01)   # near-uniform at init
+        nn.init.normal_(self.head.weight, std=0.01)   # bias dominates at init
+
+    def set_action_prior(self, lr_probs, ud_probs, btn_probs) -> None:
+        """Start the policy at the button statistics of real play.
+
+        A uniform policy holds about 44% of buttons per tick; people hold 9.85%,
+        and are neutral on the vertical axis 82% of the time against a uniform
+        33%. Every imagined rollout from a uniform start is therefore a regime
+        the world model never saw in 200 hours, where its predictions are
+        unconstrained extrapolation -- and optimising against extrapolation is
+        what GRPO has been doing.
+
+        The head's weights are initialised near zero so its bias sets the
+        distribution at step 0. This only moves the starting point; nothing
+        stops the policy from leaving it.
+        """
+        with torch.no_grad():
+            lr = torch.as_tensor(lr_probs, dtype=torch.float32).clamp_min(1e-6).log()
+            ud = torch.as_tensor(ud_probs, dtype=torch.float32).clamp_min(1e-6).log()
+            p = torch.as_tensor(btn_probs, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
+            btn = torch.log(p / (1 - p))
+            per_tick = torch.cat([lr, ud, btn])
+            self.head.bias.copy_(per_tick.repeat(self.ticks))
 
     def logits(self, z_hist: torch.Tensor, side: torch.Tensor):
         B = z_hist.shape[0]

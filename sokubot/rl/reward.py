@@ -65,6 +65,23 @@ class RewardConfig:
     damage_dealt: float = 1.0
     damage_taken: float = -1.0
 
+    # How health change becomes damage.
+    #
+    #   "step"  sum of per-step clamped decreases. The obvious choice and the
+    #           wrong one here: the clamp rectifies the probe's per-step
+    #           residual, which is around 0.14 of a bar and roughly independent
+    #           across steps, so a perfectly flat health trajectory still
+    #           accumulates about 0.4*sigma of fake damage per step. Over
+    #           sixteen steps that is close to a bar, against real damage of a
+    #           fraction of one. Rectified noise does not depend on the actions,
+    #           so it is a large constant the policy cannot move, and the part it
+    #           can move sits underneath.
+    #
+    #   "net"   one clamped decrease across the whole rollout, hp[0] - hp[T],
+    #           paid at the end. There are no per-step differences to rectify, so
+    #           endpoint noise enters once instead of once per step.
+    damage_mode: str = "net"
+
     # Red on the opponent's bar is how much the *current combo* has done. Paying
     # for its size rewards extending a combo rather than trading single hits.
     combo: float = 0.30
@@ -176,8 +193,23 @@ def compute_rewards(
     alive = (steps <= first_ko[:, None]).float()
 
     # ---- health deltas; increases discarded (see module docstring) ----
-    d_them = (thr_hp[:, 1:] - thr_hp[:, :-1]).clamp(max=0.0).abs()   # I dealt this
-    d_me = (mine_hp[:, 1:] - mine_hp[:, :-1]).clamp(max=0.0).abs()   # I took this
+    if cfg.damage_mode == "step":
+        d_them = (thr_hp[:, 1:] - thr_hp[:, :-1]).clamp(max=0.0).abs()
+        d_me = (mine_hp[:, 1:] - mine_hp[:, :-1]).clamp(max=0.0).abs()
+    elif cfg.damage_mode == "net":
+        # One decrease over the rollout, credited at the last live step, so the
+        # probe's per-step residual is not rectified sixteen times over.
+        last = first_ko.clamp(max=T - 2)
+        gather = last[:, None]
+        end_them = thr_hp[:, 1:].gather(1, gather)
+        end_me = mine_hp[:, 1:].gather(1, gather)
+        tot_them = (end_them - thr_hp[:, :1]).clamp(max=0.0).abs()
+        tot_me = (end_me - mine_hp[:, :1]).clamp(max=0.0).abs()
+        at_last = (torch.arange(T - 1, device=dev)[None, :] == last[:, None]).float()
+        d_them = tot_them * at_last
+        d_me = tot_me * at_last
+    else:
+        raise ValueError(f"unknown damage_mode {cfg.damage_mode!r}; want step or net")
 
     # ---- card use: ground-truth button, cost inferred from the spirit drop ----
     pressed = btn[..., SPELL].amax(dim=2)                  # [B,T] any tick in chunk
