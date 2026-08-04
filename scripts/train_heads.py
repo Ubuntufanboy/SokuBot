@@ -29,25 +29,57 @@ from sokubot.model.layers import Block
 from sokubot.model.world_model import LeWorldModel
 from sokubot.train import make_loader, set_seed, enable_fast_math
 
-class Decoder(nn.Module):
-    """Latent -> image, via learned patch queries cross-attending to the latent."""
-    def __init__(self, latent, img=224, patch=16, dim=256, depth=4, heads=8):
+class CrossBlock(nn.Module):
+    """Self-attention over patch queries, then cross-attention into the latent."""
+    def __init__(self, dim, heads, mlp=4.0):
         super().__init__()
-        self.p, self.n = patch, (img // patch) ** 2
-        self.img = img
+        self.n1 = nn.LayerNorm(dim); self.sa = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.n2 = nn.LayerNorm(dim); self.ca = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.n3 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, int(dim*mlp)), nn.GELU(),
+                                 nn.Linear(int(dim*mlp), dim))
+    def forward(self, x, kv):
+        h = self.n1(x); x = x + self.sa(h, h, h, need_weights=False)[0]
+        h = self.n2(x); x = x + self.ca(h, kv, kv, need_weights=False)[0]
+        return x + self.mlp(self.n3(x))
+
+
+class Decoder(nn.Module):
+    """Latent -> image.
+
+    The first version injected the latent as `queries + Linear(z)`: a single
+    linear projection added to every token. It converged in ~5k steps to a
+    constant image -- the dataset mean plus the static HUD -- and 8x more compute
+    changed nothing, because the bottleneck was the conditioning, not the budget.
+    A 192-d latent carrying scene content that a *linear* probe reads at R^2 0.96
+    for health is clearly not empty; the decoder simply could not use it.
+
+    Now: a 2-layer MLP expands the latent into a small set of memory tokens, and
+    patch queries reach it by cross-attention (LeWM App. D), so each patch can
+    attend to different parts of the code non-linearly. A residual conv head
+    cleans up patch-edge seams, which pure patch decoders show badly.
+    """
+    def __init__(self, latent, img=224, patch=16, dim=384, depth=6, heads=8, mem=16):
+        super().__init__()
+        self.p, self.n, self.img, self.mem = patch, (img // patch) ** 2, img, mem
         self.q = nn.Parameter(torch.zeros(1, self.n, dim)); nn.init.trunc_normal_(self.q, std=.02)
-        self.ctx = nn.Linear(latent, dim)
-        self.blocks = nn.ModuleList(Block(dim, heads, 4.0) for _ in range(depth))
+        self.to_mem = nn.Sequential(nn.Linear(latent, dim * 2), nn.GELU(),
+                                    nn.Linear(dim * 2, dim * mem))
+        self.blocks = nn.ModuleList(CrossBlock(dim, heads) for _ in range(depth))
         self.norm = nn.LayerNorm(dim)
         self.out = nn.Linear(dim, patch * patch * 3)
+        self.refine = nn.Sequential(nn.Conv2d(3, 32, 3, padding=1), nn.GELU(),
+                                    nn.Conv2d(32, 32, 3, padding=1), nn.GELU(),
+                                    nn.Conv2d(32, 3, 3, padding=1))
     def forward(self, z):
         B = z.shape[0]
-        x = self.q.expand(B, -1, -1) + self.ctx(z).unsqueeze(1)   # inject latent everywhere
-        for b in self.blocks: x = b(x)
-        p = self.out(self.norm(x))                                # [B,n,p*p*3]
+        kv = self.to_mem(z).view(B, self.mem, -1)
+        x = self.q.expand(B, -1, -1)
+        for b in self.blocks: x = b(x, kv)
+        p = self.out(self.norm(x))
         s = self.img // self.p
-        p = p.view(B, s, s, self.p, self.p, 3).permute(0, 5, 1, 3, 2, 4)
-        return p.reshape(B, 3, self.img, self.img)
+        img = p.view(B, s, s, self.p, self.p, 3).permute(0, 5, 1, 3, 2, 4).reshape(B, 3, self.img, self.img)
+        return img + self.refine(img)
 
 class BCPolicy(nn.Module):
     """Latent history -> 20 button logits (both players)."""

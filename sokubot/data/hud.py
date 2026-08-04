@@ -117,6 +117,7 @@ RISE_MIN_SPEED, RISE_MAX_SPEED = 1.0, 30.0
 RISE_MIN_FRAMES = 4
 RISE_MIN_TRAVEL = 20
 PARK_LO, PARK_HI = 54, 76
+PARK_MIN_FRAMES = 15
 
 HEAL_JUMP = 0.10            # yellow rising by more than this is a heal, not play
 
@@ -440,7 +441,11 @@ def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = Tru
             k = j
             while k + 1 < n and not np.isnan(y[k + 1]) and PARK_LO <= y[k + 1] <= PARK_HI:
                 k += 1
-            if k - j >= NAME_MIN_FRAMES:
+            # The rise is what identifies a cast; the park only measures how long
+            # the card lasts. Requiring 90 parked frames was left over from when
+            # parking was the detector, and it discarded valid casts whose
+            # banner clears quickly -- including the one confirmed by hand.
+            if k - j >= PARK_MIN_FRAMES:
                 out.append((i, k, float(foe[i:min(k, len(foe))].sum())))
             i = k + 1
             continue

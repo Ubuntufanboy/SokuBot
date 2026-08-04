@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 from sokubot.data.hud import (read_trace, damage_events, spellcard_events,
-                              name_banner, NAME_BAND, P1_NAME_X, P2_NAME_X)
+                              banner_top, PARK_LO, PARK_HI, P1_NAME_X, P2_NAME_X)
 W=H=480; PANEL=104; FPS=60
 
 def decode(p):
@@ -26,7 +26,7 @@ def draw(fr, on, i, who, a, b, dmg, rid, sep=False):
         img.paste(Image.fromarray(fr),(0,0)); dr=ImageDraw.Draw(img)
         x0,x1=P1_NAME_X if who==1 else P2_NAME_X
         col=(255,70,70) if on[i] else (90,80,100)
-        dr.rectangle([x0,NAME_BAND[0],x1,NAME_BAND[1]],outline=col,width=2)
+        dr.rectangle([x0,PARK_LO-2,x1,PARK_HI+2],outline=col,width=2)
     y0=H+6
     dr.text((8,y0), f"P{who} SPELL CARD?   {rid}   frames {a}-{b}  ({(b-a)/60:.1f}s)",fill=(217,164,65))
     dr.text((8,y0+16), f"damage during window: {dmg:.3f}   ->  {'HIT' if dmg>0.02 else 'WHIFF'}",
@@ -53,7 +53,7 @@ def main():
     for r in rows:
         fr=decode(r["video"]); t=read_trace(fr,smooth=3)
         for who in (1,2):
-            on=name_banner(fr,who)
+            yb=banner_top(fr,who); on=~np.isnan(yb)   # red text present at all
             for (s,e,dmg) in spellcard_events(fr,t,who):
                 out.extend([draw(None,on,s,who,s,e,dmg,r["replay_id"][:12],sep=True)]*24)
                 lo,hi=max(0,s-24),min(len(fr),e+24)
