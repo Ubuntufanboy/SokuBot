@@ -130,7 +130,10 @@ def main() -> int:
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--starts", type=int, default=256, help="groups per batch")
     ap.add_argument("--bank-replays", type=int, default=200)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=5e-5,
+                    help="the 3e-4 this defaulted to silently overrode the "
+                         "1e-4 in GRPOConfig and drove KL to 54 with 43%% of "
+                         "samples outside the trust region")
     ap.add_argument("--replay-share", type=float, default=0.0,
                     help="fraction of rollouts facing recorded human input; it is "
                          "open-loop, so this defaults off")
@@ -299,10 +302,14 @@ def main() -> int:
             # that will converge on doing nothing, and it would look like a
             # rising reward with no other symptom. These rates make it visible.
             with torch.no_grad():
-                held = traj["mine"].amax(dim=2)               # [B,T,10] per step
-                rec["press_rate"] = float(held.mean())
-                rec["idle_rate"] = float((held.amax(dim=-1) < 0.5).float().mean())
-                rec["attack_rate"] = float(held[..., 4:8].amax(dim=-1).mean())
+                m = traj["mine"]                              # [B,T,ticks,10]
+                rec["press_rate"] = float(m.mean())           # per button per tick
+                rec["attack_rate"] = float(m[..., 4:8].mean())
+                rec["move_rate"] = float(m[..., :4].mean())
+                # A decision step with nothing held at any tick. This is the one
+                # the world model's inverted idle causality would drive upward.
+                rec["idle_rate"] = float(
+                    (m.amax(dim=2).amax(dim=-1) < 0.5).float().mean())
             if step % a.eval_every == 0 or step == 1:
                 ev = evaluate()
                 rec.update({f"eval_{k}": v for k, v in ev.items()})
@@ -310,7 +317,8 @@ def main() -> int:
                       f"{ev['net']:+.5f} | as P1 {ev['p1_dealt']:+.4f}/"
                       f"{ev['p1_taken']:+.4f} | as P2 {ev['p2_dealt']:+.4f}/"
                       f"{ev['p2_taken']:+.4f} | idle {rec['idle_rate']:.3f} "
-                      f"attack {rec['attack_rate']:.3f}", flush=True)
+                      f"press {rec['press_rate']:.3f} atk {rec['attack_rate']:.3f}",
+                      flush=True)
             # Damage is the term the whole reward is denominated in, so track
             # both halves of the exchange rather than only the net.
             rec["elapsed_h"] = (time.time() - t0) / 3600
