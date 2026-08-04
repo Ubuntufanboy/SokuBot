@@ -68,7 +68,11 @@ def main() -> int:
     ap.add_argument("--ckpt", type=Path, default=Path("/root/ckpt/best.pt"))
     ap.add_argument("--probe", type=Path,
                     default=Path("/root/horizon2/reward_probe.npz"))
-    ap.add_argument("--bank", type=Path, default=Path("/root/grpo/bank.npz"))
+    ap.add_argument("--bank", type=Path, default=Path("/root/grpo/bank.npz"),
+                    help="start-state latents; built from --corpus if absent, and "
+                         "it must have been encoded by --ckpt")
+    ap.add_argument("--corpus", type=Path, default=Path("/root/corpus"))
+    ap.add_argument("--bank-replays", type=int, default=40)
     ap.add_argument("--starts", type=int, default=512)
     ap.add_argument("--horizon", type=int, default=24)
     ap.add_argument("--device", default="cuda")
@@ -87,6 +91,15 @@ def main() -> int:
                                  ysd=d["ysd"], W=d["W"],
                                  names=[str(x) for x in d["names"]])).to(a.device)
 
+    # Start states must be encoded by *this* checkpoint. A bank built with a
+    # different encoder holds latents from a different space, and every number
+    # below would be measured against nonsense.
+    if not a.bank.exists():
+        from scripts.train_grpo import build_bank
+        manifest = a.corpus / "train" / "manifest.jsonl"
+        rows = [json.loads(l) for l in manifest.read_text().splitlines()]
+        np.random.default_rng(0).shuffle(rows)
+        build_bank(rows, manifest, wm, cfg, a.device, a.bank_replays, a.bank)
     bank = np.load(a.bank)
     Z = torch.from_numpy(bank["z"]).to(a.device)
     ep = bank["ep"]

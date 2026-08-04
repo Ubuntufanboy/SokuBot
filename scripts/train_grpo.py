@@ -50,17 +50,41 @@ from sokubot.rl.reward import RewardConfig
 from scripts.horizon_ablation import capture_paths, encode_all
 
 
+def model_fingerprint(model) -> str:
+    """A cheap identity for the weights that produced a set of latents.
+
+    Only the first kilobyte of each tensor is hashed, which is plenty to tell
+    two checkpoints apart and fast enough to run on every load.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    for name, p in sorted(model.state_dict().items()):
+        h.update(name.encode())
+        h.update(p.detach().float().cpu().numpy().tobytes()[:1024])
+    return h.hexdigest()[:16]
+
+
 def build_bank(rows, manifest, model, cfg, device, n_replays, bank_path: Path):
     """Encode gameplay into a bank of start states, cached on disk.
 
     Stores latents as float16 and buttons as uint8: the bank is read every step
     of training and never differentiated through, so the precision it would cost
     to keep full-width buys nothing.
+
+    The cache records which weights encoded it. Latents only mean anything
+    relative to the encoder that produced them, and a bank silently reused across
+    a fine-tune would feed the policy start states from a different space --
+    wrong in a way that trains happily and reports nothing.
     """
+    fp = model_fingerprint(model)
     if bank_path.exists():
         d = np.load(bank_path)
-        print(f"bank: {len(d['z'])} latents from cache", flush=True)
-        return d["z"], d["a"], d["ep"]
+        cached = str(d["fingerprint"]) if "fingerprint" in d else "<unrecorded>"
+        if cached == fp:
+            print(f"bank: {len(d['z'])} latents from cache", flush=True)
+            return d["z"], d["a"], d["ep"]
+        print(f"bank: rebuilding, cache was encoded by {cached} and this model "
+              f"is {fp}", flush=True)
     zs, acts, ep = [], [], []
     for k, r in enumerate(rows[:n_replays]):
         video, inputs = capture_paths(r, manifest)
@@ -79,7 +103,7 @@ def build_bank(rows, manifest, model, cfg, device, n_replays, bank_path: Path):
             print(f"   bank {k+1}/{min(n_replays, len(rows))}", flush=True)
     Z, A, E = np.concatenate(zs), np.concatenate(acts), np.concatenate(ep)
     bank_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(bank_path, z=Z, a=A, ep=E)
+    np.savez(bank_path, z=Z, a=A, ep=E, fingerprint=fp)
     print(f"bank: {len(Z)} latents from {len(zs)} replays -> {bank_path}", flush=True)
     return Z, A, E
 
