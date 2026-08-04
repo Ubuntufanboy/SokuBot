@@ -426,45 +426,6 @@ def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = Tru
         a small addition -- and would give exact ground truth rather than an
         inference from pixels.
     """
-
-    Four approaches have failed here, and the history is worth keeping because
-    each failed differently:
-
-      1. Card-stock dimming. Documented and true (casting consumes every lit
-         card) but not specific: the stock dims in many states. 0/49 correct.
-      2. Same, plus a lit-to-dark transition. Removed round intros, still 0%.
-      3. Red text parked under the health bar. Colour-only, so a red stage and
-         red effects trigger it. 0% again -- which is exactly what the player who
-         suggested this signal warned about when they said to track movement.
-      4. This one: the banner's rise. Correct in principle, but it misses the
-         one cast verified frame by frame (replay 5278716, P2, frame 5239).
-
-    Why 4 currently fails, most likely: the trajectory was measured over
-    x 300-472, then the band was narrowed to the outer half (356-472) to exclude
-    the weather bubble and the win markers, and the narrowing was never
-    re-validated. The banner spans roughly x 305-460, so the narrowed box clips
-    its left portion and may no longer contain a wide enough red run.
-
-    NEXT STEP, and do it in this order: re-measure `banner_top` against frames
-    5230-5260 of replay 5278716 inside the *narrowed* band, confirm the rise is
-    still visible there, and only then set the speed and travel bounds from what
-    that measurement shows. Every failure above came from setting a parameter
-    before measuring the thing it constrains.
-
-    Spell-card casts, detected by the name banner's RISE.
-
-    Colour is not the signal and never was. The stage can be red, effects can be
-    red, and a red character can drift through the band -- every colour-only
-    detector built here scored 0% against footage, twice.
-
-    What is specific to a cast is the motion: the name climbs at a near-constant
-    rate and then stops just under the win indicator. Measured on a confirmed
-    cast (replay 5278716, P2): y = 106 -> 64 over seven frames, about 6 px per
-    frame, then parked at 60-62. Requiring a monotone climb of roughly that speed
-    that *terminates in the park band* is a trajectory a background cannot fake.
-
-    Returns [(start, end, damage_dealt)].
-    """
     y = banner_top(frames, who, flip=flip)
     foe = damage_events(t, 2 if who == 1 else 1)
     n = len(y)
