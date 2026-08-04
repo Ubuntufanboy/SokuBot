@@ -4,6 +4,59 @@ Written at the end of the 2026-08-04 overnight session. Every number here is
 reproducible from a script in `scripts/`; none of it is inference from a
 training curve.
 
+## Corrections, 2026-08-04 later session
+
+Three claims below were tested directly and are wrong. They are left in place
+because the reasoning that produced them is worth seeing, but do not act on
+them.
+
+**"The detail is never computed" / "the latent is essentially the HUD" -- wrong.**
+`scripts/what_is_encoded.py`: frames with matched HUD readings whose characters
+are 31.5/255 apart in the play area sit at cosine 0.78, against 0.055 for
+arbitrary pairs. The six HUD readings explain 0.0296 of latent variance and no
+single dimension is half-explained. The characters are encoded.
+
+**"Encoding strength tracks predictability" -- wrong.** Spirit is 0.96 to 0.98
+predictable one step ahead and scores 0.03 on the probe, which is the reverse of
+what that story requires. Spirit is missing because five six-pixel hexagons do
+not survive the downsample, which was the original and duller explanation.
+
+**"The decoder produced no characters, so the latent has none" -- wrong.** The
+decoder plateaued at L1 0.13 trained against a frozen encoder. Its blank stage
+was its own failure and was read as evidence about the representation.
+
+Two supporting measurements were also unsound. The random-init encoder control
+is degenerate: an untrained ViT behind a BatchNorm projector maps every input to
+nearly one vector, cosine 0.99 for unrelated frames, so it separates nothing and
+proves nothing. And `corr(attack_rate, damage)` cannot support the conclusion it
+was used for -- a correct simulator would also score near zero, because attacks
+thrown at random timing and spacing miss in the real game too.
+
+**A real bug was found underneath all of it.** The reward probe is fit on
+predictor outputs while `ImaginedArena.rollout` seeded every trajectory with an
+encoder latent. On encoder latents that probe emits health at standard deviation
+0.85 against a label spread of 0.32, so each rollout's baseline was read on the
+wrong scale and inflated damage roughly fourfold -- mean damage over sixteen
+steps 0.3264 before the fix and 0.0969 after. R^2 was 0.83 throughout and never
+revealed it, which is why `horizon_ablation` now prints each probe's dispersion
+against the label spread on every run.
+
+**What still holds after the fix.** GRPO does not move: behaviour changes
+materially -- press rate 0.099 to 0.116, KL from the reference 0.31 -- while
+predicted damage stays identical to four decimal places. So the recommendation
+to abandon pixels was premature and is withdrawn; nothing measured has yet
+implicated the observation space rather than the objective or the instrument.
+
+**The open question.** Within-group reward spread is 14% of mean damage, so the
+model *is* action-sensitive per rollout, yet that sensitivity yields no
+exploitable direction. The hypothesis worth testing next is that it is chaotic
+rather than mechanical: fit a model predicting damage from (start latent, action
+sequence), train on some starts and test on held-out ones. If it generalises,
+the optimiser is at fault. If R^2 is near zero, the sensitivity is state-specific
+noise, which is what MSE-trained deterministic prediction produces in a
+stochastic game, and the fix is a stochastic latent -- still entirely within
+pixels and inputs.
+
 ## The short version
 
 GRPO cannot learn in this world model, and the reason is measured rather than
