@@ -64,6 +64,11 @@ def main() -> int:
     ap.add_argument("--starts", type=int, default=256)
     ap.add_argument("--samples", type=int, default=32, help="rollouts per start")
     ap.add_argument("--horizon", type=int, default=16)
+    ap.add_argument("--horizons", type=int, nargs="*", default=None,
+                    help="report the correlation at each of these rollout "
+                         "lengths as well as the full one. The full-horizon "
+                         "number alone cannot tell an action effect that never "
+                         "existed from one that existed and washed out.")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", type=Path, default=Path("/root/aggression.json"))
     a = ap.parse_args()
@@ -129,6 +134,12 @@ def main() -> int:
     taken = terms["taken"].sum(dim=1)
     net = dealt + taken
 
+    def within_h(x, y):
+        xs = x.view(a.starts, G) - x.view(a.starts, G).mean(1, keepdim=True)
+        ys = y.view(a.starts, G) - y.view(a.starts, G).mean(1, keepdim=True)
+        return float(((xs * ys).sum(1) /
+                      (xs.norm(dim=1) * ys.norm(dim=1) + 1e-12)).mean())
+
     def corr(x, y):
         x, y = x - x.mean(), y - y.mean()
         return float((x * y).sum() / (x.norm() * y.norm() + 1e-12))
@@ -163,6 +174,27 @@ def main() -> int:
     print(f"damage spread within a start  {res['dealt_spread_within']:.4f}")
     print(f"damage spread across starts   {res['dealt_spread_across']:.4f}")
     print()
+    if a.horizons:
+        # Recompute rewards over truncated prefixes of the same rollouts, so the
+        # only thing changing is how far the rollout is allowed to run.
+        print(f"{'steps':>6} {'seconds':>8} {'mean dealt':>11} {'spread':>9} "
+              f"{'corr(attack,dealt)':>19}")
+        print("-" * 58)
+        sweep = {}
+        for h in a.horizons:
+            if h > P:
+                continue
+            st = states[:, : h + 1]
+            _, _, tm = compute_rewards(st, J[:, :h], side, rcfg)
+            dh = tm["dealt"].sum(dim=1)
+            c = within_h(attack, dh)
+            sweep[h] = {"corr": c, "mean_dealt": float(dh.mean()),
+                        "spread_within": float(dh.view(a.starts, G).std(1).mean())}
+            print(f"{h:6d} {h*4/60:8.3f} {dh.mean():11.4f} "
+                  f"{sweep[h]['spread_within']:9.4f} {c:+19.4f}")
+        print("-" * 58)
+        res["by_horizon"] = sweep
+        print()
     print(f"corr(attack, dealt) within start : {res['attack_vs_dealt_within']:+.4f}")
     print(f"corr(attack, net)   within start : {res['attack_vs_net_within']:+.4f}")
     print(f"corr(press,  dealt) within start : {res['press_vs_dealt_within']:+.4f}")

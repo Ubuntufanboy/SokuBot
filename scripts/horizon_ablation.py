@@ -421,6 +421,26 @@ def main() -> int:
              names=np.array(probe_cal.names), alpha=best["calibrated"])
     print(f"wrote {a.out/'reward_probe.npz'}")
 
+    # The encoder-fit probe too. The calibrated one is right for predictor
+    # outputs and wrong for encoder outputs, and a rollout contains both: its
+    # first state is a real encoded frame and every later one is predicted.
+    # Reading those two with one probe compares quantities on different scales,
+    # which manufactures a large fake change at the first step.
+    np.savez(a.out / "reward_probe_encoder.npz", zmu=probe.zmu, zsd=probe.zsd,
+             ymu=probe.ymu, ysd=probe.ysd, W=probe.W,
+             names=np.array(probe.names), alpha=best["real"])
+    print(f"wrote {a.out/'reward_probe_encoder.npz'}")
+
+    # Dispersion check. A probe whose output spread is far from the label spread
+    # is not calibrated to the latents it is being applied to, whatever its R^2
+    # says, and every difference read through it is scaled wrong.
+    for tag, pr, Zs in (("calibrated on imagined", probe_cal, ev["imag"][:, 0]),
+                        ("calibrated on encoder ", probe_cal, ev["all_z"]),
+                        ("encoder-fit on encoder", probe, ev["all_z"])):
+        out = pr.predict(Zs)
+        print(f"   {tag}: output std {out.std(0)[:2].mean():.4f} "
+              f"vs label std {ev['all_y'].std(0)[:2].mean():.4f}")
+
     try:
         plot(res, a.out / "horizon.png")
         print(f"wrote {a.out/'horizon.png'}")
