@@ -20,7 +20,7 @@ def make(states, actions=None, side=0):
     """states: [T, 6] as a list of rows -> batched tensors for one trajectory."""
     s = torch.tensor([states], dtype=torch.float32)
     T = s.shape[1]
-    a = torch.zeros(1, T, TICKS, 20) if actions is None else actions
+    a = torch.zeros(1, T - 1, TICKS, 20) if actions is None else actions
     return s, a, torch.tensor([side])
 
 
@@ -81,7 +81,7 @@ def test_losing_is_penalised_not_rewarded():
 def test_spellcard_damage_is_worth_double():
     cfg = RewardConfig()
     # Press the card button at step 0 and spend spirit, then land a hit.
-    a = torch.zeros(1, 3, TICKS, 20)
+    a = torch.zeros(1, 2, TICKS, 20)
     a[0, 0, :, SPELL] = 1.0                          # agent is P1 -> block 0
     s = torch.tensor([[full(hp2=1.0, sp1=1.0),
                        full(hp2=1.0, sp1=0.6),       # 0.4 spirit spent = cast
@@ -91,7 +91,7 @@ def test_spellcard_damage_is_worth_double():
     # Identical damage with no cast.
     s2 = torch.tensor([[full(hp2=1.0), full(hp2=1.0), full(hp2=0.8)]],
                       dtype=torch.float32)
-    plain = compute_rewards(s2, torch.zeros(1, 3, TICKS, 20),
+    plain = compute_rewards(s2, torch.zeros(1, 2, TICKS, 20),
                             torch.tensor([0]), cfg)[2]["dealt"][0, 1]
     assert torch.allclose(with_card, plain * cfg.spell_multiplier, atol=1e-5)
 
@@ -100,7 +100,7 @@ def test_whiffed_card_costs_more_when_the_card_costs_more():
     cfg = RewardConfig()
 
     def whiff_for(spirit_spent):
-        a = torch.zeros(1, 3, TICKS, 20)
+        a = torch.zeros(1, 2, TICKS, 20)
         a[0, 0, :, SPELL] = 1.0
         s = torch.tensor([[full(sp1=1.0),
                            full(sp1=1.0 - spirit_spent),
@@ -113,7 +113,7 @@ def test_whiffed_card_costs_more_when_the_card_costs_more():
 
 def test_pressing_the_button_without_paying_spirit_is_not_a_cast():
     """The button fires for skill cards and for presses that buy nothing."""
-    a = torch.zeros(1, 3, TICKS, 20)
+    a = torch.zeros(1, 2, TICKS, 20)
     a[0, 0, :, SPELL] = 1.0
     s = torch.tensor([[full(sp1=1.0), full(sp1=1.0), full(sp1=1.0)]],
                      dtype=torch.float32)          # no spirit spent
@@ -132,7 +132,7 @@ def test_guard_crush_when_spirit_hits_zero():
 
 def test_idle_is_penalised_and_holding_up_is_not():
     idle = compute_rewards(*make([full(), full()]))[2]
-    a = torch.zeros(1, 2, TICKS, 20)
+    a = torch.zeros(1, 1, TICKS, 20)
     a[0, :, :, UP] = 1.0
     moving = compute_rewards(torch.tensor([[full(), full()]], dtype=torch.float32),
                              a, torch.tensor([0]))[2]
@@ -161,7 +161,7 @@ def test_batch_of_mixed_sides_matches_one_at_a_time():
     cfg = RewardConfig()
     s = torch.tensor([[full(hp2=1.0), full(hp2=0.6)],
                       [full(hp1=1.0), full(hp1=0.6)]], dtype=torch.float32)
-    a = torch.zeros(2, 2, TICKS, 20)
+    a = torch.zeros(2, 1, TICKS, 20)
     side = torch.tensor([0, 1])
     both = compute_rewards(s, a, side, cfg)[0]
     one = compute_rewards(s[:1], a[:1], side[:1], cfg)[0]

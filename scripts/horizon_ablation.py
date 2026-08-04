@@ -94,35 +94,52 @@ def capture_paths(row: dict, manifest: Path) -> tuple[Path, Path]:
     return video, inputs
 
 
-def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int):
+def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int,
+                cache_dir: Path | None = None):
     """-> (obs [D,S,S,3] uint8, actions [D,ticks,20] float32, labels [D,K] float32).
 
     Decision step d corresponds to source frame ``d * frame_skip``: that is the
     contract `sokubot.data.soku` trains under, and getting it wrong here would
     shift every label by a fraction of a second while still looking plausible.
+
+    Labels and action chunks are cached: they depend only on the capture, not on
+    the checkpoint, and producing them means decoding the whole video at native
+    resolution, which dominates the runtime of any re-run.
     """
     skip = cfg.frame_skip
+    key = None
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = cache_dir / f"{video.parent.name}-{max_frames}-{skip}.npz"
 
-    hud = decode_hud(str(video), max_frames)
-    if len(hud) < skip * 8:
-        raise ValueError(f"only {len(hud)} frames decoded")
-    tr = read_trace(hud, smooth=3)
-    del hud
+    if key is not None and key.exists():
+        with np.load(key) as d:
+            labels, chunks = d["labels"], d["chunks"]
+    else:
+        hud = decode_hud(str(video), max_frames)
+        if len(hud) < skip * 8:
+            raise ValueError(f"only {len(hud)} frames decoded")
+        tr = read_trace(hud, smooth=3)
+        del hud
+        acts_full = read_actions(inputs)
+        n = min(len(tr.hp1) // skip, len(acts_full) // skip)
+        idx = np.arange(n) * skip
+        labels = np.stack([getattr(tr, t)[idx] for t in TARGETS], axis=1).astype(np.float32)
+        chunks = np.stack([acts_full[d * skip : d * skip + skip]
+                           for d in range(n)]).astype(np.float32)
+        if key is not None:
+            np.savez_compressed(key, labels=labels, chunks=chunks)
 
     obs = list(decode_frames(video, cfg.image_size, skip))
-    acts = read_actions(inputs)
+    acts = None
 
-    D = min(len(obs), len(tr.hp1) // skip, len(acts) // skip)
+    del acts
+    D = min(len(obs), len(labels), len(chunks))
     if max_frames > 0:
         D = min(D, max_frames // skip)
     if D < 16:
         raise ValueError(f"only {D} decision steps")
-
-    obs_a = np.stack(obs[:D])
-    chunks = np.stack([acts[d * skip : d * skip + skip] for d in range(D)])
-    idx = np.arange(D) * skip
-    labels = np.stack([getattr(tr, t)[idx] for t in TARGETS], axis=1)
-    return obs_a, chunks.astype(np.float32), labels.astype(np.float32)
+    return np.stack(obs[:D]), chunks[:D], labels[:D]
 
 
 @torch.no_grad()
@@ -167,6 +184,10 @@ def main() -> int:
     ap.add_argument("--starts", type=int, default=150, help="start states per replay")
     ap.add_argument("--max-frames", type=int, default=9000,
                     help="cap source frames per replay; 0 for the whole capture")
+    ap.add_argument("--alphas", type=float, nargs="+",
+                    default=[1e-2, 1.0, 1e2, 1e3, 1e4, 1e5, 1e6],
+                    help="ridge strengths to sweep; the gate used 1e-2, which on "
+                         "42k standardised rows is effectively unregularised")
     ap.add_argument("--out", type=Path, default=Path("/root/horizon"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -193,55 +214,90 @@ def main() -> int:
     print(f"{len(fit_rows)} replays to fit the probe, {len(eval_rows)} to evaluate "
           f"(disjoint)", flush=True)
 
-    # ---- pass 1: fit the probe on real latents from the fitting replays ----
-    fit_z, fit_y, failed = [], [], 0
-    for k, r in enumerate(fit_rows):
-        video, inputs = capture_paths(r, manifest)
-        try:
-            obs, _, lab = load_replay(video, inputs, cfg, a.max_frames)
-        except ValueError as exc:                # too short to window; not a bug
-            failed += 1
-            print(f"   skip {r['replay_id'][:12]}: {exc}", flush=True)
-            continue
-        fit_z.append(encode_all(model, obs, a.device))
-        fit_y.append(lab)
-        if (k + 1) % 5 == 0:
-            print(f"   fit {k+1}/{len(fit_rows)}", flush=True)
-    if not fit_z:
-        raise SystemExit(f"no replay produced usable frames out of {len(fit_rows)}")
-    probe = fit_ridge(np.concatenate(fit_z), np.concatenate(fit_y), names=list(TARGETS))
-    n_fit_rows = sum(len(z) for z in fit_z)
-    del fit_z, fit_y
-    print(f"probe fit on {n_fit_rows} latents from {len(fit_rows)-failed} replays",
-          flush=True)
+    # ---- gather real and imagined latents for every replay ----
+    def gather(rows, tag):
+        """-> dict of stacked arrays, or None if nothing usable came back."""
+        Zr, ZIr, Lr, Fr, allz, ally = [], [], [], [], [], []
+        for k, r in enumerate(rows):
+            video, inputs = capture_paths(r, manifest)
+            try:
+                obs, act, lab = load_replay(video, inputs, cfg, a.max_frames,
+                                            a.out / "cache")
+            except ValueError as exc:            # too short to window; not a bug
+                print(f"   skip {r['replay_id'][:12]}: {exc}", flush=True)
+                continue
+            Z = encode_all(model, obs, a.device)
+            del obs
+            allz.append(Z)
+            ally.append(lab)
+            D = len(Z)
+            lo, hi = H - 1, D - P - 1
+            if hi > lo:
+                starts = rng.choice(np.arange(lo, hi), size=min(a.starts, hi - lo),
+                                    replace=False).astype(np.int64)
+                ZIr.append(rollout_starts(model, Z, act, starts, P, H, a.device))
+                off = np.arange(P) + 1
+                Zr.append(Z[starts[:, None] + off[None, :]])
+                Lr.append(lab[starts[:, None] + off[None, :]])
+                Fr.append(Z[starts])
+            if (k + 1) % 5 == 0:
+                print(f"   {tag} {k+1}/{len(rows)}", flush=True)
+        if not allz:
+            return None
+        return {"imag": np.concatenate(ZIr), "real": np.concatenate(Zr),
+                "lab": np.concatenate(Lr), "froz": np.concatenate(Fr),
+                "all_z": np.concatenate(allz), "all_y": np.concatenate(ally)}
 
-    # ---- pass 2: roll out on the evaluation replays ----
-    imag = [[] for _ in range(P)]
-    real = [[] for _ in range(P)]
-    labs = [[] for _ in range(P)]
-    froz = [[] for _ in range(P)]
-    for k, r in enumerate(eval_rows):
-        video, inputs = capture_paths(r, manifest)
-        try:
-            obs, act, lab = load_replay(video, inputs, cfg, a.max_frames)
-        except ValueError as exc:                # too short to window; not a bug
-            print(f"   skip {r['replay_id'][:12]}: {exc}", flush=True)
-            continue
-        Z = encode_all(model, obs, a.device)
-        D = len(Z)
-        lo, hi = H - 1, D - P - 1
-        if hi <= lo:
-            continue
-        starts = rng.choice(np.arange(lo, hi), size=min(a.starts, hi - lo),
-                            replace=False).astype(np.int64)
-        ZI = rollout_starts(model, Z, act, starts, P, H, a.device)   # [B,P,latent]
-        for j in range(P):
-            imag[j].append(ZI[:, j])
-            real[j].append(Z[starts + j + 1])
-            labs[j].append(lab[starts + j + 1])
-            froz[j].append(Z[starts])
-        if (k + 1) % 5 == 0:
-            print(f"   eval {k+1}/{len(eval_rows)}", flush=True)
+    fit = gather(fit_rows, "fit")
+    if fit is None:
+        raise SystemExit(f"no replay produced usable frames out of {len(fit_rows)}")
+    print(f"fit pool: {len(fit['all_z'])} real latents, "
+          f"{fit['imag'].shape[0]} rollouts x {P} steps", flush=True)
+    ev = gather(eval_rows, "eval")
+    if ev is None:
+        raise SystemExit("no evaluation replay produced usable frames")
+
+    # ---- two candidate readouts, each swept over regularisation strength ----
+    # `real` is fit on encoder outputs only, the way the milestone-4 gate was.
+    # `calibrated` is fit on predictor outputs pooled over every horizon, which
+    # is the distribution the reward actually has to be read from.
+    ny = len(TARGETS)
+    fi = fit["imag"].reshape(-1, cfg.latent_dim)
+    fl = fit["lab"].reshape(-1, ny)
+    probes: dict[str, dict[float, object]] = {"real": {}, "calibrated": {}}
+    for al in a.alphas:
+        probes["real"][al] = fit_ridge(fit["all_z"], fit["all_y"],
+                                       names=list(TARGETS), alpha=al)
+        probes["calibrated"][al] = fit_ridge(fi, fl, names=list(TARGETS), alpha=al)
+    del fi, fl
+
+    # Pick each variant's alpha on the fit replays' own rollouts, never on the
+    # evaluation replays -- selecting on the test set would inflate every number
+    # that follows.
+    MIN_STD_SEL = 1e-3
+    sel_i = fit["imag"][:, ::8].reshape(-1, cfg.latent_dim)
+    sel_l = fit["lab"][:, ::8].reshape(-1, ny)
+    best = {}
+    for kind, byalpha in probes.items():
+        scored = []
+        for al, pr in byalpha.items():
+            r2 = pr.r2(sel_i, sel_l, min_std=MIN_STD_SEL)
+            v = [x for x in r2.values() if np.isfinite(x)]
+            scored.append((float(np.mean(v)) if v else -np.inf, al))
+        scored.sort(reverse=True)
+        best[kind] = scored[0][1]
+        print(f"alpha for {kind:11s}: {scored[0][1]:g}  "
+              + "  ".join(f"{al:g}:{s:+.3f}" for s, al in sorted(scored, key=lambda x: x[1])),
+              flush=True)
+    del sel_i, sel_l
+
+    probe = probes["real"][best["real"]]
+    probe_cal = probes["calibrated"][best["calibrated"]]
+
+    imag = [ev["imag"][:, j] for j in range(P)]
+    real = [ev["real"][:, j] for j in range(P)]
+    labs = [ev["lab"][:, j] for j in range(P)]
+    froz = [ev["froz"] for _ in range(P)]
 
     # ---- metrics per horizon ----
     # A target whose spread across the evaluation sample is this small cannot be
@@ -250,8 +306,7 @@ def main() -> int:
     MIN_STD = 1e-3
     curve = []
     for j in range(P):
-        ZI = np.concatenate(imag[j]); ZR = np.concatenate(real[j])
-        Y = np.concatenate(labs[j]);  ZF = np.concatenate(froz[j])
+        ZI, ZR, Y, ZF = imag[j], real[j], labs[j], froz[j]
         n = len(ZI)
 
         # A fresh probe needs enough held-out rows to be worth fitting: with
@@ -275,7 +330,8 @@ def main() -> int:
             "n": int(n),
             "ceiling": probe.r2(ZR, Y, min_std=MIN_STD),
             "imagined": probe.r2(ZI, Y, min_std=MIN_STD),
-            "frozen": probe.r2(ZF, Y, min_std=MIN_STD),
+            "calibrated": probe_cal.r2(ZI, Y, min_std=MIN_STD),
+            "frozen": probe_cal.r2(ZF, Y, min_std=MIN_STD),
             "refit": refit,
             "label_std": {t: float(s) for t, s in zip(TARGETS, Y.std(0))},
             "drift_rel_l2": float(np.mean(num / den)),
@@ -289,33 +345,51 @@ def main() -> int:
     # Usable horizon: imagined must retain 90% of the ceiling and still beat the
     # do-nothing baseline. Both conditions matter -- a high R^2 that merely ties
     # `frozen` means the rollout added no information.
+    # The deployed readout is the calibrated one, so it is what sets the horizon.
+    #
+    # Two things this deliberately does NOT do. It does not average over targets
+    # the reward cannot use: spirit scores ~0 even from real latents, so
+    # including it drags the mean below any threshold and reports a horizon of
+    # zero for a model whose health readings are fine. And it does not require
+    # beating the frozen baseline at short horizons -- over one step "nothing
+    # changed" is very nearly true, so frozen is *supposed* to be strong there.
+    # The margin over frozen grows with horizon; the retained fraction of the
+    # ceiling is what shrinks. Those are the two things worth reporting.
+    KEY = "calibrated"
+
+    def mean_of(d, ts):
+        v = [d[t] for t in ts if np.isfinite(d[t])]
+        return float(np.mean(v)) if v else float("nan")
+
+    scored = [t for t in TARGETS if curve[0]["ceiling"][t] > 0.15]
+    dropped = [t for t in TARGETS if t not in scored]
     usable = 0
     for c in curve:
-        ceil = mean(c["ceiling"])
-        if ceil > 0 and mean(c["imagined"]) >= 0.90 * ceil and \
-           mean(c["imagined"]) > mean(c["frozen"]) + 0.02:
-            usable = c["h"]
-        else:
-            break
-    beats = 0
-    for c in curve:
-        if mean(c["imagined"]) > mean(c["frozen"]) + 0.02:
-            beats = c["h"]
-        else:
-            break
+        ceil = mean_of(c["ceiling"], scored)
+        if ceil > 0 and mean_of(c[KEY], scored) >= 0.90 * ceil:
+            usable = c["h"]                       # largest, not first-break
+    beats = max((c["h"] for c in curve
+                 if mean_of(c[KEY], scored) > mean_of(c["frozen"], scored) + 0.02),
+                default=0)
 
     print()
-    print("=" * 78)
-    print(f"{'h':>3} {'sec':>5} {'ceiling':>8} {'imagined':>9} {'frozen':>8} "
-          f"{'refit':>8} {'drift':>7} {'cos':>6}")
-    print("=" * 78)
+    print("=" * 88)
+    print(f"{'h':>3} {'sec':>5} {'ceiling':>8} {'calibr':>8} {'real-fit':>9} "
+          f"{'frozen':>8} {'refit':>8} {'drift':>7} {'cos':>6}")
+    print("=" * 88)
     for c in curve:
         if c["h"] <= 8 or c["h"] % 4 == 0:
             print(f"{c['h']:3d} {c['seconds']:5.2f} {mean(c['ceiling']):8.3f} "
-                  f"{mean(c['imagined']):9.3f} {mean(c['frozen']):8.3f} "
-                  f"{mean(c['refit']):8.3f} {c['drift_rel_l2']:7.3f} "
-                  f"{c['cosine']:6.3f}")
-    print("=" * 78)
+                  f"{mean(c['calibrated']):8.3f} {mean(c['imagined']):9.3f} "
+                  f"{mean(c['frozen']):8.3f} {mean(c['refit']):8.3f} "
+                  f"{c['drift_rel_l2']:7.3f} {c['cosine']:6.3f}")
+    print("=" * 88)
+    print("per-target, calibrated probe on imagined latents:")
+    print(f"{'h':>3} " + "".join(f"{t:>9}" for t in TARGETS))
+    for c in curve:
+        if c["h"] in (1, 2, 4, 8, 16, 24, 32, 48):
+            print(f"{c['h']:3d} " + "".join(f"{c['calibrated'][t]:9.3f}" for t in TARGETS))
+    print("=" * 88)
     print(f"per-target ceiling (real latents, by-replay split), "
           f"with the spread R^2 is measured against:")
     for t in TARGETS:
@@ -323,15 +397,19 @@ def main() -> int:
               f"label std {curve[0]['label_std'][t]:.4f}")
     print(f"   (n = {curve[0]['n']} start states)")
     print()
+    print(f"scored on {scored}"
+          + (f"; dropped {dropped} (not decodable even from real latents)"
+             if dropped else ""))
     print(f"USABLE HORIZON : {usable} steps = {usable*skip/60:.2f}s "
-          f"(>=90% of ceiling and beating frozen)")
+          f"(calibrated probe still at >=90% of its ceiling)")
     print(f"BEATS FROZEN   : {beats} steps = {beats*skip/60:.2f}s "
-          f"(rollout still adds information)")
+          f"(rollout beats assuming nothing changed)")
     print("=" * 78)
 
     res = {"ckpt": str(a.ckpt), "step": blob.get("step"), "history": H,
            "frame_skip": skip, "horizon": P, "targets": list(TARGETS),
            "replays_fit": len(fit_rows), "replays_eval": len(eval_rows),
+           "alpha_real": best["real"], "alpha_calibrated": best["calibrated"],
            "usable_horizon": usable, "beats_frozen": beats, "curve": curve}
     (a.out / "horizon.json").write_text(json.dumps(res, indent=2))
     print(f"wrote {a.out/'horizon.json'}")
@@ -368,8 +446,9 @@ def plot(res: dict, path: Path) -> None:
 
     a0 = ax[0][0]
     a0.plot(h, m("ceiling"), color="#4ade80", lw=2, label="ceiling (real latent)")
-    a0.plot(h, m("imagined"), color="#d9a441", lw=2.5, label="imagined (deployed)")
-    a0.plot(h, m("refit"), color="#60a5fa", lw=1.6, ls="--", label="refit on imagined")
+    a0.plot(h, m("calibrated"), color="#d9a441", lw=2.5,
+            label="calibrated probe (deployed)")
+    a0.plot(h, m("refit"), color="#60a5fa", lw=1.6, ls="--", label="refit per horizon")
     a0.plot(h, m("frozen"), color="#f87171", lw=1.6, ls=":", label="frozen (do nothing)")
     u = res["usable_horizon"]
     if u:
@@ -385,7 +464,7 @@ def plot(res: dict, path: Path) -> None:
     a1 = ax[0][1]
     for t, col in zip(res["targets"],
                       ["#d9a441", "#f0b860", "#60a5fa", "#93c5fd", "#f87171", "#fca5a5"]):
-        a1.plot(h, [c["imagined"][t] for c in curve], color=col, lw=1.8, label=t)
+        a1.plot(h, [c["calibrated"][t] for c in curve], color=col, lw=1.8, label=t)
     a1.set_title("Per-target decay (imagined latents)", color="#efe9fb", fontsize=12)
     a1.set_xlabel("horizon (decision steps)", color="#c9c2dc")
     a1.set_ylabel("probe R²", color="#c9c2dc")

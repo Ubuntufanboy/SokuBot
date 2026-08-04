@@ -4,9 +4,12 @@ GRPO never sees a pixel. Each imagined latent is turned into game state by the
 linear probe (health, spirit, combo red), and this module turns a *trajectory*
 of that state, plus the actions that produced it, into a scalar per step.
 
-    states  [B, T, 6]        probe output: hp1 hp2 spirit1 spirit2 combo1 combo2
-    actions [B, T, ticks, 20] both players' buttons, agent's side included
-    side    [B]              0 if the agent is P1, 1 if P2
+    states  [B, T+1, 6]        probe output: hp1 hp2 spirit1 spirit2 combo1 combo2
+    actions [B, T, ticks, 20]  both players' buttons, agent's side included
+    side    [B]                0 if the agent is P1, 1 if P2
+
+There is one more state than action because action t is what carries state t to
+state t+1, and it is scored by what that transition did.
 
 Everything is written from the agent's point of view via `side`, so one policy
 plays either side and the reward is always "what happened to me".
@@ -115,19 +118,24 @@ def _my_buttons(actions: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
 
 
 def compute_rewards(
-    states: torch.Tensor,          # [B, T, 6]  probed, in bar units
+    states: torch.Tensor,          # [B, T+1, 6]  probed, in bar units
     actions: torch.Tensor,         # [B, T, ticks, 20]
     side: torch.Tensor,            # [B] long, 0 = agent is P1
     cfg: RewardConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """-> (reward [B, T-1], alive_mask [B, T-1], per-term breakdown).
+    """-> (reward [B, T], alive_mask [B, T], per-term breakdown).
 
     Step t's reward is paid for the transition from state t to state t+1 under
-    the action at t, so the sequence is one shorter than the state sequence.
+    the action at t, so there is one fewer reward than there are states.
     """
     cfg = cfg or RewardConfig()
     B, T, _ = states.shape
     dev = states.device
+    if actions.shape[1] != T - 1:
+        raise ValueError(
+            f"got {T} states and {actions.shape[1]} actions; action t drives the "
+            f"transition from state t to state t+1, so there must be exactly "
+            f"{T - 1}")
     mine_hp, thr_hp, mine_sp, thr_cb = _sides(states, side)
     btn = _my_buttons(actions, side)                       # [B,T,ticks,10]
 
@@ -146,7 +154,7 @@ def compute_rewards(
     # ---- card use: ground-truth button, cost inferred from the spirit drop ----
     pressed = btn[..., SPELL].amax(dim=2)                  # [B,T] any tick in chunk
     sp_drop = (mine_sp[:, :-1] - mine_sp[:, 1:]).clamp(min=0.0)
-    cast = (pressed[:, :-1] > 0.5) & (sp_drop >= cfg.spell_cost_min)
+    cast = (pressed > 0.5) & (sp_drop >= cfg.spell_cost_min)
     cost = torch.where(cast, sp_drop, torch.zeros_like(sp_drop))
 
     # A cast is "active" for the following `spell_window` steps. Damage landed
@@ -180,8 +188,8 @@ def compute_rewards(
 
     # ---- action proxies ----
     held = btn.mean(dim=2)                                  # [B,T,10] duty cycle
-    r_fly = cfg.flying * held[:, :-1, UP]
-    r_idle = cfg.idle * (btn[:, :-1].amax(dim=(2, 3)) < 0.5).float()
+    r_fly = cfg.flying * held[..., UP]
+    r_idle = cfg.idle * (btn.amax(dim=(2, 3)) < 0.5).float()
 
     terms = {"dealt": r_dealt, "taken": r_taken, "combo": r_combo, "whiff": r_whiff,
              "crush": r_crush, "outcome": r_out, "flying": r_fly, "idle": r_idle}
