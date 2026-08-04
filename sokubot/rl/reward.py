@@ -49,6 +49,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 
 # Column order of the probe's output, fixed by scripts/horizon_ablation.py.
 HP1, HP2, SPIRIT1, SPIRIT2, COMBO1, COMBO2 = range(6)
@@ -88,9 +89,22 @@ class RewardConfig:
     flying: float = 0.005          # action proxy; see module docstring
     idle: float = -0.010           # action proxy
 
-    ko_threshold: float = 0.02
+    # A KO is read off a *probed* health value, and the probe's residual noise is
+    # around 0.13 of a bar (label std 0.32 at R^2 0.83). A bare "health <= 0.02"
+    # test therefore fires on noise many times per rollout, and at +-5 it swamps
+    # damage, which lives around 0.1. Three things make it mean something:
+    # a threshold above the noise floor, a persistence requirement (noise is
+    # roughly independent across steps, a real KO is not), and a requirement that
+    # the side started the rollout alive, so a start state that merely *reads*
+    # low does not pay out.
+    ko_threshold: float = 0.06
+    ko_persist: int = 3
+    ko_alive_margin: float = 0.10
+
     # A spirit drop this large at a card press means a card actually went off.
-    # One orb is 0.2 of the gauge; a real cast spends at least one.
+    # One orb is 0.2 of the gauge; a real cast spends at least one. Set above 1.0
+    # to disable card detection entirely, which is correct wherever spirit is not
+    # decodable from the latent.
     spell_cost_min: float = 0.12
 
 
@@ -140,10 +154,24 @@ def compute_rewards(
     btn = _my_buttons(actions, side)                       # [B,T,ticks,10]
 
     # ---- termination: everything after the first KO is masked out ----
-    ko_me = mine_hp[:, 1:] <= cfg.ko_threshold
-    ko_them = thr_hp[:, 1:] <= cfg.ko_threshold
+    def _ko(hp: torch.Tensor) -> torch.Tensor:
+        """Down for `ko_persist` consecutive steps, having started alive."""
+        down = (hp[:, 1:] <= cfg.ko_threshold).float()
+        if cfg.ko_persist > 1:
+            k = cfg.ko_persist
+            # Pad with "not down". A KO within k steps of the end is therefore
+            # missed rather than assumed, which is the right way to be wrong:
+            # the alternative pays +-5 for a single noisy read at the boundary.
+            pad = torch.zeros(B, k - 1, device=dev)
+            run = F.avg_pool1d(torch.cat([down, pad], dim=1)[:, None], k, 1)[:, 0]
+            down = (run >= 1.0 - 1e-6).float()
+        started_alive = (hp[:, :1] > cfg.ko_threshold + cfg.ko_alive_margin).float()
+        return (down * started_alive).bool()
+
+    ko_me, ko_them = _ko(mine_hp), _ko(thr_hp)
     ko_any = ko_me | ko_them
-    first_ko = torch.where(ko_any.any(1), ko_any.float().argmax(1), torch.full((B,), T - 1, device=dev))
+    first_ko = torch.where(ko_any.any(1), ko_any.float().argmax(1),
+                           torch.full((B,), T - 1, device=dev))
     steps = torch.arange(T - 1, device=dev)[None, :]
     alive = (steps <= first_ko[:, None]).float()
 
@@ -182,7 +210,11 @@ def compute_rewards(
     r_crush = cfg.crush * crushed.float()
 
     # ---- match outcome, paid once at the KO step ----
-    r_out = (cfg.win * (ko_them & ~ko_me).float() + cfg.lose * ko_me.float())
+    # A simultaneous read is a double KO, which is a draw, not a loss. Paying
+    # `lose` whenever `ko_me` fires regardless of `ko_them` made every ambiguous
+    # reading negative, and with a noisy probe ambiguous readings are common.
+    both = ko_me & ko_them
+    r_out = (cfg.win * (ko_them & ~both).float() + cfg.lose * (ko_me & ~both).float())
     at_ko = (steps == first_ko[:, None]).float()
     r_out = r_out * at_ko
 

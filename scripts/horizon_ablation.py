@@ -414,6 +414,13 @@ def main() -> int:
     (a.out / "horizon.json").write_text(json.dumps(res, indent=2))
     print(f"wrote {a.out/'horizon.json'}")
 
+    # The calibrated readout is what GRPO reads rewards with, so persist it
+    # rather than making the training run refit it.
+    np.savez(a.out / "reward_probe.npz", zmu=probe_cal.zmu, zsd=probe_cal.zsd,
+             ymu=probe_cal.ymu, ysd=probe_cal.ysd, W=probe_cal.W,
+             names=np.array(probe_cal.names), alpha=best["calibrated"])
+    print(f"wrote {a.out/'reward_probe.npz'}")
+
     try:
         plot(res, a.out / "horizon.png")
         print(f"wrote {a.out/'horizon.png'}")

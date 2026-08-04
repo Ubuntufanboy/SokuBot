@@ -1,0 +1,234 @@
+"""Train the Soku policy with GRPO inside the imagined world.
+
+    python -m scripts.train_grpo --steps 20000 --horizon 24
+
+The world model and the reward probe are frozen; only the policy learns. It
+starts from random weights: the imagined environment runs several thousand times
+faster than real Hisoutensoku (see scripts/bench_arena.py), so the sample
+inefficiency of starting cold costs minutes rather than the days it would cost
+against the real game.
+
+Start states are real. Each is a window of encoded gameplay drawn from the
+corpus, so the policy is always asked to continue a situation that actually
+happened rather than one imagination invented.
+
+HORIZON
+-------
+scripts/horizon_ablation.py measured how long a rollout stays readable. With the
+probe calibrated on predictor outputs, health holds R^2 ~0.83 out to 32 steps
+and 0.79 at 48; the combo channel decays much faster, from 0.31 at one step to
+0.18 by 24 and roughly nothing by 48. Damage is computed from health, so the
+default horizon of 24 steps (1.6 s) sits where the dominant reward term is still
+at its ceiling, and the combo weight is small because that term is the one the
+ablation says to distrust.
+
+Spirit is not used at all. It is not decodable from the latent even from real
+frames (R^2 0.04 / -0.02), which is a property of the representation and not of
+the rollout, so guard-crush and spell-cost rewards are switched off rather than
+computed from noise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from sokubot.config import Config
+from sokubot.data.soku import decode_frames, read_actions
+from sokubot.model.world_model import LeWorldModel
+from sokubot.probe import LinearProbe
+from sokubot.rl.grpo import (GRPOConfig, ImaginedArena, PolicyOpponent, ProbeHead,
+                             ReplayOpponent, SnapshotPool, group_advantages,
+                             grpo_loss)
+from sokubot.rl.policy import SokuPolicy
+from sokubot.rl.reward import RewardConfig
+from scripts.horizon_ablation import capture_paths, encode_all
+
+
+def build_bank(rows, manifest, model, cfg, device, n_replays, bank_path: Path):
+    """Encode gameplay into a bank of start states, cached on disk.
+
+    Stores latents as float16 and buttons as uint8: the bank is read every step
+    of training and never differentiated through, so the precision it would cost
+    to keep full-width buys nothing.
+    """
+    if bank_path.exists():
+        d = np.load(bank_path)
+        print(f"bank: {len(d['z'])} latents from cache", flush=True)
+        return d["z"], d["a"], d["ep"]
+    zs, acts, ep = [], [], []
+    for k, r in enumerate(rows[:n_replays]):
+        video, inputs = capture_paths(r, manifest)
+        skip = cfg.frame_skip
+        obs = list(decode_frames(video, cfg.image_size, skip))
+        raw = read_actions(inputs)
+        D = min(len(obs), len(raw) // skip)
+        if D < 64:
+            continue
+        z = encode_all(model, np.stack(obs[:D]), device)
+        chunks = np.stack([raw[d * skip : d * skip + skip] for d in range(D)])
+        ep.append(np.full(D, len(zs), dtype=np.int32))
+        zs.append(z.astype(np.float16))
+        acts.append(chunks.astype(np.uint8))
+        if (k + 1) % 10 == 0:
+            print(f"   bank {k+1}/{min(n_replays, len(rows))}", flush=True)
+    Z, A, E = np.concatenate(zs), np.concatenate(acts), np.concatenate(ep)
+    bank_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(bank_path, z=Z, a=A, ep=E)
+    print(f"bank: {len(Z)} latents from {len(zs)} replays -> {bank_path}", flush=True)
+    return Z, A, E
+
+
+def valid_starts(ep: np.ndarray, history: int, horizon: int) -> np.ndarray:
+    """Indices whose context and future both stay inside one replay."""
+    ok = []
+    edges = np.flatnonzero(np.diff(ep)) + 1
+    for lo, hi in zip(np.r_[0, edges], np.r_[edges, len(ep)]):
+        a, b = lo + history - 1, hi - horizon - 1
+        if b > a:
+            ok.append(np.arange(a, b))
+    return np.concatenate(ok)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--corpus", type=Path, default=Path("/root/corpus"))
+    ap.add_argument("--wm", type=Path, default=Path("/root/ckpt/best.pt"))
+    ap.add_argument("--probe", type=Path, default=Path("/root/horizon2/reward_probe.npz"))
+    ap.add_argument("--out", type=Path, default=Path("/root/grpo"))
+    ap.add_argument("--steps", type=int, default=20_000)
+    ap.add_argument("--horizon", type=int, default=24)
+    ap.add_argument("--group-size", type=int, default=8)
+    ap.add_argument("--starts", type=int, default=256, help="groups per batch")
+    ap.add_argument("--bank-replays", type=int, default=200)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--replay-share", type=float, default=0.0,
+                    help="fraction of rollouts facing recorded human input; it is "
+                         "open-loop, so this defaults off")
+    ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--ckpt-every", type=int, default=1000)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args()
+    a.out.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(a.seed)
+    rng = np.random.default_rng(a.seed)
+
+    blob = torch.load(a.wm, map_location=a.device, weights_only=False)
+    cfg: Config = blob["cfg"]
+    cfg.device = a.device
+    wm = LeWorldModel(cfg).to(a.device)
+    wm.load_state_dict(blob["model"])
+    wm.eval()
+
+    d = np.load(a.probe, allow_pickle=True)
+    probe = LinearProbe(zmu=d["zmu"], zsd=d["zsd"], ymu=d["ymu"], ysd=d["ysd"],
+                        W=d["W"], names=[str(x) for x in d["names"]])
+    print(f"reward probe: alpha {float(d['alpha']):g}, targets {probe.names}",
+          flush=True)
+
+    # Spirit is unmeasurable in the latent, so the terms that depend on it are
+    # off. Combo survives only at short horizons, hence the reduced weight.
+    # Weights checked against a random policy's term breakdown before launching.
+    # A damage exchange over one rollout is worth about 0.1, so the shaping terms
+    # have to sit well under that or the agent can farm them instead of fighting:
+    # flying at 0.005/step was worth 0.12 a rollout, more than the damage it was
+    # meant to nudge toward.
+    rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
+                        flying=0.0015)
+    gcfg = GRPOConfig(horizon=a.horizon, group_size=a.group_size,
+                      starts_per_batch=a.starts, lr=a.lr, reward=rcfg)
+
+    manifest = a.corpus / "train" / "manifest.jsonl"
+    rows = [json.loads(l) for l in manifest.read_text().splitlines()]
+    rng.shuffle(rows)
+    Z, A, E = build_bank(rows, manifest, wm, cfg, a.device, a.bank_replays,
+                         a.out / "bank.npz")
+    starts = valid_starts(E, cfg.history, a.horizon)
+    print(f"{len(starts)} valid start states", flush=True)
+
+    Zt = torch.from_numpy(Z).to(a.device)
+    At = torch.from_numpy(A).to(a.device)
+
+    policy = SokuPolicy(cfg.latent_dim, cfg.history, cfg.action_ticks).to(a.device)
+    opt = torch.optim.AdamW(policy.parameters(), lr=a.lr)
+    arena = ImaginedArena(wm, ProbeHead(probe).to(a.device), gcfg,
+                          cfg.history, cfg.action_ticks)
+    pool = SnapshotPool(gcfg)
+    G, S = a.group_size, a.starts
+    B = G * S
+    print(f"policy {sum(p.numel() for p in policy.parameters())/1e6:.2f}M | "
+          f"{S} groups x {G} = {B} rollouts x {a.horizon} steps", flush=True)
+
+    hist, t0 = [], time.time()
+    for step in range(1, a.steps + 1):
+        # Each group shares one start state and one side.
+        idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)
+        idx = idx.repeat_interleave(G)
+        side = torch.randint(0, 2, (S,), device=a.device).repeat_interleave(G)
+        off = torch.arange(cfg.history, device=a.device) - (cfg.history - 1)
+        z_ctx = Zt[idx[:, None] + off[None, :]].float()
+        a_hist = At[idx[:, None] + off[None, :-1]].float()
+
+        if rng.random() < a.replay_share:
+            fut = At[idx[:, None] + torch.arange(a.horizon, device=a.device)[None, :]]
+            opponent, kind = ReplayOpponent(fut.float()), "replay"
+        else:
+            snap = pool.sample(rng)
+            use_snap = snap is not None and rng.random() < 0.5
+            opponent = PolicyOpponent(snap if use_snap else policy)
+            kind = "snapshot" if use_snap else "self"
+
+        traj = arena.rollout(z_ctx, a_hist, side, policy, opponent)
+        adv = group_advantages(traj["reward"], traj["alive"], G, gcfg.gamma)
+        flat_side = side[:, None].expand(B, a.horizon).reshape(-1)
+        with torch.no_grad():
+            old_logp = policy.log_prob_of(
+                traj["obs"].reshape(-1, cfg.history, cfg.latent_dim), flat_side,
+                traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
+
+        loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
+        opt.step()
+        pool.maybe_add(policy, step)
+
+        if step % a.log_every == 0 or step == 1:
+            alive = traj["alive"]
+            n = alive.sum().clamp(min=1)
+            rec = {"step": step, "loss": float(loss.detach()), "opponent": kind,
+                   "reward": float((traj["reward"] * alive).sum() / n),
+                   "ret": float(traj["reward"].sum(1).mean()),
+                   "grad_norm": float(gn), "alive_frac": float(alive.mean()),
+                   **stats,
+                   **{f"r_{k}": float((v * alive).sum() / n)
+                      for k, v in traj["terms"].items()}}
+            # Damage is the term the whole reward is denominated in, so track
+            # both halves of the exchange rather than only the net.
+            rec["elapsed_h"] = (time.time() - t0) / 3600
+            hist.append(rec)
+            (a.out / "log.json").write_text(json.dumps(hist, indent=1))
+            print(f"step {step:6d} | ret {rec['ret']:+8.4f} | dealt "
+                  f"{rec['r_dealt']:+.4f} taken {rec['r_taken']:+.4f} | "
+                  f"KL {rec['kl']:.4f} ent {rec['entropy']:.2f} "
+                  f"clip {rec['clip_frac']:.3f} | vs {kind} | "
+                  f"{rec['elapsed_h']:.2f}h", flush=True)
+
+        if step % a.ckpt_every == 0:
+            torch.save({"policy": policy.state_dict(), "cfg": cfg, "gcfg": gcfg,
+                        "rcfg": rcfg, "step": step}, a.out / "policy.pt")
+
+    torch.save({"policy": policy.state_dict(), "cfg": cfg, "gcfg": gcfg,
+                "rcfg": rcfg, "step": a.steps}, a.out / "policy.pt")
+    print(f"done in {(time.time()-t0)/3600:.2f} h -> {a.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

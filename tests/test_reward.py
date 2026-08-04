@@ -62,8 +62,9 @@ def test_end_of_match_heal_pays_nothing():
 
 
 def test_ko_pays_once_and_masks_the_rest():
-    # Opponent is KO'd at step 1; steps after that are not the agent's match.
-    s, a, side = make([full(hp2=0.3), full(hp2=0.0), full(hp2=1.0), full(hp2=0.5)])
+    # Opponent drops and *stays* down, which is what separates a KO from noise.
+    s, a, side = make([full(hp2=0.3), full(hp2=0.0), full(hp2=0.0),
+                       full(hp2=0.0), full(hp2=0.5)])
     r, alive, terms = compute_rewards(s, a, side)
     assert terms["outcome"][0, 0].item() > 0        # win paid at the KO step
     assert alive[0, 0].item() == 1.0
@@ -72,8 +73,42 @@ def test_ko_pays_once_and_masks_the_rest():
     assert (terms["outcome"][0, 1:] == 0).all()     # and never paid twice
 
 
+def test_a_single_frame_dip_is_not_a_ko():
+    """The probe's health residual is ~0.13 of a bar; one low read means nothing.
+
+    This is the property that keeps a +-5 term from firing on probe noise many
+    times per rollout and drowning out damage, which lives around 0.1.
+    """
+    s, a, side = make([full(hp2=0.6), full(hp2=0.0), full(hp2=0.6),
+                       full(hp2=0.6), full(hp2=0.6)])
+    r, alive, terms = compute_rewards(s, a, side)
+    assert terms["outcome"].abs().max().item() == 0.0
+    assert alive.min().item() == 1.0                # nothing was terminated
+
+
+def test_a_side_that_starts_low_does_not_pay_out():
+    """Starts are sampled from real gameplay, so some begin near death."""
+    s, a, side = make([full(hp2=0.02), full(hp2=0.0), full(hp2=0.0),
+                       full(hp2=0.0), full(hp2=0.0)])
+    terms = compute_rewards(s, a, side)[2]
+    assert terms["outcome"].abs().max().item() == 0.0
+
+
+def test_simultaneous_ko_is_a_draw_not_a_loss():
+    """An ambiguous double reading must not be scored as a loss.
+
+    `ko_them & ~ko_me` paid `lose` for every simultaneous read, and with a noisy
+    probe those are common -- it biased the whole outcome term negative.
+    """
+    s, a, side = make([full(hp1=0.5, hp2=0.5), full(hp1=0.0, hp2=0.0),
+                       full(hp1=0.0, hp2=0.0), full(hp1=0.0, hp2=0.0)])
+    terms = compute_rewards(s, a, side)[2]
+    assert terms["outcome"].sum().item() == 0.0
+
+
 def test_losing_is_penalised_not_rewarded():
-    s, a, side = make([full(hp1=0.3), full(hp1=0.0)])
+    s, a, side = make([full(hp1=0.3), full(hp1=0.0), full(hp1=0.0),
+                       full(hp1=0.0), full(hp1=0.0)])
     r, alive, terms = compute_rewards(s, a, side)
     assert terms["outcome"][0, 0].item() < 0
 
