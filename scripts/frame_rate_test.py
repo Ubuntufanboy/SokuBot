@@ -52,6 +52,14 @@ def main() -> int:
     ap.add_argument("--lookaheads", type=int, nargs="+",
                     default=[2, 4, 8, 16, 24, 48], help="in game frames at 60 Hz")
     ap.add_argument("--drop", type=float, default=0.01)
+    ap.add_argument("--drops", type=float, nargs="*", default=None,
+                    help="sweep the damage threshold at a fixed lookahead "
+                         "instead of sweeping the lookahead. One health bar is "
+                         "189 px, so 0.01 is about two pixels -- plausibly "
+                         "inside the HUD reader's own jitter, which would cap "
+                         "AUC for every representation and look exactly like a "
+                         "representation failure")
+    ap.add_argument("--fixed-lookahead", type=int, default=16)
     ap.add_argument("--max-frames", type=int, default=5400)
     ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--device", default="cuda")
@@ -97,11 +105,14 @@ def main() -> int:
     Xd = X.to(dev)
     print(f"\n{len(X)} frames at 60 Hz, {len(tr_i)} train / {len(va_i)} val, "
           f"split by replay\n")
-    print(f"{'lookahead':>10} {'seconds':>8} {'base rate':>10} {'AUC':>8}")
+    print(f"{'lookahead':>10} {'drop':>8} {'base rate':>10} {'AUC':>8}")
     print("-" * 40)
 
+    # Either sweep is the same loop over (lookahead, threshold) pairs.
+    sweep = ([(a.fixed_lookahead, d) for d in a.drops] if a.drops
+             else [(L, a.drop) for L in a.lookaheads])
     res = {}
-    for L in a.lookaheads:
+    for L, drop in sweep:
         # Targets are rebuilt per replay so a lookahead never reads across a
         # boundary into the next capture.
         parts = []
@@ -109,7 +120,7 @@ def main() -> int:
             n = len(hp) - max(a.lookaheads) - 1
             cur = hp[:n]
             fut = hp[L : L + n]
-            parts.append(((cur - fut) > a.drop).astype(np.float32))
+            parts.append(((cur - fut) > drop).astype(np.float32))
         Y = torch.from_numpy(np.concatenate(parts))
         base = float(Y[tr_i].mean())
         Yd = Y.to(dev)
@@ -124,12 +135,26 @@ def main() -> int:
                              nn.Linear(512, 512), nn.GELU(),
                              nn.Linear(512, 1)).to(dev)
         auc = fit_and_score(make, len(tr_i), len(va_i), dev, head, a.steps)
-        res[str(L)] = {"auc": auc, "base_rate": base, "seconds": L / 60.0}
-        print(f"{L:10d} {L/60.0:8.3f} {base:10.4f} {auc:8.4f}")
+        key = f"L{L}_d{drop:g}"
+        res[key] = {"auc": auc, "base_rate": base, "seconds": L / 60.0,
+                    "lookahead": L, "drop": drop}
+        print(f"{L:10d} {drop:8.3f} {base:10.4f} {auc:8.4f}")
 
-    aucs = [res[str(L)]["auc"] for L in a.lookaheads]
+    aucs = [res[f"L{L}_d{d:g}"]["auc"] for L, d in sweep]
     near, far = aucs[0], aucs[-1]
     print("-" * 40)
+    if a.drops:
+        print(f"threshold {sweep[0][1]:g} -> {sweep[-1][1]:g}: "
+              f"AUC {near:.4f} -> {far:.4f} ({far - near:+.4f})")
+        if far - near > 0.08:
+            print("VERDICT: the earlier ceiling was the label, not the "
+                  "representation -- a two-pixel threshold was scoring HUD "
+                  "jitter, and real hits are far more predictable")
+        else:
+            print("VERDICT: the ceiling holds at every threshold, so it is "
+                  "the representation and not label noise")
+        a.out.write_text(json.dumps(res, indent=2))
+        return 0
     print(f"nearest lookahead {a.lookaheads[0]} frames: {near:.4f}")
     print(f"farthest {a.lookaheads[-1]} frames        : {far:.4f}")
     print(f"decay across the sweep                : {near - far:+.4f}")

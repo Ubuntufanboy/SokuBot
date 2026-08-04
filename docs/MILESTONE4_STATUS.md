@@ -164,9 +164,29 @@ AUC **rises** with distance. A hit two frames away is *harder* to call than one
 0.8 s away, which is the exact reverse of what a short-lived signal discarded by
 15 Hz would produce. Sampling more often would not help.
 
+**And it is worse than the ceiling suggested.** Sweeping the damage threshold
+at a fixed 16-frame lookahead, because 0.01 of a bar is only about two pixels of
+a 189-pixel gauge and could have been the HUD reader's own jitter rather than a
+hit:
+
+| threshold | of a bar | base rate | AUC |
+|---|---|---|---|
+| 0.005 | ~1 px | 0.1755 | 0.6187 |
+| 0.010 | ~2 px | 0.1052 | 0.6543 |
+| 0.020 | ~4 px | 0.0708 | 0.6468 |
+| 0.050 | ~10 px | 0.0268 | **0.4886** |
+| 0.100 | ~19 px | 0.0028 | 0.2942 |
+
+Not label noise -- the ceiling does not lift when the threshold rises. The
+opposite: predictability *collapses to chance* exactly when the events become
+large enough to be real connected attacks. The 0.62 to 0.65 reported above was
+tracking small drifts -- chip damage, weather regen, reader jitter -- and not
+hits at all. The bottom row has about thirty positive examples in validation and
+is noise, but 0.4886 at a tenth of that rate is not.
+
 ## What that leaves
 
-The pattern across all four experiments is consistent: the latent tracks
+The pattern across all five experiments is consistent: the latent tracks
 something slow and situational -- roughly, that a player is under pressure and
 damage is likely soon -- and does not represent the mechanics that decide whether
 a particular attack connects. More pixels, the full patch grid, a
