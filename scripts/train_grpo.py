@@ -127,10 +127,13 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("/root/grpo"))
     ap.add_argument("--steps", type=int, default=20_000)
     ap.add_argument("--horizon", type=int, default=24)
-    ap.add_argument("--group-size", type=int, default=8)
+    ap.add_argument("--group-size", type=int, default=16,
+                    help="the baseline is the group mean, so a larger group "
+                         "estimates it better and samples a wider spread of "
+                         "behaviour from one start")
     ap.add_argument("--starts", type=int, default=256, help="groups per batch")
     ap.add_argument("--bank-replays", type=int, default=200)
-    ap.add_argument("--lr", type=float, default=5e-5,
+    ap.add_argument("--lr", type=float, default=1.5e-4,
                     help="the 3e-4 this defaulted to silently overrode the "
                          "1e-4 in GRPOConfig and drove KL to 54 with 43%% of "
                          "samples outside the trust region")

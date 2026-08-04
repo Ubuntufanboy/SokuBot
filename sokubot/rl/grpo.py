@@ -66,11 +66,19 @@ class GRPOConfig:
     gamma: float = 0.99
     clip_eps: float = 0.2
     kl_coef: float = 0.02
-    # Rewards come from a probe with real residual noise, so the policy will
-    # happily sharpen onto noise if left alone; the first run lost 40% of its
-    # entropy in 25 steps. This holds exploration open long enough for the
-    # genuine signal to outvote it.
-    entropy_coef: float = 0.02
+    # Raised to 0.02 after the first run lost 40% of its entropy in 25 steps,
+    # which was the right diagnosis of the wrong cause: that collapse came from
+    # per-group advantage scaling amplifying tiny return differences, and is
+    # fixed by `advantage_scale`. At 0.02 the entropy bonus contributes about 0.5
+    # to the loss while the policy-gradient term is far smaller, so the policy
+    # sat at 24.98 of a possible 25.4 for 625 steps -- pinned uniform, unable to
+    # commit to anything.
+    #
+    # Worth being clear that the rollout is deterministic: one start plus one
+    # action sequence gives exactly one return, so differences within a group are
+    # entirely caused by the actions sampled. There is no observation noise for
+    # exploration to average out, and the gradient is small rather than noisy.
+    entropy_coef: float = 0.005
     # Passes over each batch of rollouts. With one pass the sampling policy *is*
     # the current policy, so the ratio is identically 1 and both the clipping and
     # the KL penalty are inert -- the update degenerates to REINFORCE with a
