@@ -107,6 +107,17 @@ NAME_MIN_FRAMES = 90
 P1_NAME_X = (8, 124)
 P2_NAME_X = (356, 472)
 
+# The rise is the signal. Measured: enters around y=106, climbs ~6 px/frame for
+# seven frames, stops at 60-62 and holds there for the card.
+RISE_TOP, RISE_BOTTOM = 52, 300
+# The cap was first set from the average speed (~6 px/frame) and rejected the
+# very cast it was derived from: that trajectory steps 100 -> 82 in one frame.
+# Bounds must come from the per-frame extremes, not the mean.
+RISE_MIN_SPEED, RISE_MAX_SPEED = 1.0, 30.0
+RISE_MIN_FRAMES = 4
+RISE_MIN_TRAVEL = 20
+PARK_LO, PARK_HI = 54, 76
+
 HEAL_JUMP = 0.10            # yellow rising by more than this is a heal, not play
 
 # Screen-wide effects (weather transitions, supers, spellcard flashes) wash the
@@ -350,35 +361,88 @@ def combo_size(t: HudTrace, who: int) -> np.ndarray:
     return np.maximum(0.0, c - RED_FLOOR)
 
 
-def name_banner(frames: np.ndarray, who: int, flip: bool = True) -> np.ndarray:
-    """True per frame where a spell-card name is parked under `who`'s health bar."""
+def banner_top(frames: np.ndarray, who: int, flip: bool = True) -> np.ndarray:
+    """Top-most row holding a wide red run, per frame. NaN where none."""
     if flip:
         frames = frames[:, ::-1]
     x0, x1 = P1_NAME_X if who == 1 else P2_NAME_X
-    band = frames[:, NAME_BAND[0]:NAME_BAND[1], x0:x1].astype(np.int16)
+    band = frames[:, RISE_TOP:RISE_BOTTOM, x0:x1].astype(np.int16)
     r, g, b = band[..., 0], band[..., 1], band[..., 2]
     red = (r > 120) & ((r - g) > 55) & ((r - b) > 55)
-    return (red.sum(axis=2) >= NAME_MIN_RUN).any(axis=1)
+    wide = red.sum(axis=2) >= NAME_MIN_RUN            # [n, rows]
+    out = np.full(len(frames), np.nan)
+    for i in range(len(frames)):
+        w = np.where(wide[i])[0]
+        if len(w):
+            out[i] = w.min() + RISE_TOP
+    return out
 
 
 def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = True):
-    """Spell-card windows for `who`, from the name banner.
+    """UNVERIFIED -- misses a hand-confirmed cast. Do not wire into a reward yet.
 
-    Returns [(start, end, damage_dealt)]. Replaces the card-stock approach, which
-    scored zero true positives in review: the stock dims in many states, so its
-    collapse is not specific to casting.
+    Four approaches have failed here, and the history is worth keeping because
+    each failed differently:
+
+      1. Card-stock dimming. Documented and true (casting consumes every lit
+         card) but not specific: the stock dims in many states. 0/49 correct.
+      2. Same, plus a lit-to-dark transition. Removed round intros, still 0%.
+      3. Red text parked under the health bar. Colour-only, so a red stage and
+         red effects trigger it. 0% again -- which is exactly what the player who
+         suggested this signal warned about when they said to track movement.
+      4. This one: the banner's rise. Correct in principle, but it misses the
+         one cast verified frame by frame (replay 5278716, P2, frame 5239).
+
+    Why 4 currently fails, most likely: the trajectory was measured over
+    x 300-472, then the band was narrowed to the outer half (356-472) to exclude
+    the weather bubble and the win markers, and the narrowing was never
+    re-validated. The banner spans roughly x 305-460, so the narrowed box clips
+    its left portion and may no longer contain a wide enough red run.
+
+    NEXT STEP, and do it in this order: re-measure `banner_top` against frames
+    5230-5260 of replay 5278716 inside the *narrowed* band, confirm the rise is
+    still visible there, and only then set the speed and travel bounds from what
+    that measurement shows. Every failure above came from setting a parameter
+    before measuring the thing it constrains.
+
+    Spell-card casts, detected by the name banner's RISE.
+
+    Colour is not the signal and never was. The stage can be red, effects can be
+    red, and a red character can drift through the band -- every colour-only
+    detector built here scored 0% against footage, twice.
+
+    What is specific to a cast is the motion: the name climbs at a near-constant
+    rate and then stops just under the win indicator. Measured on a confirmed
+    cast (replay 5278716, P2): y = 106 -> 64 over seven frames, about 6 px per
+    frame, then parked at 60-62. Requiring a monotone climb of roughly that speed
+    that *terminates in the park band* is a trajectory a background cannot fake.
+
+    Returns [(start, end, damage_dealt)].
     """
-    on = name_banner(frames, who, flip=flip)
+    y = banner_top(frames, who, flip=flip)
     foe = damage_events(t, 2 if who == 1 else 1)
-    out, i, n = [], 0, len(on)
+    n = len(y)
+    out = []
+    i = 1
     while i < n:
-        if not on[i]:
+        if np.isnan(y[i]) or np.isnan(y[i - 1]):
             i += 1
             continue
+        # a rise: consecutive frames moving up within the plausible speed range
         j = i
-        while j < n and on[j]:
+        while (j + 1 < n and not np.isnan(y[j + 1])
+               and RISE_MIN_SPEED <= (y[j] - y[j + 1]) <= RISE_MAX_SPEED):
             j += 1
-        if j - i >= NAME_MIN_FRAMES:
-            out.append((i, j, float(foe[i:min(j, len(foe))].sum())))
-        i = j
+        span = j - i
+        if span >= RISE_MIN_FRAMES and (y[i] - y[j]) >= RISE_MIN_TRAVEL \
+                and PARK_LO <= y[j] <= PARK_HI:
+            # the card lasts while the banner stays parked
+            k = j
+            while k + 1 < n and not np.isnan(y[k + 1]) and PARK_LO <= y[k + 1] <= PARK_HI:
+                k += 1
+            if k - j >= NAME_MIN_FRAMES:
+                out.append((i, k, float(foe[i:min(k, len(foe))].sum())))
+            i = k + 1
+            continue
+        i = max(j + 1, i + 1)
     return out
