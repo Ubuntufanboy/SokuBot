@@ -165,8 +165,15 @@ def main() -> int:
     # have to sit well under that or the agent can farm them instead of fighting:
     # flying at 0.005/step was worth 0.12 a rollout, more than the damage it was
     # meant to nudge toward.
+    # The idle penalty is set against a specific, measured hazard rather than by
+    # feel. The world model credits "P1 presses nothing" with roughly 0.126 of a
+    # bar of damage to P2, because in the corpus a silent frame is usually a
+    # player in hitstun who cannot input -- the correlation is real and the
+    # causality is backwards. At 0.010/step the penalty over a 16-step rollout is
+    # 0.16, barely covering that; at 0.020 it is 0.32, so standing still is
+    # clearly unprofitable even when the model is wrong about why.
     rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
-                        flying=0.0015)
+                        flying=0.0015, idle=-0.020)
     gcfg = GRPOConfig(horizon=a.horizon, group_size=a.group_size,
                       starts_per_batch=a.starts, lr=a.lr, reward=rcfg)
 
@@ -285,13 +292,25 @@ def main() -> int:
                    **stats,
                    **{f"r_{k}": float((v * alive).sum() / n)
                       for k, v in traj["terms"].items()}}
+            # How often the policy actually presses things. The world model
+            # associates "nobody is inputting" with a player in hitstun -- in the
+            # corpus that is what a silent frame usually means -- so it credits
+            # standing still with damaging the opponent. A policy that discovers
+            # that will converge on doing nothing, and it would look like a
+            # rising reward with no other symptom. These rates make it visible.
+            with torch.no_grad():
+                held = traj["mine"].amax(dim=2)               # [B,T,10] per step
+                rec["press_rate"] = float(held.mean())
+                rec["idle_rate"] = float((held.amax(dim=-1) < 0.5).float().mean())
+                rec["attack_rate"] = float(held[..., 4:8].amax(dim=-1).mean())
             if step % a.eval_every == 0 or step == 1:
                 ev = evaluate()
                 rec.update({f"eval_{k}": v for k, v in ev.items()})
                 print(f"  [eval] step {step:6d} | net vs frozen init "
                       f"{ev['net']:+.5f} | as P1 {ev['p1_dealt']:+.4f}/"
                       f"{ev['p1_taken']:+.4f} | as P2 {ev['p2_dealt']:+.4f}/"
-                      f"{ev['p2_taken']:+.4f}", flush=True)
+                      f"{ev['p2_taken']:+.4f} | idle {rec['idle_rate']:.3f} "
+                      f"attack {rec['attack_rate']:.3f}", flush=True)
             # Damage is the term the whole reward is denominated in, so track
             # both halves of the exchange rather than only the net.
             rec["elapsed_h"] = (time.time() - t0) / 3600
