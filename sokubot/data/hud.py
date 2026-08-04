@@ -99,6 +99,14 @@ NAME_MIN_RUN = 15            # px of red in a row for it to be a line of text
 # blips from red effects crossing the band. 90 frames (1.5 s) separates them.
 NAME_MIN_FRAMES = 90
 
+# Only the OUTER half of each side can hold the banner: it is left-aligned for
+# P1 and right-aligned for P2. Searching the full half reached into the middle
+# of the screen and fired on the weather bubble -- whose text is sometimes red --
+# and on the round-win rectangles, which sit at the inner edge beside the timer.
+# Neither may ever be inside the search box.
+P1_NAME_X = (8, 124)
+P2_NAME_X = (356, 472)
+
 HEAL_JUMP = 0.10            # yellow rising by more than this is a heal, not play
 
 # Screen-wide effects (weather transitions, supers, spellcard flashes) wash the
@@ -346,7 +354,7 @@ def name_banner(frames: np.ndarray, who: int, flip: bool = True) -> np.ndarray:
     """True per frame where a spell-card name is parked under `who`'s health bar."""
     if flip:
         frames = frames[:, ::-1]
-    x0, x1 = (8, 240) if who == 1 else (240, 472)
+    x0, x1 = P1_NAME_X if who == 1 else P2_NAME_X
     band = frames[:, NAME_BAND[0]:NAME_BAND[1], x0:x1].astype(np.int16)
     r, g, b = band[..., 0], band[..., 1], band[..., 2]
     red = (r > 120) & ((r - g) > 55) & ((r - b) > 55)
