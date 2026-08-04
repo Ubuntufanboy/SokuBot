@@ -110,8 +110,11 @@ def main() -> int:
 
     rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
                         flying=0.0015, idle=-0.020)
-    zs, joints = [z_ctx[:, -1]], []
-    for _ in range(P):
+    # No encoder latent in the sequence: see ImaginedArena.rollout. The probe is
+    # calibrated for predictor outputs and reads encoder outputs 2.6x
+    # over-dispersed, which fabricates damage at the first step.
+    zs, joints = [], []
+    for _ in range(P + 1):
         mine = policy(z_win, side, sample=True).actions
         theirs = policy(z_win, 1 - side, sample=True).actions
         joint = to_joint(mine, theirs, side)
@@ -123,8 +126,8 @@ def main() -> int:
         if cfg.history > 1:
             a_win = torch.cat([a_win[:, 1:], joint[:, None]], dim=1)
 
-    states = head(torch.stack(zs, dim=1))
-    J = torch.stack(joints, dim=1)                      # [B,P,ticks,20]
+    states = head(torch.stack(zs, dim=1))               # [B,P+1,K] all predicted
+    J = torch.stack(joints[1:], dim=1)                  # [B,P,ticks,20]
     _, alive, terms = compute_rewards(states, J, side, rcfg)
 
     mine_blk = J[..., :10]

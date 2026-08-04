@@ -189,9 +189,17 @@ class ImaginedArena:
         if hasattr(opponent, "reset"):
             opponent.reset()          # replay opponents are stateful in time
         z_win, a_win = z_ctx, a_hist
-        zs, mine_all, joint_all, obs_all = [z_ctx[:, -1]], [], [], []
+        # Deliberately not seeded with z_ctx[:, -1]. That is an *encoder* latent
+        # and every later state is a *predictor* output, and the reward probe is
+        # calibrated for one of those two distributions, not both. Reading the
+        # pair through one probe compares numbers on different scales: on encoder
+        # latents the calibrated probe emits health with standard deviation 0.85
+        # against a label spread of 0.32, which manufactures a large fake change
+        # at the first step and puts every later comparison against a corrupted
+        # baseline. One extra predictor step costs less than that.
+        zs, mine_all, joint_all, obs_all = [], [], [], []
 
-        for _ in range(T):
+        for _ in range(T + 1):
             obs_all.append(z_win)
             out = policy(z_win, side, sample=True)
             mine = jitter_actions(out.actions, cfg.jitter_sigma)
@@ -208,11 +216,14 @@ class ImaginedArena:
             if self.H > 1:
                 a_win = torch.cat([a_win[:, 1:], joint[:, None]], dim=1)
 
+        # T+1 predicted states against the T actions that produced the last T of
+        # them, so the state sequence is homogeneous and the action alignment is
+        # unchanged: joint_all[k] carries zs[k] to zs[k+1].
         states = self.probe(torch.stack(zs, dim=1))          # [B, T+1, K]
-        joint_seq = torch.stack(joint_all, dim=1)            # [B, T, ticks, 20]
+        joint_seq = torch.stack(joint_all[1:], dim=1)        # [B, T, ticks, 20]
         reward, alive, terms = compute_rewards(states, joint_seq, side, cfg.reward)
-        return {"obs": torch.stack(obs_all, dim=1),          # [B, T, H, latent]
-                "mine": torch.stack(mine_all, dim=1),        # [B, T, ticks, 10]
+        return {"obs": torch.stack(obs_all[1:], dim=1),      # [B, T, H, latent]
+                "mine": torch.stack(mine_all[1:], dim=1),    # [B, T, ticks, 10]
                 "reward": reward, "alive": alive, "terms": terms,
                 "states": states, "side": side}
 
