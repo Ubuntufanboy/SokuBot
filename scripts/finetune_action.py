@@ -124,9 +124,18 @@ def main() -> int:
                     help="fine-tune, not pretrain: the 2e-4 that trained this "
                          "model from scratch would discard what it knows")
     ap.add_argument("--warmup", type=int, default=500)
-    ap.add_argument("--lambda-cf", type=float, default=1.0)
+    ap.add_argument("--lambda-cf", type=float, default=0.05,
+                    help="l_pred is ~0.008 and lambda_sigreg*sigreg ~0.085, so the "
+                         "existing objective totals about 0.09. At lambda 1.0 the "
+                         "counterfactual term contributes ~1.39 -- fifteen times "
+                         "everything else -- and skill fell from +0.864 to -0.220 "
+                         "in a thousand steps. This keeps it an auxiliary.")
     ap.add_argument("--n-neg", type=int, default=3)
+    ap.add_argument("--min-skill", type=float, default=0.80,
+                    help="floor for keeping a checkpoint; a world model that "
+                         "predicts worse than copy-last-latent cannot plan either")
     ap.add_argument("--log-every", type=int, default=200)
+    ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--ckpt-every", type=int, default=1000)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -162,7 +171,29 @@ def main() -> int:
         opt, lambda s: min(1.0, (s + 1) / max(1, a.warmup)) *
         (0.5 * (1 + np.cos(np.pi * min(1.0, s / a.steps)))))
 
+    # Both numbers have to be watched together. Driving the counterfactual term
+    # down is easy and worthless on its own: at lambda 1.0 it reached 0.79 nats
+    # while skill went from +0.864 to -0.220, which is a model that knows what
+    # the buttons do and can no longer predict the game. The checkpoint kept is
+    # the most action-aware one that is still a working predictor.
+    from scripts.eval_ckpt import recalibrate_bn
+    from scripts.train_full import evaluate as skill_eval
+    import copy as _copy
+    val = torch.load(a.corpus / "val.pt", map_location="cpu", weights_only=False)
+
+    def measure() -> dict:
+        probe = _copy.deepcopy(model)
+        recalibrate_bn(probe, val)
+        ev = skill_eval(probe, val, cfg)
+        del probe
+        return ev
+
+    base = measure()
+    print(f"before fine-tuning: skill {base['skill']:+.4f} "
+          f"(val {base['val_pred']:.4f}, identity {base['identity']:.4f})", flush=True)
+
     hist, t0, step = [], time.time(), 0
+    best_cf, best_step = float("inf"), -1
     run = {"pred": 0.0, "sig": 0.0, "cf": 0.0, "acc": 0.0, "n": 0}
     for batch in loader:
         if step >= a.steps:
@@ -206,6 +237,23 @@ def main() -> int:
                   flush=True)
             run = {k: 0.0 for k in run}
 
+        if step % a.eval_every == 0:
+            ev = measure()
+            cf_now = hist[-1]["cf"] if hist else float("nan")
+            keep = ev["skill"] >= a.min_skill and cf_now < best_cf
+            if keep:
+                best_cf, best_step = cf_now, step
+                torch.save({"model": model.state_dict(), "cfg": cfg, "step": step,
+                            "skill": ev["skill"], "cf": cf_now},
+                           a.out / "best.pt")
+            if hist:
+                hist[-1].update({"skill": ev["skill"], "val_pred": ev["val_pred"],
+                                 "identity": ev["identity"]})
+                (a.out / "log.json").write_text(json.dumps(hist, indent=1))
+            print(f"  [eval] step {step:6d} | skill {ev['skill']:+.4f} "
+                  f"(floor {a.min_skill:+.2f}) | cf {cf_now:.4f} | "
+                  f"{'kept best.pt' if keep else 'not kept'}", flush=True)
+
         if step % a.ckpt_every == 0:
             torch.save({"model": model.state_dict(), "cfg": cfg, "step": step},
                        a.out / "sokubot_cf.pt")
@@ -213,7 +261,11 @@ def main() -> int:
     torch.save({"model": model.state_dict(), "cfg": cfg, "step": step},
                a.out / "sokubot_cf.pt")
     print(f"done in {(time.time()-t0)/3600:.2f} h -> {a.out}")
-    print(f"next: python -m scripts.action_sensitivity --ckpt {a.out/'sokubot_cf.pt'}")
+    if best_step >= 0:
+        print(f"best: cf {best_cf:.4f} at step {best_step} with skill >= {a.min_skill}")
+        print(f"next: python -m scripts.action_sensitivity --ckpt {a.out/'best.pt'}")
+    else:
+        print(f"no checkpoint held skill >= {a.min_skill}; lower --lambda-cf")
     return 0
 
 
