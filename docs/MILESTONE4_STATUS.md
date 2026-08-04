@@ -209,6 +209,35 @@ present by construction rather than hoped for.
 That is a redesign of milestone 3's observation space, not a tuning change, and
 it is the honest recommendation rather than a fifth attempt at the same thing.
 
+### It is concrete, not speculative
+
+Checked against the vendored headers in
+`SokuFrameExtractor/third_party/SokuLib/src` rather than assumed:
+
+| what | where |
+|---|---|
+| exact HP and MaxHP, as integers out of 10000 | `GameObject.hpp`, offset 0x184 |
+| `actionId`, `direction`, `hitStop` | `GameObject.hpp` `BoxInfo` |
+| `hurtBoxes`, `attackBoxes`, `collisionBox` | `FrameData.hpp` |
+| `damage`, `chipdamage`, `spiritdamage`, `untech`, `limit` | `FrameData.hpp` |
+| positions as `Vector2f` | `AnimationObject.hpp` |
+
+Whether an attack connects is a predicate over two boxes -- and both boxes,
+their positions, and the damage they carry are already in memory, exactly, every
+frame. `hp` alone is a better damage signal than the HUD reader, being an
+integer rather than a pixel count, which also removes the probe and the whole
+calibration problem behind it.
+
+The extractor already links SokuLib and already reads the game's own structures
+each frame: `dll/src/session.cpp` pulls `SWRCHARINPUT` out of the character
+object at `CHAR_INPUT_OFFSET` for the input log. Writing a few dozen more fields
+into the same per-frame record is a modest extension of code that exists and
+works, not new capability.
+
+What it does cost is a re-capture. The 200 hours on disk contain pixels and
+inputs, not state, so the corpus would have to be regenerated -- which the fleet
+has done once already, and the `.rep` files are all preserved.
+
 **Reconsider the frame rate.** Decisions run at 15 Hz against a 60 Hz game.
 Whether an attack connects is often decided within two or three frames, which is
 below one decision step.
