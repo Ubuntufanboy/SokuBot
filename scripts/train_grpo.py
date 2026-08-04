@@ -111,6 +111,8 @@ def main() -> int:
                     help="fraction of rollouts facing recorded human input; it is "
                          "open-loop, so this defaults off")
     ap.add_argument("--log-every", type=int, default=25)
+    ap.add_argument("--eval-every", type=int, default=100)
+    ap.add_argument("--eval-starts", type=int, default=1024)
     ap.add_argument("--ckpt-every", type=int, default=1000)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
@@ -165,6 +167,43 @@ def main() -> int:
     print(f"policy {sum(p.numel() for p in policy.parameters())/1e6:.2f}M | "
           f"{S} groups x {G} = {B} rollouts x {a.horizon} steps", flush=True)
 
+    # ---- a yardstick that self-play cannot provide -------------------------
+    # In self-play both chairs hold the same policy, so one side's gain is the
+    # other's loss and the mean return is zero however well or badly the policy
+    # plays. Training reward is therefore not a progress signal at all. Progress
+    # has to be measured against a *fixed* opponent, on *fixed* start states, so
+    # the only thing that changes between evaluations is the policy.
+    import copy
+    reference = copy.deepcopy(policy).eval()
+    for p in reference.parameters():
+        p.requires_grad_(False)
+    eval_rng = np.random.default_rng(12345)
+    eval_idx = torch.from_numpy(eval_rng.choice(starts, size=a.eval_starts)).to(a.device)
+
+    @torch.no_grad()
+    def evaluate() -> dict:
+        """Net damage of `policy` against the frozen initial policy.
+
+        Each start is played twice with the sides swapped, so a policy cannot
+        score by exploiting whichever chair the world model happens to favour.
+        """
+        off = torch.arange(cfg.history, device=a.device) - (cfg.history - 1)
+        out = {}
+        for tag, s0 in (("p1", 0), ("p2", 1)):
+            side = torch.full((a.eval_starts,), s0, device=a.device, dtype=torch.long)
+            zc = Zt[eval_idx[:, None] + off[None, :]].float()
+            ah = At[eval_idx[:, None] + off[None, :-1]].float()
+            tr = arena.rollout(zc, ah, side, policy, PolicyOpponent(reference))
+            al = tr["alive"]
+            n = al.sum().clamp(min=1)
+            out[f"{tag}_dealt"] = float((tr["terms"]["dealt"] * al).sum() / n)
+            out[f"{tag}_taken"] = float((tr["terms"]["taken"] * al).sum() / n)
+            out[f"{tag}_ret"] = float(tr["reward"].sum(1).mean())
+        # dealt is positive and taken negative, so their sum is the net exchange.
+        out["net"] = ((out["p1_dealt"] + out["p1_taken"]) +
+                      (out["p2_dealt"] + out["p2_taken"])) / 2
+        return out
+
     hist, t0 = [], time.time()
     for step in range(1, a.steps + 1):
         # Each group shares one start state and one side.
@@ -185,18 +224,30 @@ def main() -> int:
             kind = "snapshot" if use_snap else "self"
 
         traj = arena.rollout(z_ctx, a_hist, side, policy, opponent)
-        adv = group_advantages(traj["reward"], traj["alive"], G, gcfg.gamma)
+        adv = group_advantages(traj["reward"], traj["alive"], G, gcfg.gamma,
+                               scale=gcfg.advantage_scale)
         flat_side = side[:, None].expand(B, a.horizon).reshape(-1)
+        # Frozen before any update: this is the policy the actions were actually
+        # sampled from, which is what makes the ratio mean anything.
         with torch.no_grad():
             old_logp = policy.log_prob_of(
                 traj["obs"].reshape(-1, cfg.history, cfg.latent_dim), flat_side,
                 traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
 
-        loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
-        opt.step()
+        skipped = 0
+        for _ in range(gcfg.epochs):
+            loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
+            # A single non-finite batch otherwise writes NaN into every weight,
+            # and from there nothing recovers -- the first run died this way at
+            # step 1400. Skipping costs one update.
+            if not (torch.isfinite(loss) and torch.isfinite(gn)):
+                skipped += 1
+                opt.zero_grad(set_to_none=True)
+                continue
+            opt.step()
         pool.maybe_add(policy, step)
 
         if step % a.log_every == 0 or step == 1:
@@ -206,9 +257,17 @@ def main() -> int:
                    "reward": float((traj["reward"] * alive).sum() / n),
                    "ret": float(traj["reward"].sum(1).mean()),
                    "grad_norm": float(gn), "alive_frac": float(alive.mean()),
+                   "skipped": skipped,
                    **stats,
                    **{f"r_{k}": float((v * alive).sum() / n)
                       for k, v in traj["terms"].items()}}
+            if step % a.eval_every == 0 or step == 1:
+                ev = evaluate()
+                rec.update({f"eval_{k}": v for k, v in ev.items()})
+                print(f"  [eval] step {step:6d} | net vs frozen init "
+                      f"{ev['net']:+.5f} | as P1 {ev['p1_dealt']:+.4f}/"
+                      f"{ev['p1_taken']:+.4f} | as P2 {ev['p2_dealt']:+.4f}/"
+                      f"{ev['p2_taken']:+.4f}", flush=True)
             # Damage is the term the whole reward is denominated in, so track
             # both halves of the exchange rather than only the net.
             rec["elapsed_h"] = (time.time() - t0) / 3600

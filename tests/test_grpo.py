@@ -73,6 +73,30 @@ def test_group_advantages_are_centred_within_each_group():
     assert torch.allclose(adv[4:], adv2[4:], atol=1e-5)
 
 
+def test_a_group_that_barely_differs_gets_a_small_advantage():
+    """The failure mode per-group std normalisation causes.
+
+    Group 0's rollouts differ by 1e-3 -- measurement noise on a probe whose
+    health residual is ~0.13 of a bar. Group 1's differ by a real margin.
+    Dividing by each group's own spread rescales both to unit magnitude, so the
+    policy is told to chase the noise exactly as confidently as the signal.
+    """
+    reward = torch.zeros(8, 1)
+    reward[:4, 0] = torch.tensor([0.0, 1e-3, 2e-3, 3e-3])     # noise
+    reward[4:, 0] = torch.tensor([0.0, 1.0, 2.0, 3.0])        # signal
+
+    per_group = group_advantages(reward, torch.ones(8, 1), 4, 1.0, scale="group")
+    assert torch.allclose(per_group[:4].abs(), per_group[4:].abs(), atol=1e-3), \
+        "per-group scaling should make noise and signal indistinguishable"
+
+    batch = group_advantages(reward, torch.ones(8, 1), 4, 1.0, scale="batch")
+    assert batch[:4].abs().max() < 0.01 * batch[4:].abs().max(), \
+        "batch scaling should leave the noise group near zero"
+    # Centring still happens, which is the part that replaces the critic.
+    assert abs(float(batch[:4].mean())) < 1e-6
+    assert abs(float(batch[4:].mean())) < 1e-6
+
+
 def test_dead_steps_do_not_accumulate_return():
     """Return-to-go must stop at the KO, not keep discounting past it."""
     reward = torch.ones(2, 4)
@@ -140,6 +164,27 @@ def test_replay_opponent_advances_in_time_and_resets():
     assert seen == [0.0, 1.0, 2.0, 3.0]
     opp.reset()
     assert opp.act(torch.zeros(B, 1, 1), side)[0, 0, 3].item() == 0.0
+
+
+def test_kl_stays_finite_when_the_policy_has_moved_far():
+    """The blowup that killed the first run.
+
+    One decision step's log-probability sums ~30 terms, so after an inner epoch
+    the joint log-ratio can be large; exp() of it reached 5.8e8 and produced NaN
+    logits. The surrogate and the KL must survive a policy that has moved a long
+    way, because the clipped objective is supposed to handle exactly that.
+    """
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    traj = arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy))
+    adv = group_advantages(traj["reward"], traj["alive"], gcfg.group_size, gcfg.gamma)
+    # A sampling policy that assigned these actions vanishing probability.
+    old_logp = torch.full((B, gcfg.horizon), -500.0)
+    loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg)
+    assert torch.isfinite(loss), "loss must survive a large policy shift"
+    assert np.isfinite(stats["kl"]) and stats["kl"] < 1e4
+    loss.backward()
+    assert all(p.grad is None or torch.isfinite(p.grad).all()
+               for p in policy.parameters())
 
 
 def test_snapshot_pool_keeps_a_bounded_history():

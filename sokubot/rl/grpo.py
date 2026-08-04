@@ -66,8 +66,21 @@ class GRPOConfig:
     gamma: float = 0.99
     clip_eps: float = 0.2
     kl_coef: float = 0.02
-    entropy_coef: float = 0.003
-    lr: float = 3e-4
+    # Rewards come from a probe with real residual noise, so the policy will
+    # happily sharpen onto noise if left alone; the first run lost 40% of its
+    # entropy in 25 steps. This holds exploration open long enough for the
+    # genuine signal to outvote it.
+    entropy_coef: float = 0.02
+    # Passes over each batch of rollouts. With one pass the sampling policy *is*
+    # the current policy, so the ratio is identically 1 and both the clipping and
+    # the KL penalty are inert -- the update degenerates to REINFORCE with a
+    # baseline. More than one makes them do their job.
+    epochs: int = 2
+    advantage_scale: str = "batch"
+    # Bounds exp() in the surrogate and the KL. exp(5) ~ 148 is already far
+    # outside the clipped region, so this costs nothing the objective was using.
+    max_log_ratio: float = 5.0
+    lr: float = 1e-4
     grad_clip: float = 1.0
     jitter_sigma: float = 1.0        # frames; the user's "acts more human" noise
     # Probability of drawing the opponent from (current policy, snapshot,
@@ -189,13 +202,24 @@ class ImaginedArena:
 
 
 def group_advantages(reward: torch.Tensor, alive: torch.Tensor,
-                     group_size: int, gamma: float) -> torch.Tensor:
+                     group_size: int, gamma: float, scale: str = "batch",
+                     eps: float = 1e-6) -> torch.Tensor:
     """Discounted return-to-go, centred within each group of `group_size`.
 
     Each group shares a start state and a side, so subtracting the group mean
     removes exactly the part of the return that came from the situation rather
     than from the policy's choices -- which is the baseline a critic would
-    otherwise have to learn.
+    otherwise have to learn. That part is not optional; it is what GRPO is.
+
+    The *scaling* is. Dividing by each group's own standard deviation, as the
+    original formulation does, is actively harmful when rewards are read from a
+    noisy probe: a group whose eight rollouts genuinely played out the same way
+    has a return spread of almost nothing, and dividing by it rescales pure
+    measurement noise up to unit magnitude. The policy then receives a confident
+    gradient telling it to prefer whichever rollout the probe happened to
+    misread upward. Scaling by the batch's spread instead leaves such a group
+    with the near-zero advantage it deserves, while keeping the overall gradient
+    scale stable. Pass ``scale="group"`` for the original behaviour.
     """
     B, T = reward.shape
     ret = torch.zeros_like(reward)
@@ -204,7 +228,17 @@ def group_advantages(reward: torch.Tensor, alive: torch.Tensor,
         run = reward[:, t] + gamma * run * alive[:, t]
         ret[:, t] = run
     g = ret.view(-1, group_size, T)
-    adv = (g - g.mean(dim=1, keepdim=True)) / (g.std(dim=1, keepdim=True) + 1e-6)
+    centred = g - g.mean(dim=1, keepdim=True)
+    if scale == "group":
+        adv = centred / (g.std(dim=1, keepdim=True) + eps)
+    elif scale == "batch":
+        # Per timestep: return-to-go shrinks as the horizon runs out, so one
+        # scalar for the whole trajectory would over-weight early steps.
+        adv = centred / (centred.std(dim=(0, 1), keepdim=True) + eps)
+    elif scale == "none":
+        adv = centred
+    else:
+        raise ValueError(f"unknown scale {scale!r}; want group, batch or none")
     return adv.view(B, T)
 
 
@@ -221,13 +255,22 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
     logp, ent = logp.view(B, T), ent.view(B, T)
     alive = traj["alive"]
 
-    ratio = torch.exp(logp - old_logp)
+    # One decision step's log-probability is a sum over ticks x (two categoricals
+    # plus six Bernoullis) -- about thirty terms. Small per-term movements
+    # compound, so the joint log-ratio swings far more than a scalar action's
+    # would, and exp() of it overflows long before the policy has done anything
+    # unreasonable. The first run reached a k3 KL of 5.8e8 at step 1350 and
+    # produced NaN logits shortly after. Clamping the exponent bounds both the
+    # surrogate and the penalty without changing either where they matter, since
+    # the clipped objective already ignores ratios outside +-clip_eps.
+    log_ratio = (logp - old_logp).clamp(-cfg.max_log_ratio, cfg.max_log_ratio)
+    ratio = torch.exp(log_ratio)
     unclipped = ratio * adv
     clipped = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv
     pg = -torch.min(unclipped, clipped)
 
     # k3 estimator: always positive, low variance, and unbiased for the KL.
-    log_r = old_logp - logp
+    log_r = -log_ratio
     kl = torch.exp(log_r) - 1 - log_r
 
     denom = alive.sum().clamp(min=1.0)
