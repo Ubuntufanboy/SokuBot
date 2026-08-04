@@ -81,6 +81,24 @@ CARD_ROWS = (428, 470)
 # on a KO. Subtracting the floor makes "no combo" read as no combo.
 RED_FLOOR = 0.018
 
+# Spell cards are detected by the card's NAME, which the game draws in red under
+# the casting player's health bar -- left-aligned for P1, right-aligned for P2.
+# It rises from near the card slots and then PARKS just below the win indicator
+# for the card's duration.
+#
+# Measured on a confirmed cast (replay 5278716, P2): the text enters at y=106,
+# climbs ~6 px/frame for seven frames, and holds at y=60-62 from frame 5246
+# until the card ends. Parking is the signal worth using -- it is long-lived and
+# gives the window directly -- while the rise pins down the start.
+#
+# Colour alone is a trap: a red character flying through the band matches it.
+# What a character cannot do is sit at exactly this height for tens of frames.
+NAME_BAND = (56, 74)         # where the name parks
+NAME_MIN_RUN = 15            # px of red in a row for it to be a line of text
+# Real casts park the banner for seconds; the false positives were 0.3-0.9 s
+# blips from red effects crossing the band. 90 frames (1.5 s) separates them.
+NAME_MIN_FRAMES = 90
+
 HEAL_JUMP = 0.10            # yellow rising by more than this is a heal, not play
 
 # Screen-wide effects (weather transitions, supers, spellcard flashes) wash the
@@ -324,66 +342,35 @@ def combo_size(t: HudTrace, who: int) -> np.ndarray:
     return np.maximum(0.0, c - RED_FLOOR)
 
 
-def spellcard_events(t: HudTrace, who: int, min_gap: int = 45):
-    """DO NOT USE. Card-stock dimming does not detect spell cards.
+def name_banner(frames: np.ndarray, who: int, flip: bool = True) -> np.ndarray:
+    """True per frame where a spell-card name is parked under `who`'s health bar."""
+    if flip:
+        frames = frames[:, ::-1]
+    x0, x1 = (8, 240) if who == 1 else (240, 472)
+    band = frames[:, NAME_BAND[0]:NAME_BAND[1], x0:x1].astype(np.int16)
+    r, g, b = band[..., 0], band[..., 1], band[..., 2]
+    red = (r > 120) & ((r - g) > 55) & ((r - b) > 55)
+    return (red.sum(axis=2) >= NAME_MIN_RUN).any(axis=1)
 
-    Reviewed against footage: of 49 detections, **zero** were real casts. The
-    premise -- that casting consumes every lit card so the stock collapses -- is
-    documented and true, but the stock also dims in states that are far more
-    common, so the signal is swamped. Requiring a lit-to-dark transition removed
-    the round-intro false positives and still left 0 true positives.
 
-    THE APPROACH THAT SHOULD WORK, from a player who tracks this by eye:
-    the spell card's *name* appears under the casting player's health bar and
-    **rises at a constant speed** from just above the card slots to just below
-    the win indicator -- left-aligned for P1, right-aligned for P2. Colour alone
-    is a trap, because a red character flying through that region matches it;
-    the linear rise rate is what makes it near-perfect.
+def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = True):
+    """Spell-card windows for `who`, from the name banner.
 
-    Confirmed by inspection: in replay 5278716 around frame 5300, P2's card
-    "Midnight King 'Dracula Cradle'" is rendered right-aligned at y~72-78, under
-    the health bar. Two things still to establish before implementing:
-      * the rise happens *before* frame 5300 -- the text is already settled
-        there, so the search window has to start earlier;
-      * that instance renders light/white with a dark outline rather than red,
-        so the colour may vary by card or character. Sample several casts and
-        find what is actually invariant.
+    Returns [(start, end, damage_dealt)]. Replaces the card-stock approach, which
+    scored zero true positives in review: the stock dims in many states, so its
+    collapse is not specific to casting.
     """
-
-    Casting consumes every lit card at once, so the stock collapses; the slots
-    stay dim for a while after the card ends, so the window overruns and the
-    trailing dim frames are trimmed back to where the stock starts recovering.
-
-    Returns [(start, end, cost, damage_dealt)] with cost in card slots.
-    """
-    cards = t.cards1 if who == 1 else t.cards2
+    on = name_banner(frames, who, flip=flip)
     foe = damage_events(t, 2 if who == 1 else 1)
-    base = float(np.median(cards[cards > 0])) if (cards > 0).any() else 0.0
-    if base <= 0:
-        return []
-    active = cards < 0.35 * base
-    out, i, n = [], 0, len(cards)
+    out, i, n = [], 0, len(on)
     while i < n:
-        if not active[i]:
+        if not on[i]:
             i += 1
             continue
         j = i
-        while j < n and active[j]:
+        while j < n and on[j]:
             j += 1
-        # A cast is a transition from lit to dark. Requiring the stock to have
-        # been lit just before rejects round intros, where the cards are not
-        # drawn at all and the strip is dark from the start -- that alone
-        # accounted for most of the 90 false events across six replays.
-        pre = cards[max(0, i - 40):i]
-        was_lit = len(pre) > 0 and pre.max() > 0.5 * base
-        if j - i >= min_gap and was_lit:
-            # trim the trailing dim tail: end where the stock resumes climbing
-            k = j
-            while k > i + 1 and cards[k - 1] <= cards[min(n - 1, k)] * 0.9:
-                k -= 1
-            lit_before = cards[max(0, i - 30):i]
-            cost = int(round((lit_before.max() if len(lit_before) else base) /
-                             max(base, 1e-6) * 5)) if base > 0 else 0
-            out.append((i, k, max(1, min(5, cost)), float(foe[i:k].sum())))
+        if j - i >= NAME_MIN_FRAMES:
+            out.append((i, j, float(foe[i:min(j, len(foe))].sum())))
         i = j
     return out
