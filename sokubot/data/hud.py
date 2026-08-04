@@ -94,7 +94,15 @@ RED_FLOOR = 0.018
 # Colour alone is a trap: a red character flying through the band matches it.
 # What a character cannot do is sit at exactly this height for tens of frames.
 NAME_BAND = (56, 74)         # where the name parks
-NAME_MIN_RUN = 15            # px of red in a row for it to be a line of text
+# "Red" is not the signal -- a red stage fills the band and every colour-only
+# detector built here failed on exactly that. Text is *thin strokes*: measured on
+# real spell-card banners, a row crossing the text breaks into 5-18 separate red
+# runs with a median length of 1-3.5 px, covering only 13-25% of the row. A solid
+# red background is one run covering nearly all of it.
+TEXT_MIN_RUNS = 4            # separate strokes in a row
+TEXT_MAX_MEDIAN_RUN = 5      # px; strokes are thin
+TEXT_MAX_COVERAGE = 0.55     # text is sparse, a background is not
+TEXT_MIN_COVERAGE = 0.04
 # Real casts park the banner for seconds; the false positives were 0.3-0.9 s
 # blips from red effects crossing the band. 90 frames (1.5 s) separates them.
 NAME_MIN_FRAMES = 90
@@ -369,18 +377,55 @@ def banner_top(frames: np.ndarray, who: int, flip: bool = True) -> np.ndarray:
     x0, x1 = P1_NAME_X if who == 1 else P2_NAME_X
     band = frames[:, RISE_TOP:RISE_BOTTOM, x0:x1].astype(np.int16)
     r, g, b = band[..., 0], band[..., 1], band[..., 2]
-    red = (r > 120) & ((r - g) > 55) & ((r - b) > 55)
-    wide = red.sum(axis=2) >= NAME_MIN_RUN            # [n, rows]
-    out = np.full(len(frames), np.nan)
-    for i in range(len(frames)):
-        w = np.where(wide[i])[0]
+    red = (r > 110) & ((r - g) > 45) & ((r - b) > 45)
+    n, rowsn, cols = red.shape
+    pad = np.zeros((n, rowsn, 1), dtype=np.int8)
+    d = np.diff(np.concatenate([pad, red.astype(np.int8), pad], axis=2), axis=2)
+    starts = (d == 1).sum(axis=2)                    # runs per row
+    cover = red.mean(axis=2)
+    # median run length ~= covered px / number of runs
+    mean_run = np.where(starts > 0, red.sum(axis=2) / np.maximum(starts, 1), 0.0)
+    istext = ((starts >= TEXT_MIN_RUNS) & (mean_run <= TEXT_MAX_MEDIAN_RUN)
+              & (cover <= TEXT_MAX_COVERAGE) & (cover >= TEXT_MIN_COVERAGE))
+    out = np.full(n, np.nan)
+    for i in range(n):
+        w = np.where(istext[i])[0]
         if len(w):
             out[i] = w.min() + RISE_TOP
     return out
 
 
 def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = True):
-    """UNVERIFIED -- misses a hand-confirmed cast. Do not wire into a reward yet.
+    """BLOCKED BY CAPTURE RESOLUTION. Not solvable from this corpus as recorded.
+
+    Measured on the hand-verified cast, inside the correct band, against a
+    red-background frame in the same band:
+
+        actual banner (f5252)      runs/row 1-4   mean run 7-88 px  coverage <=0.76
+        red background (f5352)     runs/row 1-7   mean run 1-3.7 px coverage <=0.16
+
+    The discriminators are inverted. Real spell text has *fewer and fatter* runs
+    than the red background, so by any thin-stroke test the background scores
+    more text-like than the text. The game draws 640x480; capture squashes to
+    480x480 and encodes h264 at ~640 MB/h, and small text does not survive that.
+    The reference screenshots show letters; this corpus holds a blob.
+
+    Six approaches failed, and the last four failed for the same reason -- every
+    threshold was set from something other than the corpus: from the average
+    rather than the extremes, from the pre-narrowing band, from clean
+    screenshots. The measurement above is what should have come first.
+
+    OPTIONS, in order of cost:
+      * Drop the 2x spell-card bonus and whiff penalty. Everything else in the
+        reward is validated and unaffected; these are additive terms.
+      * Re-encode a subset at native 640x480 and higher bitrate. The 12,310
+        source .rep files are preserved on the Hugging Face staging repos, so a
+        few hundred replays can be re-captured without touching the fleet.
+      * Read the state from memory. SokuLib exposes it; the DLL already calls
+        game functions directly for the replay bypass, so logging a cast flag is
+        a small addition -- and would give exact ground truth rather than an
+        inference from pixels.
+    """
 
     Four approaches have failed here, and the history is worth keeping because
     each failed differently:
