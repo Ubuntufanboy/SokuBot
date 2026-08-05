@@ -107,9 +107,26 @@ class GRPOConfig:
     # within fifty steps and a 0.43 press rate, destroying the initialisation
     # before the dual could decay. A floor has to cost nothing until it is
     # violated, which means starting inert and rising only if entropy falls.
-    entropy_log_alpha_init: float = -5.0
-    entropy_lr: float = 0.02
-    max_log_alpha: float = 4.0
+    entropy_log_alpha_init: float = -4.0
+    # Every bound here is set from a measurement, because the first version got
+    # all three wrong and failed in both directions at once.
+    #
+    # The multiplier wound down to its -10 floor over the two thousand steps the
+    # policy spent healthy, and Adam moves log_alpha by about `entropy_lr` per
+    # step regardless of how badly the constraint is violated. So when entropy
+    # finally fell it needed ~500 steps to climb back to a value that does
+    # anything: one arm sat at entropy 3.89 against a floor of 8.59 with alpha
+    # still 0.000, and the other took so long that it overshot to alpha 54.6.
+    # Classic integrator wind-up, in a controller that has to act faster than
+    # the collapse it is catching.
+    #
+    # -4 bounds the wind-up (alpha never drops below 0.018, still negligible)
+    # and 0.0 caps it at alpha 1.0, because alpha = 1.0 is already violent: it
+    # drove entropy from 10.76 to the 25.40 maximum in fifty steps. 54.6 was
+    # never a sensible number. At lr 0.05 the whole range takes 80 steps.
+    entropy_min_log_alpha: float = -4.0
+    entropy_lr: float = 0.05
+    max_log_alpha: float = 0.0
     # Passes over each batch of rollouts. With one pass the sampling policy *is*
     # the current policy, so the ratio is identically 1 and both the clipping and
     # the KL penalty are inert -- the update degenerates to REINFORCE with a
@@ -370,7 +387,7 @@ class EntropyFloor:
     def update(self, entropy: float) -> dict:
         """Push alpha up while entropy sits under the floor, down while over."""
         if self.floor is None:
-            return {"alpha": 0.0, "floor": float("nan")}
+            return {"alpha": 0.0, "floor": float("nan"), "ent_violation": 0.0}
         # Relative violation, so `entropy_lr` means the same thing whatever the
         # action space's entropy scale happens to be.
         loss = self.log_alpha.clamp(max=self.cfg.max_log_alpha) * (
@@ -379,8 +396,10 @@ class EntropyFloor:
         loss.backward()
         self.opt.step()
         with torch.no_grad():
-            self.log_alpha.clamp_(-10.0, self.cfg.max_log_alpha)
-        return {"alpha": float(self.alpha), "floor": self.floor}
+            self.log_alpha.clamp_(self.cfg.entropy_min_log_alpha,
+                                  self.cfg.max_log_alpha)
+        return {"alpha": float(self.alpha), "floor": self.floor,
+                "ent_violation": self.floor - entropy}
 
 
 def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
