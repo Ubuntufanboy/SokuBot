@@ -61,6 +61,59 @@ def recalibrate_bn(model: LeWorldModel, cache: dict, batch: int = 64,
     return len(bns)
 
 
+@torch.no_grad()
+def predictor_skill(model, Z, A, ep, cfg, n: int = 8192, seed: int = 0) -> float:
+    """One-step `1 - MSE_model / MSE_identity` against a bank of real latents.
+
+    The same quantity `train_full.evaluate` reports, computed from a bank so it
+    costs nothing and needs no video decode. At or below zero the predictor is
+    no better than copying the previous latent forward.
+    """
+    import numpy as np
+    dev = next(model.parameters()).device
+    H = cfg.history
+    same = np.zeros(len(ep), dtype=bool)
+    same[: len(ep) - (H + 1)] = ep[: len(ep) - (H + 1)] == ep[H + 1 :]
+    ok = np.flatnonzero(same)
+    ok = ok[ok >= H - 1]
+    idx = torch.from_numpy(np.random.default_rng(seed).choice(
+        ok, size=min(n, len(ok)), replace=False)).to(dev)
+    off = torch.arange(H, device=dev) - (H - 1)
+    se_m = se_i = 0.0
+    for s in range(0, len(idx), 4096):
+        base = idx[s : s + 4096]
+        zw = Z[base[:, None] + off[None, :]].float()
+        acts = A[base[:, None] + off[None, :]].float()
+        zhat = model.predictor(zw, model.action_encoder(acts))[:, -1]
+        zt = Z[base + 1].float()
+        se_m += float(((zhat - zt) ** 2).mean(1).sum())
+        se_i += float(((zw[:, -1] - zt) ** 2).mean(1).sum())
+    return 1.0 - se_m / se_i
+
+
+def assert_predictor_sane(model, Z, A, ep, cfg, floor: float = 0.0,
+                          what: str = "checkpoint") -> float:
+    """Refuse to roll a predictor that cannot beat copying the last latent.
+
+    `ckpt_cf/best.pt` was saved with BatchNorm running statistics that had never
+    been recalibrated -- the fine-tune scored a recalibrated *copy* and wrote the
+    original -- and measured skill -6.15 while its own blob recorded +0.82. It
+    was then used as the default by the horizon ablation, the reward probe it
+    fits, and every rollout diagnostic downstream. Nothing failed loudly; the
+    numbers just quietly stopped meaning anything. One line here would have
+    caught it, so here is the line.
+    """
+    sk = predictor_skill(model, Z, A, ep, cfg)
+    if sk < floor:
+        raise SystemExit(
+            f"{what} has one-step skill {sk:+.4f}, at or below the floor "
+            f"{floor:+.2f}: its predictor is no better than copying the "
+            f"previous latent, so any rollout through it is noise. If this is "
+            f"a fine-tuned checkpoint, its BatchNorm running statistics are "
+            f"probably stale -- see scripts.eval_ckpt.recalibrate_bn.")
+    return sk
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--ckpt", type=Path, required=True)

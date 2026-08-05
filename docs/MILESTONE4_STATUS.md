@@ -4,6 +4,57 @@ Written at the end of the 2026-08-04 overnight session. Every number here is
 reproducible from a script in `scripts/`; none of it is inference from a
 training curve.
 
+## Root cause, 2026-08-04 evening: a checkpoint that was never saved correctly
+
+**`/root/ckpt_cf/best.pt` has a one-step skill of −6.15.** Its predictor is
+seven times worse than copying the previous latent forward and doing nothing.
+Its own blob records `skill: 0.8189`.
+
+`scripts/finetune_action.py` scored a recalibrated *copy* and saved the
+original:
+
+```python
+def measure() -> dict:
+    probe = _copy.deepcopy(model)
+    recalibrate_bn(probe, val)      # BatchNorm stats re-estimated here
+    ev = skill_eval(probe, val, cfg)
+    return ev                       # ...and the copy is discarded
+...
+torch.save({"model": model.state_dict(), ...})   # the un-recalibrated model
+```
+
+The `--min-skill 0.80` gate worked exactly as designed. It just admitted a set
+of weights that were never the ones written to disk. The counterfactual
+objective pushes deliberately *wrong* actions through the network as negatives,
+so BatchNorm's running statistics absorb a distribution the model never sees at
+eval — which is why this fine-tune breaks that way and ordinary training does
+not. Recalibrating the two BatchNorm layers of the saved file restores it:
+skill −6.148 → **+0.7948**, against the +0.8189 in its blob.
+
+`scripts/eval_ckpt.py:predictor_skill` and `assert_predictor_sane` now compute
+this from a bank in about a second, and the rollout diagnostics call it on load.
+
+**What this invalidates.** Every result measured through `ckpt_cf/best.pt`,
+which was the default for `aggression_test`, `action_effect_test`,
+`latent_drift_test`, and the `horizon_ablation` run that produced
+`horizon_best/reward_probe.npz`:
+
+| claim | measured on | status |
+|---|---|---|
+| latent "mean-collapses", norm ratio 0.42 at h=16 | ckpt_cf | artifact of the wrong BN scale |
+| rollout worse than copy-the-start at h=1 | ckpt_cf | artifact |
+| action→return rule decays +0.47 → +0.06 over 16 steps | ckpt_cf | must be re-measured |
+| probe reads encoder latents 2.6× over-dispersed | ckpt_cf | the same bug from another angle |
+
+**And it reaches GRPO.** `train_grpo.py` defaults to `--wm /root/ckpt/best.pt`,
+which is healthy (skill +0.869 as saved). But its reward probe came from a
+`horizon_ablation` run whose own JSON records `"ckpt": "/root/ckpt_cf/best.pt"`.
+So GRPO was reading every reward through a linear map fit to a broken model's
+latent space and applying it to a working one's. That is sufficient on its own
+to produce the flat curve, and it is a far duller explanation than chaos.
+
+Nothing here implicates pixels or the observation space.
+
 ## Corrections, 2026-08-04 later session
 
 Three claims below were tested directly and are wrong. They are left in place

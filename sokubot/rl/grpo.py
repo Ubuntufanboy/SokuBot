@@ -189,14 +189,21 @@ class ImaginedArena:
         if hasattr(opponent, "reset"):
             opponent.reset()          # replay opponents are stateful in time
         z_win, a_win = z_ctx, a_hist
-        # Deliberately not seeded with z_ctx[:, -1]. That is an *encoder* latent
-        # and every later state is a *predictor* output, and the reward probe is
-        # calibrated for one of those two distributions, not both. Reading the
-        # pair through one probe compares numbers on different scales: on encoder
-        # latents the calibrated probe emits health with standard deviation 0.85
-        # against a label spread of 0.32, which manufactures a large fake change
-        # at the first step and puts every later comparison against a corrupted
-        # baseline. One extra predictor step costs less than that.
+        # Deliberately not seeded with z_ctx[:, -1]: that is an *encoder* latent
+        # and every later state is a *predictor* output, so the state sequence
+        # stays homogeneous and one probe reads all of it. One extra predictor
+        # step is cheaper than reasoning about whether the two agree.
+        #
+        # This was originally written to fix a much larger effect -- the probe
+        # read encoder latents at standard deviation 0.85 against 0.32 for
+        # predictor outputs, fabricating damage at the first step. That gap was
+        # not a property of the two distributions. It was `ckpt_cf/best.pt`
+        # carrying BatchNorm running statistics that were never recalibrated,
+        # which put its predictor outputs on the wrong scale entirely (one-step
+        # skill -6.15). On a correctly saved checkpoint the same measurement
+        # reads 0.3470 against 0.3438, i.e. no gap at all. Keeping the sequence
+        # homogeneous is still the right call; the alarming number was a bug
+        # elsewhere.
         zs, mine_all, joint_all, obs_all = [], [], [], []
 
         for _ in range(T + 1):

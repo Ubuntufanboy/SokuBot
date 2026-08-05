@@ -236,14 +236,25 @@ def main() -> int:
     import copy as _copy
     val = torch.load(a.corpus / "val.pt", map_location="cpu", weights_only=False)
 
-    def measure() -> dict:
+    # Returns the recalibrated *weights* alongside the score, and those are what
+    # get saved. Scoring a recalibrated copy and then saving `model` writes an
+    # artifact that does not match the number which admitted it. This fine-tune
+    # deliberately pushes wrong actions through the network as counterfactual
+    # negatives, so BatchNorm's running statistics absorb a distribution the
+    # model never sees at eval. `ckpt_cf/best.pt` was written that way: it
+    # measured skill -6.15 as saved against the +0.82 recorded in its own blob,
+    # seven times worse than predicting no change at all. Everything calibrated
+    # on it downstream -- the reward probe GRPO reads every reward through --
+    # inherited that.
+    def measure() -> tuple[dict, dict]:
         probe = _copy.deepcopy(model)
         recalibrate_bn(probe, val)
         ev = skill_eval(probe, val, cfg)
+        sd = {k: v.detach().cpu().clone() for k, v in probe.state_dict().items()}
         del probe
-        return ev
+        return ev, sd
 
-    base = measure()
+    base, _ = measure()
     print(f"before fine-tuning: skill {base['skill']:+.4f} "
           f"(val {base['val_pred']:.4f}, identity {base['identity']:.4f})", flush=True)
 
@@ -297,13 +308,13 @@ def main() -> int:
             run = {k: 0.0 for k in run}
 
         if step % a.eval_every == 0:
-            ev = measure()
+            ev, eval_sd = measure()
             cf_now = hist[-1]["cf"] if hist else float("nan")
             keep = ev["skill"] >= a.min_skill and cf_now < best_cf
             if keep:
                 best_cf, best_step = cf_now, step
-                torch.save({"model": model.state_dict(), "cfg": cfg, "step": step,
-                            "skill": ev["skill"], "cf": cf_now},
+                torch.save({"model": eval_sd, "cfg": cfg, "step": step,
+                            "skill": ev["skill"], "cf": cf_now, "bn_recalibrated": True},
                            a.out / "best.pt")
             if hist:
                 hist[-1].update({"skill": ev["skill"], "val_pred": ev["val_pred"],
