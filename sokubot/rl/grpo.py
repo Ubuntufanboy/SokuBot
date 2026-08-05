@@ -132,6 +132,14 @@ class GRPOConfig:
     # the KL penalty are inert -- the update degenerates to REINFORCE with a
     # baseline. More than one makes them do their job.
     epochs: int = 2
+    # Abandon the rest of a batch's inner epochs once the policy has already
+    # moved this far from the one that sampled it. Standard PPO practice, and
+    # the thing whose absence killed every run so far: with kl_coef alone the
+    # measured KL went 0.48 -> 15 -> 42 -> 77 over 250 steps, and entropy
+    # collapsed *after* that, as a symptom. A penalty argues with the gradient;
+    # a target stops it. 0.05 is two orders of magnitude above the 0.0005 a
+    # healthy step shows here and still far below the blow-out.
+    target_kl: float = 0.05
     advantage_scale: str = "batch"
     # Bounds exp() in the surrogate and the KL. exp(5) ~ 148 is already far
     # outside the clipped region, so this costs nothing the objective was using.

@@ -255,6 +255,12 @@ def main() -> int:
         print(f"policy prior: press rate {float(samp.actions.mean()):.4f} "
               f"(corpus {float(p1.mean()):.4f}, uniform ~0.44)", flush=True)
     opt = torch.optim.AdamW(policy.parameters(), lr=a.lr)
+    # A constant step size for 150k steps is the other half of the blow-out: the
+    # advantage is batch-normalised to unit spread, so as the policy captures
+    # the easy gains the signal shrinks while the step does not, and the update
+    # degenerates into a fixed-size random walk. Decay it.
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, a.steps * GRPOConfig.epochs), eta_min=a.lr * 0.05)
     probe_head = ProbeHead(probe).to(a.device)
     arena = ImaginedArena(wm, probe_head, gcfg, cfg.history, cfg.action_ticks)
 
@@ -389,10 +395,17 @@ def main() -> int:
                 traj["obs"].reshape(-1, cfg.history, cfg.latent_dim), flat_side,
                 traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
 
-        for _ in range(gcfg.epochs):
+        stopped_early = 0
+        for _ep in range(gcfg.epochs):
             loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg, ref_logp,
                                     ent_alpha=float(ent_floor.alpha)
                                     if ent_floor else 0.0)
+            # Measured before the step, so this refuses to take an update from a
+            # policy that has already drifted too far from the sampling one
+            # rather than noticing afterwards.
+            if _ep > 0 and stats["kl"] > gcfg.target_kl:
+                stopped_early = 1
+                break
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
@@ -404,6 +417,7 @@ def main() -> int:
                 opt.zero_grad(set_to_none=True)
                 continue
             opt.step()
+            sched.step()
         pool.maybe_add(policy, step)
 
         # The floor is a fraction of where the policy *started*, so it is set
@@ -425,6 +439,8 @@ def main() -> int:
                    "ret": float(traj["reward"].sum(1).mean()),
                    "grad_norm": float(gn), "alive_frac": float(alive.mean()),
                    "skipped": skipped, "term_value": v_mean,
+                   "kl_early_stop": stopped_early,
+                   "lr": float(sched.get_last_lr()[0]),
                    "ent_alpha": ent_stats["alpha"],
                    "ent_floor": ent_stats["floor"],
                    **stats,
