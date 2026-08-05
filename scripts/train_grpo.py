@@ -289,6 +289,7 @@ def main() -> int:
         return out
 
     hist, t0 = [], time.time()
+    best_net, best_step = float("-inf"), -1
     for step in range(1, a.steps + 1):
         # Each group shares one start state and one side.
         idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)

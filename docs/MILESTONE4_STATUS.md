@@ -97,6 +97,40 @@ buttons.
 **So the horizon is a measured parameter, not a taste.** GRPO wants 2–4 steps,
 not 16–24, unless the rollout itself is made more faithful.
 
+### GRPO learns now
+
+With the repaired checkpoint, a probe fit to that same checkpoint, and horizon 4:
+
+```
+step    1  +0.00001      step 1200  +0.00121
+step  200  +0.00022      step 1700  +0.00146
+step  600  +0.00101      step 1800  +0.00152   <- policy_best.pt
+```
+
+150× off the floor, monotone for 1800 steps, and improving on both chairs at
+once: as P1 damage dealt 0.0064 → 0.0085 while taken falls 0.0059 → 0.0057; as
+P2 dealt 0.0060 → 0.0063, taken 0.0065 → 0.0060. That is the first time this
+project's policy has moved at all.
+
+**It does not hold.** Past roughly step 2000 the policy drifts, entropy decays,
+and by step 8000 it is back to deterministic button-mashing — press rate 0.447
+against a human's 0.0985, `kl_ref` 109,281, net back to +0.0002.
+
+`_anchored_kl` fixed a real bug on the way here (a hard-clamped log ratio has
+zero gradient outside the clamp, so the anchor stopped existing exactly when
+needed) and moved the collapse from step ~1200 to ~2000. It is not the cure.
+The policy collapses by becoming confident, so `logp → 0` on its own samples
+while `ref_logp` stays very negative and the log ratio runs to −∞. On that side
+the true KL is only linear, so its restoring gradient is a constant 1 however
+far the policy has gone; at coefficient 0.05 it loses, and at 0.3 it wins so
+hard the policy never moves (+0.00002 over 1000 steps).
+
+**The next thing to try is an entropy floor**, not more KL. What collapses is
+the entropy, so constrain the entropy directly — a target with a Lagrange
+multiplier, as SAC does, which costs nothing while the policy explores and bites
+only at the boundary. `--kl-ref-coef` between 0.05 and 0.3 is the cheap stopgap;
+`policy_best.pt` already captures the peak either way.
+
 ## Corrections, 2026-08-04 later session
 
 Three claims below were tested directly and are wrong. They are left in place

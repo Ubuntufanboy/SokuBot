@@ -291,6 +291,23 @@ def _anchored_kl(log_r: torch.Tensor, fence: float) -> torch.Tensor:
     Inside the fence this is unchanged. Outside, the exponential stays clamped
     (it is what overflows) and a linear term takes over, so the penalty grows
     without bound and its gradient keeps pointing home at constant magnitude.
+
+    That is necessary and, on its own, not sufficient. It moved the collapse from
+    step ~1200 to step ~2000 rather than preventing it. The reason is visible in
+    the asymptotics: the policy collapses by becoming *confident*, so on its own
+    sampled actions `logp -> 0` while `ref_logp` stays very negative, and the log
+    ratio runs to minus infinity. On that side the true k3 KL is
+    `exp(r) - 1 - r ~ -1 - r`, already only linear, so its restoring gradient is
+    a constant 1 no matter how far the policy has gone. At `kl_ref_coef 0.05`
+    that is a pull of 0.05 against a policy gradient that grows with confidence,
+    and the anchor loses. Raising the coefficient to 0.3 does hold it -- and
+    freezes the policy from step one, net gain 0.00002 over 1000 steps.
+
+    So the KL anchor is the wrong instrument for this particular failure. What
+    collapses is the entropy, and the thing to constrain is the entropy: a floor
+    with a Lagrange multiplier, as SAC does, costs nothing while the policy is
+    exploring and only bites at the boundary. Left undone deliberately rather
+    than guessed at.
     """
     safe = log_r.clamp(-fence, fence)
     core = torch.exp(safe) - 1 - safe
