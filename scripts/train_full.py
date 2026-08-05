@@ -96,6 +96,14 @@ def main() -> None:
                          "Optimiser state and LR schedule restart.")
     args = ap.parse_args()
 
+    # Before anything long-running. `on_eval` writes best.pt into --ckpt-dir at
+    # the first eval, and `save_checkpoint` -- the only thing that used to
+    # create that directory -- does not run until training finishes. On a fresh
+    # --ckpt-dir this killed the run at step 5000, eighteen minutes in, with the
+    # eval already computed and then thrown away along with everything else.
+    args.ckpt_dir.mkdir(parents=True, exist_ok=True)
+    args.log.parent.mkdir(parents=True, exist_ok=True)
+
     cfg = Config.soku(device=args.device, batch_size=args.batch_size,
                       num_workers=args.num_workers, total_steps=args.steps,
                       warmup_steps=args.warmup, lr=args.lr, seed=args.seed)
