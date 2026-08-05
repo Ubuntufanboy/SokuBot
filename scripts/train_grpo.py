@@ -42,9 +42,9 @@ from sokubot.config import Config
 from sokubot.data.soku import decode_frames, read_actions
 from sokubot.model.world_model import LeWorldModel
 from sokubot.probe import LinearProbe
-from sokubot.rl.grpo import (GRPOConfig, ImaginedArena, PolicyOpponent, ProbeHead,
-                             ReplayOpponent, SnapshotPool, group_advantages,
-                             grpo_loss)
+from sokubot.rl.grpo import (EntropyFloor, GRPOConfig, ImaginedArena,
+                             PolicyOpponent, ProbeHead, ReplayOpponent,
+                             SnapshotPool, group_advantages, grpo_loss)
 from sokubot.rl.policy import SokuPolicy
 from sokubot.rl.reward import RewardConfig
 from scripts.horizon_ablation import capture_paths, encode_all
@@ -133,6 +133,16 @@ def main() -> int:
                          "behaviour from one start")
     ap.add_argument("--starts", type=int, default=256, help="groups per batch")
     ap.add_argument("--bank-replays", type=int, default=200)
+    ap.add_argument("--entropy-floor-frac", type=float, default=None,
+                    help="floor under the policy entropy, as a fraction of its "
+                         "entropy at initialisation. 0 disables it.")
+    ap.add_argument("--planner", type=Path, default=None,
+                    help="FF-JEPA latent planner from scripts.train_planner. "
+                         "Its predicted subgoal is read with the reward probe "
+                         "and added to the last step as a terminal value, so a "
+                         "short rollout carries information about the seconds "
+                         "after it ends.")
+    ap.add_argument("--value-coef", type=float, default=1.0)
     ap.add_argument("--kl-ref-coef", type=float, default=None,
                     help="strength of the anchor back to the initial policy. "
                          "The default 0.05 held until the reward was corrected "
@@ -209,6 +219,8 @@ def main() -> int:
                       starts_per_batch=a.starts, lr=a.lr, reward=rcfg)
     if a.kl_ref_coef is not None:
         gcfg.kl_ref_coef = a.kl_ref_coef
+    if a.entropy_floor_frac is not None:
+        gcfg.entropy_floor_frac = a.entropy_floor_frac
     print(f"kl_ref_coef {gcfg.kl_ref_coef}, horizon {gcfg.horizon}", flush=True)
 
     manifest = a.corpus / "train" / "manifest.jsonl"
@@ -243,8 +255,44 @@ def main() -> int:
         print(f"policy prior: press rate {float(samp.actions.mean()):.4f} "
               f"(corpus {float(p1.mean()):.4f}, uniform ~0.44)", flush=True)
     opt = torch.optim.AdamW(policy.parameters(), lr=a.lr)
-    arena = ImaginedArena(wm, ProbeHead(probe).to(a.device), gcfg,
-                          cfg.history, cfg.action_ticks)
+    probe_head = ProbeHead(probe).to(a.device)
+    arena = ImaginedArena(wm, probe_head, gcfg, cfg.history, cfg.action_ticks)
+
+    planner = None
+    if a.planner is not None:
+        from scripts.subgoal_test import LatentPlanner
+        pb = torch.load(a.planner, map_location=a.device, weights_only=False)
+        if pb.get("wm_fingerprint") != model_fingerprint(wm):
+            raise SystemExit(
+                f"planner was trained on latents from {pb.get('wm_fingerprint')} "
+                f"but --wm is {model_fingerprint(wm)}. It predicts in the wrong "
+                f"space; retrain with scripts.train_planner --ckpt {a.wm}.")
+        planner = LatentPlanner(pb["latent_dim"], ctx=pb["ctx"]).to(a.device)
+        planner.load_state_dict(pb["planner"])
+        planner.eval()
+        for prm in planner.parameters():
+            prm.requires_grad_(False)
+        print(f"planner: H={pb['horizon']} ctx={pb['ctx']}, health-delta skill "
+              f"{pb['health_delta_skill']:+.4f}, value coef {a.value_coef}",
+              flush=True)
+
+    @torch.no_grad()
+    def terminal_value(traj, side):
+        """Damage the planner expects over the H steps *after* the rollout ends.
+
+        Read straight off the predicted subgoal with the same frozen probe the
+        reward uses, as (their health drop) - (my health drop), so it is already
+        in the units of `dealt + taken` and needs no separate scale.
+        """
+        z_last = traj["obs"][:, -1, -1]                       # [B, latent]
+        st = probe_head(z_last)
+        sg = probe_head(planner(z_last[:, None]))
+        me = side.long()
+        hp_me_now = st.gather(1, me[:, None]).squeeze(1)
+        hp_th_now = st.gather(1, (1 - me)[:, None]).squeeze(1)
+        hp_me_sg = sg.gather(1, me[:, None]).squeeze(1)
+        hp_th_sg = sg.gather(1, (1 - me)[:, None]).squeeze(1)
+        return (hp_th_now - hp_th_sg) - (hp_me_now - hp_me_sg)
     pool = SnapshotPool(gcfg)
     G, S = a.group_size, a.starts
     B = G * S
@@ -290,6 +338,8 @@ def main() -> int:
 
     hist, t0 = [], time.time()
     best_net, best_step = float("-inf"), -1
+    ent_floor = (EntropyFloor(gcfg, a.device)
+                 if gcfg.entropy_floor_frac > 0 else None)
     for step in range(1, a.steps + 1):
         # Each group shares one start state and one side.
         idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)
@@ -309,6 +359,15 @@ def main() -> int:
             kind = "snapshot" if use_snap else "self"
 
         traj = arena.rollout(z_ctx, a_hist, side, policy, opponent)
+        if planner is not None:
+            # Paid at the final step, so `group_advantages` discounts it back
+            # through the rollout exactly like any other reward.
+            v = terminal_value(traj, side) * a.value_coef
+            traj["reward"] = traj["reward"].clone()
+            traj["reward"][:, -1] = traj["reward"][:, -1] + v * traj["alive"][:, -1]
+            v_mean = float(v.mean())
+        else:
+            v_mean = 0.0
         adv = group_advantages(traj["reward"], traj["alive"], G, gcfg.gamma,
                                scale=gcfg.advantage_scale)
         flat_side = side[:, None].expand(B, a.horizon).reshape(-1)
@@ -331,7 +390,9 @@ def main() -> int:
                 traj["mine"].reshape(-1, cfg.action_ticks, 10))[0].view(B, a.horizon)
 
         for _ in range(gcfg.epochs):
-            loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg, ref_logp)
+            loss, stats = grpo_loss(policy, traj, adv, old_logp, gcfg, ref_logp,
+                                    ent_alpha=float(ent_floor.alpha)
+                                    if ent_floor else 0.0)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(policy.parameters(), gcfg.grad_clip)
@@ -345,6 +406,17 @@ def main() -> int:
             opt.step()
         pool.maybe_add(policy, step)
 
+        # The floor is a fraction of where the policy *started*, so it is set
+        # once from the first measured entropy rather than guessed in advance.
+        ent_stats = {"alpha": 0.0, "floor": float("nan")}
+        if ent_floor is not None:
+            if ent_floor.floor is None:
+                f = ent_floor.set_floor_from(stats["entropy"])
+                print(f"entropy floor {f:.2f} nats "
+                      f"({gcfg.entropy_floor_frac:.0%} of the initial "
+                      f"{stats['entropy']:.2f})", flush=True)
+            ent_stats = ent_floor.update(stats["entropy"])
+
         if step % a.log_every == 0 or step == 1:
             alive = traj["alive"]
             n = alive.sum().clamp(min=1)
@@ -352,7 +424,9 @@ def main() -> int:
                    "reward": float((traj["reward"] * alive).sum() / n),
                    "ret": float(traj["reward"].sum(1).mean()),
                    "grad_norm": float(gn), "alive_frac": float(alive.mean()),
-                   "skipped": skipped,
+                   "skipped": skipped, "term_value": v_mean,
+                   "ent_alpha": ent_stats["alpha"],
+                   "ent_floor": ent_stats["floor"],
                    **stats,
                    **{f"r_{k}": float((v * alive).sum() / n)
                       for k, v in traj["terms"].items()}}
@@ -397,7 +471,8 @@ def main() -> int:
             print(f"step {step:6d} | ret {rec['ret']:+8.4f} | dealt "
                   f"{rec['r_dealt']:+.4f} taken {rec['r_taken']:+.4f} | "
                   f"KL {rec['kl']:.4f} ent {rec['entropy']:.2f} "
-                  f"clip {rec['clip_frac']:.3f} | vs {kind} | "
+                  f"clip {rec['clip_frac']:.3f} | a {rec['ent_alpha']:.3f} "
+                  f"V {rec['term_value']:+.4f} | vs {kind} | "
                   f"{rec['elapsed_h']:.2f}h", flush=True)
 
         if step % a.ckpt_every == 0:

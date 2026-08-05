@@ -87,6 +87,29 @@ class GRPOConfig:
     # that neighbourhood -- the same construction RLHF uses, for the same reason.
     entropy_coef: float = 0.0
     kl_ref_coef: float = 0.05
+    # Entropy floor, as a fraction of the policy's entropy at initialisation.
+    #
+    # A fixed entropy *bonus* is the wrong shape for this: at 0.02 it pinned the
+    # policy at 24.98 of a possible 25.4 nats for 625 steps, and at 0 the policy
+    # collapsed to 0.05 and started mashing. What is wanted is not a preference
+    # for entropy but a floor under it, so the term costs nothing while the
+    # policy explores and only bites at the boundary. `entropy_coef` becomes a
+    # learned multiplier on the violation, exactly as SAC tunes its temperature.
+    #
+    # Anchored to the initial entropy rather than to an absolute number because
+    # the policy is initialised from the corpus action prior -- roughly 12.5 nats
+    # against a uniform 25.4 -- so "80% of where human-like play starts" is a
+    # meaningful floor and "10 nats" is an arbitrary one.
+    entropy_floor_frac: float = 0.8
+    # The multiplier starts near zero, not at one. Starting at alpha = 1 makes
+    # the floor a full-strength entropy *bonus* from step one: the first attempt
+    # drove the policy from its corpus-prior 10.76 nats to the 25.40 maximum
+    # within fifty steps and a 0.43 press rate, destroying the initialisation
+    # before the dual could decay. A floor has to cost nothing until it is
+    # violated, which means starting inert and rising only if entropy falls.
+    entropy_log_alpha_init: float = -5.0
+    entropy_lr: float = 0.02
+    max_log_alpha: float = 4.0
     # Passes over each batch of rollouts. With one pass the sampling policy *is*
     # the current policy, so the ratio is identically 1 and both the clipping and
     # the KL penalty are inert -- the update degenerates to REINFORCE with a
@@ -314,9 +337,56 @@ def _anchored_kl(log_r: torch.Tensor, fence: float) -> torch.Tensor:
     return core + (log_r.abs() - fence).clamp(min=0.0)
 
 
+class EntropyFloor:
+    """A learned multiplier that only pays attention below a target entropy.
+
+    The dual of `maximise return subject to H(pi) >= H_floor`. `alpha` rises
+    while the constraint is violated and decays to zero once it is satisfied,
+    so an exploring policy is not taxed and a collapsing one is caught. This is
+    SAC's temperature tuning with the inequality pointing the same way.
+
+    The failure it exists for: with no entropy term the policy fell from 12.5
+    nats to 0.05 and pinned itself on deterministic button-mashing at a 33%
+    press rate, wiping out gains it had already banked. With a *fixed* bonus it
+    sat at maximum entropy instead, unable to commit to anything. Neither is a
+    tuning problem; a bonus and a floor are different objectives.
+    """
+
+    def __init__(self, cfg: GRPOConfig, device):
+        self.cfg = cfg
+        self.log_alpha = torch.tensor(cfg.entropy_log_alpha_init, device=device,
+                                      requires_grad=True)
+        self.opt = torch.optim.Adam([self.log_alpha], lr=cfg.entropy_lr)
+        self.floor: Optional[float] = None
+
+    def set_floor_from(self, initial_entropy: float) -> float:
+        self.floor = self.cfg.entropy_floor_frac * initial_entropy
+        return self.floor
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.detach().clamp(max=self.cfg.max_log_alpha).exp()
+
+    def update(self, entropy: float) -> dict:
+        """Push alpha up while entropy sits under the floor, down while over."""
+        if self.floor is None:
+            return {"alpha": 0.0, "floor": float("nan")}
+        # Relative violation, so `entropy_lr` means the same thing whatever the
+        # action space's entropy scale happens to be.
+        loss = self.log_alpha.clamp(max=self.cfg.max_log_alpha) * (
+            (entropy - self.floor) / max(abs(self.floor), 1e-6))
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        self.opt.step()
+        with torch.no_grad():
+            self.log_alpha.clamp_(-10.0, self.cfg.max_log_alpha)
+        return {"alpha": float(self.alpha), "floor": self.floor}
+
+
 def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
               old_logp: torch.Tensor, cfg: GRPOConfig,
-              ref_logp: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, dict]:
+              ref_logp: Optional[torch.Tensor] = None,
+              ent_alpha: float = 0.0) -> tuple[torch.Tensor, dict]:
     """Clipped surrogate, a k3 KL back to the sampling policy, and optionally a
     second KL back to a fixed reference.
 
@@ -360,8 +430,11 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
         kl_ref = torch.zeros_like(kl)
 
     denom = alive.sum().clamp(min=1.0)
+    # `ent_alpha` is the EntropyFloor's multiplier: zero while the policy is
+    # above its floor, growing while it is below. `entropy_coef` is the old
+    # fixed bonus and stays at 0 unless something explicitly wants it.
     loss = (((pg + cfg.kl_coef * kl + cfg.kl_ref_coef * kl_ref
-              - cfg.entropy_coef * ent) * alive).sum() / denom)
+              - (cfg.entropy_coef + ent_alpha) * ent) * alive).sum() / denom)
     with torch.no_grad():
         stats = {
             "pg": float((pg * alive).sum() / denom),
