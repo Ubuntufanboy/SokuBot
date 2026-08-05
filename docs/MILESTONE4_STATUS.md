@@ -55,6 +55,48 @@ to produce the flat curve, and it is a far duller explanation than chaos.
 
 Nothing here implicates pixels or the observation space.
 
+### Answering "why is the world model invariant to controller inputs"
+
+It is not. `scripts/action_effect_test.py` fits a regressor to
+`f(start latent, joint action sequence) -> outcome`, trains it on some start
+states and scores it on start states it has never seen. Within-start
+correlation on held-out starts is exactly the quantity a policy gradient
+consumes: can the effect of an action be predicted at a *new* situation?
+
+On the repaired checkpoint, 4096 starts x 32 sampled rollouts:
+
+| horizon | seconds | return | net damage | damage dealt | own actions only |
+|---|---|---|---|---|---|
+| 1 | 0.07 | **+0.547** | **+0.556** | **+0.598** | +0.247 |
+| 4 | 0.27 | +0.317 | +0.267 | +0.221 | +0.140 |
+| 16 | 1.07 | +0.094 | +0.078 | +0.128 | +0.058 |
+
+A one-step action effect transfers to unseen states at r ≈ 0.56–0.60. The world
+model learned real, generalising mechanics from pixels and buttons alone. What
+it cannot do is carry them through a long autoregressive rollout: by sixteen
+steps only about a sixth of that survives.
+
+The leverage table says the same thing from the other side. Within-start spread
+as a fraction of across-start spread *grows* with horizon (net damage 0.049 at
+h=1 to 0.184 at h=16) while its predictability collapses. Long rollouts
+manufacture more action-driven variance and less action-driven *meaning*: past
+a few steps the divergence is compounding error, not mechanics.
+
+GRPO was planning at horizon 24. Roughly nine tenths of its advantage signal was
+compounding noise even before the two bugs above are counted, and each gradient
+step pointed somewhere unrelated to the last. They cancelled, which is precisely
+the flat curve that was observed.
+
+**Controls.** A synthetic target with the shape of a real mechanic — attack
+rate scaled by the opponent's health at the start — is recovered at +0.9993 to
++0.9997 at every horizon by the same regressor on the same features. So a null
+on the real targets is a fact about the world model and not about the fitting
+budget. A pure action function scores +0.999, confirming the features carry the
+buttons.
+
+**So the horizon is a measured parameter, not a taste.** GRPO wants 2–4 steps,
+not 16–24, unless the rollout itself is made more faithful.
+
 ## Corrections, 2026-08-04 later session
 
 Three claims below were tested directly and are wrong. They are left in place
