@@ -416,9 +416,19 @@ def main() -> int:
 
     # The calibrated readout is what GRPO reads rewards with, so persist it
     # rather than making the training run refit it.
+    #
+    # Stamped with the weights it was fit against. A probe is a linear map out of
+    # one particular latent space and means nothing in another, and this exact
+    # mismatch already happened once: this ablation was run against
+    # `ckpt_cf/best.pt` while `train_grpo` rolled `ckpt/best.pt`, so every reward
+    # GRPO saw came from a map fit to a different model's latents. Nothing
+    # failed; the rewards were simply noise.
+    from scripts.train_grpo import model_fingerprint
+    fp = model_fingerprint(model)
     np.savez(a.out / "reward_probe.npz", zmu=probe_cal.zmu, zsd=probe_cal.zsd,
              ymu=probe_cal.ymu, ysd=probe_cal.ysd, W=probe_cal.W,
-             names=np.array(probe_cal.names), alpha=best["calibrated"])
+             names=np.array(probe_cal.names), alpha=best["calibrated"],
+             fingerprint=fp, ckpt=str(a.ckpt))
     print(f"wrote {a.out/'reward_probe.npz'}")
 
     # The encoder-fit probe too. The calibrated one is right for predictor

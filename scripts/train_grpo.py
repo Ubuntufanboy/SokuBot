@@ -166,6 +166,24 @@ def main() -> int:
     print(f"reward probe: alpha {float(d['alpha']):g}, targets {probe.names}",
           flush=True)
 
+    # The probe is a linear map out of one specific latent space. Read a
+    # different model's latents through it and the rewards are noise, silently:
+    # the run trains, the curves look plausible, and nothing is being optimised.
+    # That is what happened -- the ablation that fit this probe ran against
+    # ckpt_cf/best.pt while this defaulted to ckpt/best.pt.
+    wm_fp = model_fingerprint(wm)
+    probe_fp = str(d["fingerprint"]) if "fingerprint" in d.files else None
+    if probe_fp is None:
+        print(f"WARNING: {a.probe} predates the fingerprint stamp, so it cannot "
+              f"be checked against this world model ({wm_fp}). Re-run "
+              f"scripts.horizon_ablation --ckpt {a.wm} to be sure.", flush=True)
+    elif probe_fp != wm_fp:
+        raise SystemExit(
+            f"reward probe was fit on weights {probe_fp} "
+            f"({str(d['ckpt']) if 'ckpt' in d.files else 'unknown ckpt'}) but "
+            f"--wm {a.wm} is {wm_fp}. A probe does not transfer between latent "
+            f"spaces; re-run scripts.horizon_ablation --ckpt {a.wm}.")
+
     # Spirit is unmeasurable in the latent, so the terms that depend on it are
     # off. Combo survives only at short horizons, hence the reduced weight.
     # Weights checked against a random policy's term breakdown before launching.
