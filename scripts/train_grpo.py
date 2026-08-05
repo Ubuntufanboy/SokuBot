@@ -133,6 +133,11 @@ def main() -> int:
                          "behaviour from one start")
     ap.add_argument("--starts", type=int, default=256, help="groups per batch")
     ap.add_argument("--bank-replays", type=int, default=200)
+    ap.add_argument("--kl-ref-coef", type=float, default=None,
+                    help="strength of the anchor back to the initial policy. "
+                         "The default 0.05 held until the reward was corrected "
+                         "and the policy actually had a direction to run in; "
+                         "raise it if entropy collapses.")
     ap.add_argument("--lr", type=float, default=1.5e-4,
                     help="the 3e-4 this defaulted to silently overrode the "
                          "1e-4 in GRPOConfig and drove KL to 54 with 43%% of "
@@ -202,6 +207,9 @@ def main() -> int:
                         flying=0.0015, idle=-0.020)
     gcfg = GRPOConfig(horizon=a.horizon, group_size=a.group_size,
                       starts_per_batch=a.starts, lr=a.lr, reward=rcfg)
+    if a.kl_ref_coef is not None:
+        gcfg.kl_ref_coef = a.kl_ref_coef
+    print(f"kl_ref_coef {gcfg.kl_ref_coef}, horizon {gcfg.horizon}", flush=True)
 
     manifest = a.corpus / "train" / "manifest.jsonl"
     rows = [json.loads(l) for l in manifest.read_text().splitlines()]
@@ -365,6 +373,14 @@ def main() -> int:
             if step % a.eval_every == 0 or step == 1:
                 ev = evaluate()
                 rec.update({f"eval_{k}": v for k, v in ev.items()})
+                # Keep the peak. GRPO here improves for a while and can then
+                # diverge, and a run that ends worse than it passed through
+                # should still hand back the policy it passed through.
+                if ev["net"] > best_net:
+                    best_net, best_step = ev["net"], step
+                    torch.save({"policy": policy.state_dict(), "cfg": cfg,
+                                "step": step, "net": ev["net"]},
+                               a.out / "policy_best.pt")
                 print(f"  [eval] step {step:6d} | net vs frozen init "
                       f"{ev['net']:+.5f} | as P1 {ev['p1_dealt']:+.4f}/"
                       f"{ev['p1_taken']:+.4f} | as P2 {ev['p2_dealt']:+.4f}/"

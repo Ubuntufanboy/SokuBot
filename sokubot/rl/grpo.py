@@ -276,6 +276,27 @@ def group_advantages(reward: torch.Tensor, alive: torch.Tensor,
     return adv.view(B, T)
 
 
+def _anchored_kl(log_r: torch.Tensor, fence: float) -> torch.Tensor:
+    """k3 KL that keeps pulling once the policy is outside the fence.
+
+    `exp(log_r) - 1 - log_r` on a hard-clamped `log_r` has *exactly zero
+    gradient* beyond the clamp. As an anchor that is a fence whose gate opens
+    outward: it holds while the policy stays near the reference and stops
+    existing the moment the policy escapes, which is the one situation it was
+    added for. The first run at the corrected reward drifted past it around step
+    1000 and then ran away unopposed -- entropy 5.72 -> 0.05, KL to reference 87
+    and still climbing, the policy pinned on deterministic button-mashing, and
+    the eval gains it had accumulated to that point wiped out.
+
+    Inside the fence this is unchanged. Outside, the exponential stays clamped
+    (it is what overflows) and a linear term takes over, so the penalty grows
+    without bound and its gradient keeps pointing home at constant magnitude.
+    """
+    safe = log_r.clamp(-fence, fence)
+    core = torch.exp(safe) - 1 - safe
+    return core + (log_r.abs() - fence).clamp(min=0.0)
+
+
 def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
               old_logp: torch.Tensor, cfg: GRPOConfig,
               ref_logp: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, dict]:
@@ -317,8 +338,7 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
     kl = torch.exp(log_r) - 1 - log_r
 
     if ref_logp is not None:
-        log_r_ref = (ref_logp - logp).clamp(-cfg.max_log_ratio, cfg.max_log_ratio)
-        kl_ref = torch.exp(log_r_ref) - 1 - log_r_ref
+        kl_ref = _anchored_kl(ref_logp - logp, cfg.max_log_ratio)
     else:
         kl_ref = torch.zeros_like(kl)
 
