@@ -91,6 +91,9 @@ def main() -> None:
                     help="peak LR. The 5e-4 tuned on 16k-step runs diverged at "
                          "75k of a 320k-step schedule -- see module docstring.")
     ap.add_argument("--warmup", type=int, default=5_000)
+    ap.add_argument("--init-from", type=Path, default=None,
+                    help="continue from these weights instead of random init. "
+                         "Optimiser state and LR schedule restart.")
     args = ap.parse_args()
 
     cfg = Config.soku(device=args.device, batch_size=args.batch_size,
@@ -101,6 +104,14 @@ def main() -> None:
 
     set_seed(args.seed)
     model = LeWorldModel(cfg)
+    if args.init_from is not None:
+        # Weights only. The optimiser state and the cosine schedule restart,
+        # which is the honest thing to say about it: this continues training
+        # from a set of weights, it does not resume an interrupted run.
+        blob = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        model.load_state_dict(blob["model"])
+        print(f"initialised from {args.init_from} (step {blob.get('step')}); "
+              f"optimiser and LR schedule start fresh", flush=True)
     rep = model.param_report()
     print("params: " + ", ".join(f"{k} {v/1e6:.2f}M" for k, v in rep.items()), flush=True)
 
@@ -127,6 +138,15 @@ def main() -> None:
         probe_model = copy.deepcopy(m)
         recalibrate_bn(probe_model, cache)
         ev = evaluate(probe_model, cache, cfg)
+        # Keep the weights that were actually scored. Saving `m` instead writes
+        # a checkpoint whose BatchNorm statistics are not the ones the recorded
+        # skill describes -- mild here, since ordinary training keeps them close
+        # (+0.8689 as saved against +0.8642 recalibrated), and catastrophic in
+        # finetune_action, where counterfactual negatives drag the running stats
+        # off-distribution and this same pattern shipped a checkpoint measuring
+        # -6.15 while its own blob recorded +0.82.
+        eval_sd = {k: v.detach().cpu().clone()
+                   for k, v in probe_model.state_dict().items()}
         del probe_model
         ev["step"] = step
         tail = hist[-20:] if hist else []
@@ -159,8 +179,9 @@ def main() -> None:
         # healthy step-65k model was already gone.
         healthy = [c for c in curve if not c["diverged"]]
         if healthy and ev is healthy[-1] and ev["skill"] >= max(c["skill"] for c in healthy):
-            torch.save({"model": m.state_dict(), "cfg": cfg, "step": step,
-                        "eval": ev}, Path(args.ckpt_dir) / "best.pt")
+            torch.save({"model": eval_sd, "cfg": cfg, "step": step,
+                        "eval": ev, "bn_recalibrated": True},
+                       Path(args.ckpt_dir) / "best.pt")
             print(f"  saved best.pt (skill {ev['skill']:+.4f} at step {step})", flush=True)
         print(f"  [eval] step {step:6d} | train {ev['train_pred']:.4f} "
               f"| val {ev['val_pred']:.4f} | identity {ev['identity']:.4f} "
