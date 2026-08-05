@@ -101,12 +101,26 @@ def main() -> int:
     A = torch.from_numpy(bank["a"]).to(dev)
     ep = bank["ep"]
 
-    # Winner per replay, from the final frame's health.
-    ends = np.r_[np.flatnonzero(np.diff(ep)), len(ep) - 1]
-    fin = head_enc(Z[torch.from_numpy(ends).to(dev)].float())
-    winner = (fin[:, 1] > fin[:, 0]).long().cpu().numpy()   # 1 => P2 won
-    print(f"{len(ends)} replays; P1 won {(winner == 0).sum()}, "
-          f"P2 won {(winner == 1).sum()}")
+    # Winner per replay. Not from the final frame: captures do not all end on
+    # the deciding hit, and the probe carries a small constant bias between the
+    # hp1 and hp2 readouts, which on final-frame health alone declared P1 the
+    # winner of all 200 replays. The lowest point each bar reaches over the
+    # whole capture is far more robust -- the loser is whoever got closest to
+    # zero -- and the bias mostly cancels in the comparison of two minima.
+    hp_all = []
+    for s0 in range(0, len(Z), 65536):
+        hp_all.append(head_enc(Z[s0 : s0 + 65536].float())[:, :2].cpu())
+    hp_all = torch.cat(hp_all).numpy()
+    edges = np.r_[0, np.flatnonzero(np.diff(ep)) + 1, len(ep)]
+    winner, margin = [], []
+    for lo_, hi_ in zip(edges[:-1], edges[1:]):
+        m1, m2 = hp_all[lo_:hi_, 0].min(), hp_all[lo_:hi_, 1].min()
+        winner.append(0 if m1 > m2 else 1)
+        margin.append(abs(m1 - m2))
+    winner, margin = np.array(winner), np.array(margin)
+    print(f"{len(winner)} replays; P1 won {(winner == 0).sum()}, "
+          f"P2 won {(winner == 1).sum()}  "
+          f"(median margin {np.median(margin):.3f} bar)")
 
     lo = cfg.history - 1
     ok = np.zeros(len(ep), dtype=bool)
@@ -190,16 +204,26 @@ def main() -> int:
     print("-" * 68)
 
     ra = res["arms"]
-    rw = (ra["real/P1/winners"]["dealt"] + ra["real/P2/winners"]["dealt"]) / 2
-    ia = (ra["imagined/P1/all"]["dealt"] + ra["imagined/P2/all"]["dealt"]) / 2
-    rl = (ra["real/P1/all"]["dealt"] + ra["real/P2/all"]["dealt"]) / 2
-    print(f"\nA winning human deals {rw:.4f} per {res['seconds']:.2f} s "
-          f"({rw*per_min:.2f} health bars per minute of it).")
-    print(f"The same play scored inside the world model deals {ia:.4f} "
-          f"against {rl:.4f} in reality "
-          f"({ia/max(rl,1e-9):.2f}x).")
-    print("\nRead GRPO's `as P1 +x/-y` against the *imagined* rows: the agent is "
-          "only ever scored inside the world model.")
+    g = lambda k, f="dealt": ra[k][f] if k in ra else float("nan")
+    mean2 = lambda a_, b_: np.nanmean([a_, b_])
+
+    rl = mean2(g("real/P1/all"), g("real/P2/all"))
+    ia = mean2(g("imagined/P1/all"), g("imagined/P2/all"))
+    wn = mean2(g("real/P1/winners"), g("real/P2/winners"))
+    res["summary"] = {"real_dealt": rl, "imagined_dealt": ia,
+                      "winner_real_dealt": wn, "distortion": ia / max(rl, 1e-9)}
+    print(f"\nHUMAN THROUGHPUT, averaged over both chairs so the probe's "
+          f"P1/P2 bias cancels:")
+    print(f"  in the real game        {rl:.4f} per {res['seconds']:.2f} s "
+          f"= {rl*per_min:.2f} bars/min")
+    print(f"  through the world model {ia:.4f} per {res['seconds']:.2f} s "
+          f"= {ia*per_min:.2f} bars/min   ({ia/max(rl,1e-9):.2f}x)")
+    print(f"  winners only, real      {wn:.4f}")
+    print(f"\nCompare GRPO's `as P1 +x` against the *imagined* figure: the "
+          f"agent is only ever scored inside the world model.")
+    print(f"Net is near zero for both humans by construction -- two people of "
+          f"similar skill trade evenly -- so damage *dealt* is the throughput "
+          f"to compare, and net only means something against a fixed opponent.")
     a.out.write_text(json.dumps(res, indent=2))
     return 0
 
