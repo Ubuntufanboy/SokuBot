@@ -50,7 +50,7 @@ class SokuPolicy(nn.Module):
     """[B, H, latent] + side -> a distribution over one decision step."""
 
     def __init__(self, latent_dim: int = 192, history: int = 3, ticks: int = 4,
-                 width: int = 512, depth: int = 3, logit_bound: float = 4.0):
+                 width: int = 512, depth: int = 3, logit_bound: float = 6.0):
         super().__init__()
         self.ticks = ticks
         self.history = history
@@ -64,10 +64,17 @@ class SokuPolicy(nn.Module):
         # was arguing with a runaway instead of preventing one.
         #
         # tanh rather than a hard clamp because a clamp has no gradient outside
-        # its bounds, which is the same mistake the KL anchor made. At 4.0 a
-        # button can still go from the corpus prior's 0.0985 to 0.982, which is
-        # far more commitment than good play needs, while the entropy floor
-        # still has room to act above the ~2.1 nats this bound implies.
+        # its bounds, which is the same mistake the KL anchor made.
+        #
+        # 6.0 is set by the corpus, not by taste. The prior needs a logit of
+        # -5.33 to represent the rarest button -- pressed 0.48% of the time --
+        # and a bound below that cannot express human play at all: the first
+        # attempt at 4.0 was rejected by the check in set_action_prior rather
+        # than silently distorting the reference the whole evaluation is
+        # measured against. The floor this implies is 0.42 nats, well under the
+        # entropy floor's working range, but the point of the bound is not the
+        # entropy floor: it is that the log-ratio to the reference is now
+        # bounded by roughly 64L instead of reaching 1e14.
         self.logit_bound = logit_bound
         # Which player the agent is. The user asked for the agent to know this,
         # and it is load-bearing: the probe's channels are P1-first, so "my
