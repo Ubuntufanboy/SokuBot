@@ -50,10 +50,25 @@ class SokuPolicy(nn.Module):
     """[B, H, latent] + side -> a distribution over one decision step."""
 
     def __init__(self, latent_dim: int = 192, history: int = 3, ticks: int = 4,
-                 width: int = 512, depth: int = 3):
+                 width: int = 512, depth: int = 3, logit_bound: float = 4.0):
         super().__init__()
         self.ticks = ticks
         self.history = history
+        # Logits are squashed to (-logit_bound, logit_bound) before any
+        # distribution is built. Without it the policy has nothing stopping it
+        # from becoming arbitrarily confident, and four GRPO runs did exactly
+        # that: entropy to 0.00, press rate 0.53 against a human's 0.097, and a
+        # KL from the reference of 1e14 -- a policy whose log-probabilities have
+        # run away has left the region the world model was trained on, and every
+        # penalty term added to chase it (entropy floor, KL target, LR decay)
+        # was arguing with a runaway instead of preventing one.
+        #
+        # tanh rather than a hard clamp because a clamp has no gradient outside
+        # its bounds, which is the same mistake the KL anchor made. At 4.0 a
+        # button can still go from the corpus prior's 0.0985 to 0.982, which is
+        # far more commitment than good play needs, while the entropy floor
+        # still has room to act above the ~2.1 nats this bound implies.
+        self.logit_bound = logit_bound
         # Which player the agent is. The user asked for the agent to know this,
         # and it is load-bearing: the probe's channels are P1-first, so "my
         # health" is a different column depending on the side.
@@ -87,12 +102,28 @@ class SokuPolicy(nn.Module):
             p = torch.as_tensor(btn_probs, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
             btn = torch.log(p / (1 - p))
             per_tick = torch.cat([lr, ud, btn])
+            # Pre-invert the squash so the *bounded* logits equal the corpus
+            # statistics rather than a shrunken version of them. Without this
+            # the prior arrives distorted -- at bound 4.0 a target of -2.41
+            # would come out as -2.16 -- and the reference policy the whole
+            # evaluation is measured against would not be the corpus prior.
+            if self.logit_bound:
+                L = self.logit_bound
+                if float(per_tick.abs().max()) >= L:
+                    raise ValueError(
+                        f"action prior needs logits up to "
+                        f"{float(per_tick.abs().max()):.2f} but logit_bound is "
+                        f"{L}; the bound cannot represent the corpus prior")
+                per_tick = L * torch.atanh(per_tick / L)
             self.head.bias.copy_(per_tick.repeat(self.ticks))
 
     def logits(self, z_hist: torch.Tensor, side: torch.Tensor):
         B = z_hist.shape[0]
         h = self.trunk(z_hist.reshape(B, -1)) + self.side_emb(side)
         o = self.head(h).view(B, self.ticks, 3 + 3 + N_FREE)
+        if self.logit_bound:
+            L = self.logit_bound
+            o = L * torch.tanh(o / L)
         return o[..., :3], o[..., 3:6], o[..., 6:]
 
     def distributions(self, z_hist: torch.Tensor, side: torch.Tensor):
