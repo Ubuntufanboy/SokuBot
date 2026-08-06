@@ -188,8 +188,24 @@ measures random features; compare against the baseline from the same run.
 - [x] Milestone 1 — capture tooling refactor ([SokuFrameExtractor](https://github.com/Ubuntufanboy/SokuFrameExtractor))
 - [x] Milestone 2 — headless containerised replay collection at fleet scale
 - [x] Milestone 3 — LeWM + AdaJEPA model, trained and smoke-tested on PushT
-- [ ] Milestone 4 — train on the full Soku corpus; text conditioning
-- [ ] Milestone 5 — real-time inference and control loop
+- [x] Milestone 4 — trained on the full Soku corpus; GRPO policy learns in the imagined world
+- [ ] Milestone 5 — real-time inference and control loop **(blocked, see below)**
+
+**Currently paused.** The world model works (skill +0.86) and GRPO learns — the
+best policy reaches `net +0.00215` and exceeds human damage throughput in
+world-model units. The blocker is actuation, not learning: Wine's DirectInput
+reads real evdev devices, so synthetic keystrokes never reach the game. Until
+that is solved the agent cannot press a button in Soku, and every number stays
+inside the simulator.
+
+### Documentation
+
+| document | read it for |
+|---|---|
+| **[`docs/HANDOFF.md`](docs/HANDOFF.md)** | **Start here.** Current state, every number with its units, how to rebuild from scratch, what to do next. |
+| [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) | What every checkpoint, probe and policy in `~/K0NTR0L-2/artifacts` is, and which are reproducible. |
+| [`docs/BUGS.md`](docs/BUGS.md) | Eight bugs that produced plausible-looking wrong numbers, and the pattern three of them shared. |
+| [`docs/MILESTONE4_STATUS.md`](docs/MILESTONE4_STATUS.md) | Historical reasoning, layered chronologically. Superseded — read `HANDOFF.md` first. |
 
 ## Papers
 

@@ -1,5 +1,24 @@
 # Milestone 4 — where GRPO stands, and why
 
+> **Start with [`HANDOFF.md`](HANDOFF.md), not this file.**
+>
+> This document grew in layers: the original 2026-08-04 analysis at the bottom,
+> corrections stacked on top in reverse chronological order. That structure is
+> useful for seeing how the reasoning moved, and actively misleading to read
+> cold — several claims below are stated confidently and then retracted three
+> sections above them.
+>
+> Two things here are wrong in ways later sections do not fully flag:
+>
+> * Every number measured through `ckpt_cf/best.pt` is an artifact of a broken
+>   checkpoint (see [`BUGS.md`](BUGS.md) §1). That includes the mean-collapse
+>   and drift findings.
+> * Damage figures quoted from `train_grpo` are **per step**, and were at one
+>   point compared against per-window figures — a 4× error that inverted a
+>   conclusion. See [`HANDOFF.md`](HANDOFF.md) §2.
+>
+> `HANDOFF.md` supersedes all of it and states only what survived.
+
 Written at the end of the 2026-08-04 overnight session. Every number here is
 reproducible from a script in `scripts/`; none of it is inference from a
 training curve.
