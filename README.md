@@ -189,14 +189,41 @@ measures random features; compare against the baseline from the same run.
 - [x] Milestone 2 — headless containerised replay collection at fleet scale
 - [x] Milestone 3 — LeWM + AdaJEPA model, trained and smoke-tested on PushT
 - [x] Milestone 4 — trained on the full Soku corpus; GRPO policy learns in the imagined world
-- [ ] Milestone 5 — real-time inference and control loop **(blocked, see below)**
+- [x] Milestone 5 — real-time inference and control loop; **the agent has played a human**
 
-**Currently paused.** The world model works (skill +0.86) and GRPO learns — the
-best policy reaches `net +0.00215` and exceeds human damage throughput in
-world-model units. The blocker is actuation, not learning: Wine's DirectInput
-reads real evdev devices, so synthetic keystrokes never reach the game. Until
-that is solved the agent cannot press a button in Soku, and every number stays
-inside the simulator.
+**It plays.** On 2026-08-06 SokuBot played the author in Vs Player — Reimu
+(human) vs Cirno (agent) — driving Hisoutensoku itself from nothing but the
+pixels in the game window. The author's verdict:
+
+> "It wasn't great or anything (as expected) but it was 100% real genuine
+> gameplay. No super weird behaviour. … I honestly wouldn't even know it was an
+> AI playing."
+
+```
+2121 decisions over 141 s of play
+round trip p50 48.2 / p90 50.6 / p99 61.8 ms
+0.42% of decisions missed their 66.7 ms control period
+```
+
+The loop is `sokubot/live/`: X11 capture of the game window → vflip and squash
+to the corpus geometry → JPEG → LAN → ViT encoder → one world-model step of
+latency compensation → GRPO policy → a 4-tick button chunk → 60 Hz scheduler →
+a `/dev/uinput` device. **No game memory is read anywhere in it.**
+
+```bash
+# on the machine that holds the model
+python -m scripts.serve_policy --wm ckpt_cf/best_bnfix.pt \
+    --policy grpo_bounded/policy_best.pt --prior action_prior.npz --steps 1
+
+# on the machine running the game (pad first, then the game -- see live/pad.py)
+python -m scripts.play_match --server <host> --side 2 --steps 1
+```
+
+What it does *not* yet do is win. The policy's peak is `net +0.00215` against
+its own initialisation, inside a world model that inflates damage 2.11×. Two
+concrete behaviours the match exposed — it gives up at low health, and it
+presses more than the corpus prior — are written up with their candidate causes
+in [`docs/HANDOFF.md`](docs/HANDOFF.md) §10.
 
 ### Documentation
 

@@ -23,24 +23,42 @@ The goal is an agent that beats the author in an online Hisoutensoku match,
 learned from **pixels and controller inputs only** — no memory reading, ever.
 See §8 for why that constraint is not negotiable.
 
-The pipeline works end to end **inside simulation**:
+The pipeline works end to end, **and now outside simulation too**:
 
 ```
-captures (mp4 + CSV) → encoder → latent world model → reward probe → GRPO policy
+training:  captures (mp4 + CSV) → encoder → latent world model → reward probe → GRPO policy
+live:      X11 capture → encoder → 1-step world-model compensation → policy → uinput device
 ```
 
 The best policy is `artifacts/grpo_bounded/policy_best.pt`, step 2700,
 `net +0.002146`. It beats its own initialisation by a clear margin and, in
-world-model units, exceeds human damage throughput. **That is not the same as
-beating a person**, and the gap between those two statements is the honest
-summary of the project's state. Every number is measured inside a world model
-that inflates damage 2.11× and whose action signal is only trustworthy for about
-0.27 s.
+world-model units, exceeds human damage throughput. Every number in §3 is still
+measured inside a world model that inflates damage 2.11× and whose action signal
+is only trustworthy for about 0.27 s — read them as world-model units, always.
 
-**The blocker is actuation, and it is not a GPU problem.** Wine's DirectInput
-reads real evdev devices, so synthetic keystrokes never reach the game. Until
-that is solved the agent cannot press a button in Soku, cannot be tested against
-a CPU bot or a human, and every number stays self-referential.
+**Milestone 5 is done: the agent has played a human.** On 2026-08-06 it played
+the author in Vs Player, Reimu (human) vs Cirno (agent), driving the game itself
+from window pixels. The author's summary is the result that matters:
+
+> "It wasn't great or anything (as expected) but it was 100% real genuine
+> gameplay. No super weird behaviour. … I honestly wouldn't even know it was an
+> AI playing."
+
+```
+2121 decisions over 141 s armed
+round trip p50 48.2 / p90 50.6 / p99 61.8 ms
+0.42% of decisions missed their 66.7 ms slot; scheduled lag constant at 4 ticks
+```
+
+Recording and per-decision log: `results/`. The loop is `sokubot/live/`, run by
+`scripts/play_match.py` against `scripts/serve_policy.py`. See §10 for what the
+match revealed and what to do next.
+
+**The old blocker is gone.** Wine's DirectInput reads real evdev devices, so
+nothing injected above the kernel reaches the game — that root cause was right,
+but the conclusion drawn from it ("synthetic input is not worth pursuing") was
+too broad. A `/dev/uinput` device created *before the game starts* is read
+normally. §10 records which kind of device, and why the obvious choice is wrong.
 
 ---
 
@@ -307,16 +325,14 @@ weeks.
 ## 9. Next steps, in order
 
 1. **Evaluate `sokubot.pt` (320k)** against `best.pt` (225k). Five minutes,
-   possibly invalidates the base of everything else. §7.
-2. **Solve actuation.** Wine's DirectInput reads real evdev, so synthetic input
-   never reaches Soku. Local work, no GPU. Until this is done nothing can be
-   measured outside the simulator, and the project's central question — does it
-   beat a person — is unanswerable.
-3. **Then finetune against CPU bots in the real game.** The first measurement
-   that is not self-referential.
-4. Optional, only if simulator work resumes: the policy still drifts down from
-   its peak (+0.00215 at step 2700 → +0.00117 at 40k). Not a collapse any more,
-   just decay. `policy_best.pt` captures the peak, so this is a nicety.
+   possibly invalidates the base of everything else. §7. Still not done.
+2. **Chase the two behaviours the live match exposed** — §10. Both are policy or
+   reward questions, which is the first time that has been the honest place to
+   point.
+3. **Finetune against CPU bots in the real game.** Now unblocked: the live loop
+   can run unattended (`scripts/play_match.py --launch --seek-battle`), which
+   makes real-environment episodes collectable rather than hypothetical. The
+   first learning signal that is not self-referential.
 
 **What would raise the ceiling, if it needs raising.** Four runs peaked between
 +0.0016 and +0.00215. The binding constraint is most likely the world model's
@@ -324,3 +340,63 @@ weeks.
 from r=0.55 at one step to r=0.09 at sixteen. Improving *that* is a world-model
 problem (rollout fidelity, or a stochastic latent so multi-step futures stop
 collapsing to a blur), not a GRPO problem.
+
+---
+
+## 10. What the first live match established
+
+### The loop, and the four things settled by measurement
+
+Full rationale lives next to each decision in `sokubot/live/`; the short form:
+
+* **Inference must be local.** The author's uplink is persistently jittery *at
+  idle* — 26–239 ms to Google with the link at 0 KB/s, against 2 ms to their own
+  gateway. The tail is the ISP hop every packet crosses, so no relay helps.
+  Cloud: 65% of decisions missed their slot. LAN box: 0.42%.
+* **Compress at 480×480, not 224.** Latent cosine to the training chain is
+  0.9899 for a 480 JPEG downscaled server-side, 0.9152 for a 224 JPEG. One
+  ordinary gameplay step is 0.9723 — so compressing at 224 costs *more than a
+  whole step of real play*. JPEG artifacts at 224 sit at the same scale as the
+  encoder's 14 px patches; at 480 the downscale averages them out.
+* **The corpus really is stored vertically flipped.** Confirmed by eye against
+  HF shard A-0001, not taken on trust from `data/hud.py`. Live frames are
+  flipped to match.
+* **A DirectInput joystick makes Soku's menus unusable under Wine** — the cursor
+  scrolls continuously once the game receives any joystick input, independent of
+  axis range, POV hat, and VID/PID. The author sees the same with physical
+  controllers. The agent therefore uses a *keyboard* bound to keys the human's
+  profile does not hold (`profile/sokubot.pf`).
+
+### Two behaviours worth chasing, in priority order
+
+**It gives up when its health gets low.** The most interesting observation from
+the match, and there is a mechanistic candidate that can be tested without
+touching the live loop: `compute_rewards` returns an `alive` mask and GRPO
+divides by `alive.sum()`, so imagined trajectories that reach a KO stop
+contributing gradient. Low-health states therefore carry the *least* training
+signal precisely where fighting back matters most — and they are rarer among
+corpus start states to begin with. Measure the per-start gradient magnitude as a
+function of probed health before assuming; it is a falsifiable claim about the
+reward, not about the policy.
+
+**It presses too much.** The trained policy sits at a 0.113–0.130 press rate
+against the corpus prior's 0.094 (`scripts/build_action_prior.py`, 361k frames).
+Human players spam too, so this is mild — but it is a measurable drift from the
+reference the whole evaluation is anchored to, and worth knowing whether it is
+the entropy floor, the bounded logits, or a genuine strategy.
+
+### A caution about instruments, from this session
+
+Two measurement mistakes here cost hours, and both had the same shape: **an
+instrument that could not see the failure reported success.**
+
+* Mean absolute frame difference could not distinguish Soku's animated sky from
+  a cursor crossing eight rows.
+* Sampling that cursor twice, ten seconds apart, *aliased* onto the same row
+  while it was cycling through all twelve entries every few seconds — reporting
+  STABLE twice, confidently, on a screen that was looping.
+
+Sample continuously and count transitions. And when the human at the machine
+contradicts the measurement, the measurement is the thing to doubt first: the
+author said "I have this problem with real controllers too" early on, and taking
+that at face value would have skipped four wrong hypotheses.
