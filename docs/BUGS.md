@@ -214,6 +214,23 @@ Roughly thirty scripts still build `LeWorldModel(cfg)` by hand and will meet thi
 the moment another architecture field gains a default. They should move to
 `load_world_model`.
 
+**It happened again the same day, to me, after writing the paragraph above.**
+`idm_coef` was added with a default of 1.0 to gate the inverse-dynamics head, and
+every checkpoint written before it — including `wm_cf_bnfix.pt`, which everything
+depends on — started failing to load. `eval_policy`, `train_ac`, `train_grpo` and
+`banner_in_imagination` all broke at once.
+
+Knowing the rule was not enough, because the fix was **two hand-written blocks**:
+adding a third head meant *remembering* to extend it. The failure mode is a
+mechanical omission, so the guard has to be mechanical. `reconcile_config` now
+drives from a table of `(coefficient, weight key)` pairs, and
+`test_every_config_gated_module_is_in_the_reconcile_table` asserts each one is
+present.
+
+The general lesson, which is worth more than the specific fix: **a convention
+that must be remembered will eventually not be.** If a rule can be violated by
+forgetting, encode it so that forgetting fails a test.
+
 ---
 
 ## 9. Small ones that still cost time

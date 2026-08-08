@@ -81,3 +81,47 @@ def test_freeze_is_explicit(tmp_path):
     assert not any(p.requires_grad for p in frozen.parameters())
     live, _, _ = load_world_model(path, "cpu", freeze=False, verbose=False)
     assert all(p.requires_grad for p in live.parameters())
+
+
+def test_idm_head_is_reconciled_too(tmp_path):
+    """The same bug, reintroduced. `idm_coef` was added with a default of 1.0,
+    which gave every checkpoint written before it an `idm_head` with no weights
+    -- breaking artifacts that had loaded fine minutes earlier. The reconciler
+    handles heads from a table now, so this test is really asking whether the
+    table was updated."""
+    cfg = _tiny(hud_coef=0.0, idm_coef=0.0)
+    model = LeWorldModel(cfg)
+    assert model.idm_head is None
+    path = tmp_path / "pre_idm.pt"
+    torch.save({"model": model.state_dict(), "cfg": cfg}, path)
+
+    saved = dict(torch.load(path, map_location="cpu", weights_only=False))
+    del saved["cfg"].__dict__["idm_coef"]
+    torch.save(saved, path)
+    assert Config.idm_coef > 0, "meaningless unless the default is non-zero"
+
+    wm, cfg2, _ = load_world_model(path, "cpu", verbose=False)
+    assert wm.idm_head is None
+    assert cfg2.idm_coef == 0.0
+
+
+def test_a_checkpoint_with_an_idm_head_keeps_it(tmp_path):
+    cfg = _tiny(idm_coef=1.0)
+    model = LeWorldModel(cfg)
+    assert model.idm_head is not None
+    path = tmp_path / "with_idm.pt"
+    torch.save({"model": model.state_dict(), "cfg": cfg}, path)
+    wm, cfg2, _ = load_world_model(path, "cpu", verbose=False)
+    assert wm.idm_head is not None
+    assert torch.allclose(wm.idm_head.net[0].weight, model.idm_head.net[0].weight)
+
+
+def test_every_config_gated_module_is_in_the_reconcile_table():
+    """A guard against the next one. Any Config field named *_coef that gates a
+    module must appear in reconcile_config, or checkpoints written before it
+    break on load with a confusing missing-key error."""
+    import inspect
+    from sokubot.model import loading
+    src = inspect.getsource(loading.reconcile_config)
+    for name in ("hud_coef", "idm_coef"):
+        assert name in src, f"{name} gates a head but is not reconciled"

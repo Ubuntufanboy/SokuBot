@@ -51,21 +51,34 @@ def reconcile_config(cfg: Config, state: Dict[str, Any]) -> List[str]:
     """
     notes: List[str] = []
 
-    # ---- supervised HUD head -------------------------------------------------
-    # Presence is the only thing the weights record; the coefficient itself is a
-    # loss weight and is unrecoverable. So only the zero/non-zero distinction is
+    # ---- optional heads ------------------------------------------------------
+    # Every entry here is a head whose *existence* is controlled by a loss
+    # weight. Presence is the only thing the weights record -- the coefficient
+    # itself is unrecoverable -- so only the zero/non-zero distinction is
     # restored, and a positive value is left exactly as found.
-    has_hud = "hud_head.weight" in state
-    if has_hud and cfg.hud_coef <= 0:
-        cfg.hud_coef = Config.hud_coef
-        notes.append(
-            f"checkpoint has a hud_head but cfg.hud_coef was {0.0:g}; set to "
-            f"{cfg.hud_coef:g} so the head is built")
-    elif not has_hud and cfg.hud_coef > 0:
-        notes.append(
-            f"checkpoint has no hud_head but cfg.hud_coef resolved to "
-            f"{cfg.hud_coef:g} (this predates the field); set to 0")
-        cfg.hud_coef = 0.0
+    #
+    # This is a table rather than two hand-written blocks because the bug it
+    # prevents has now happened twice: `hud_coef` broke every earlier checkpoint
+    # when it was added with a non-zero default, that was fixed here, and then
+    # `idm_coef` was added the same way and broke them again. Anything added to
+    # `Config` that gates a module must be added to this list, and the failure
+    # if it is not is a confusing "Missing key(s) in state_dict" on artifacts
+    # that were fine the day before.
+    for coef_name, weight_key in (("hud_coef", "hud_head.weight"),
+                                  ("idm_coef", "idm_head.net.0.weight")):
+        present = weight_key in state
+        value = getattr(cfg, coef_name, 0.0)
+        if present and value <= 0:
+            setattr(cfg, coef_name, getattr(Config, coef_name))
+            notes.append(
+                f"checkpoint has {weight_key.split('.')[0]} but cfg.{coef_name} "
+                f"was 0; set to {getattr(cfg, coef_name):g} so the head is built")
+        elif not present and value > 0:
+            notes.append(
+                f"checkpoint has no {weight_key.split('.')[0]} but "
+                f"cfg.{coef_name} resolved to {value:g} (this predates the "
+                f"field); set to 0")
+            setattr(cfg, coef_name, 0.0)
 
     # ---- input resolution ----------------------------------------------------
     # `pos_embed` is [1, 1 + grid^2, dim], so the grid -- and with it the image
