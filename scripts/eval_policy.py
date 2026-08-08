@@ -61,7 +61,7 @@ from sokubot.model.loading import load_world_model
 from sokubot.probe import LinearProbe
 from sokubot.rl.grpo import GRPOConfig, ImaginedArena, PolicyOpponent, ProbeHead
 from sokubot.rl.policy import SokuPolicy
-from sokubot.rl.reward import RewardConfig
+from sokubot.rl.reward import KO_BANNER, RewardConfig, banner_ko_masks
 from scripts.train_grpo import model_fingerprint, valid_starts
 
 # The reference must not depend on what the caller did to the global RNG before
@@ -75,6 +75,11 @@ EVAL_SEED = 12345
 # so it is not inert.
 RCFG = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
                     flying=0.0015, idle=-0.020)
+
+# Outcome measurement is deliberately independent of what any arm trained on.
+# `ko_source` is a *training* choice; this is the ruler, and it always uses the
+# better detector so that an arm trained on the health test is not scored by it.
+BANNER_EVAL = RewardConfig(ko_source="banner")
 
 
 def build_reference(bank_actions: np.ndarray, cfg, device: str) -> SokuPolicy:
@@ -108,6 +113,7 @@ def score(arena: ImaginedArena, policy: SokuPolicy, reference: SokuPolicy,
     zc = Zt[eval_idx[:, None] + off[None, :]].float()
     ah = At[eval_idx[:, None] + off[None, :-1]].float()
     out = {}
+    wins = losses = 0.0
     for tag, s0 in (("p1", 0), ("p2", 1)):
         side = torch.full((len(eval_idx),), s0, device=device, dtype=torch.long)
         tr = arena.rollout(zc, ah, side, policy, PolicyOpponent(reference))
@@ -116,11 +122,25 @@ def score(arena: ImaginedArena, policy: SokuPolicy, reference: SokuPolicy,
         out[f"{tag}_dealt"] = float((tr["terms"]["dealt"] * al).sum() / n)
         out[f"{tag}_taken"] = float((tr["terms"]["taken"] * al).sum() / n)
         out[f"{tag}_alive"] = float(al.mean())
+        # Outcomes, when the probe can see them. `net` is a *damage exchange*,
+        # and the +-5 win/lose term rewards finishing -- so a policy that learns
+        # to close rounds out can be a better player while looking flat on net.
+        # Measured with the banner detector regardless of what any arm trained
+        # on, because this is the ruler and the banner is the better instrument
+        # (precision 0.803 against the health test's 0.003 on real frames).
+        if tr["states"].shape[-1] > KO_BANNER:
+            me, them = banner_ko_masks(tr["states"], side, BANNER_EVAL)
+            losses += float(me.any(1).float().mean())
+            wins += float(them.any(1).float().mean())
         if tag == "p1":
             out["press_rate"] = float(tr["mine"].mean())
             out["attack_rate"] = float(tr["mine"][..., 4:8].mean())
     out["net"] = ((out["p1_dealt"] + out["p1_taken"]) +
                   (out["p2_dealt"] + out["p2_taken"])) / 2
+    if wins or losses:
+        out["win_rate"] = wins / 2
+        out["loss_rate"] = losses / 2
+        out["outcome"] = (wins - losses) / 2
     return out
 
 
@@ -206,12 +226,13 @@ def main() -> int:
                 base = r["net"]
             row = {"horizon": H, "arm": name, **r, "net_over_control": r["net"] - base}
             res["rows"].append(row)
+            oc = (f" | win {r['win_rate']:.3%} lose {r['loss_rate']:.3%} "
+                  f"net-outcome {r['outcome']:+.3%}" if "outcome" in r else "")
             print(f"  {name:<22} net {r['net']:+.5f} "
                   f"(vs control {row['net_over_control']:+.5f}) | "
                   f"P1 {r['p1_dealt']:+.4f}/{r['p1_taken']:+.4f} "
                   f"P2 {r['p2_dealt']:+.4f}/{r['p2_taken']:+.4f} | "
-                  f"press {r['press_rate']:.3f} alive {r['p1_alive']:.3f}",
-                  flush=True)
+                  f"press {r['press_rate']:.3f}{oc}", flush=True)
 
     print("\n" + "=" * 68)
     print("The control row is the reference played against itself with the sides\n"
