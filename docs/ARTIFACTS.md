@@ -10,6 +10,20 @@ Layout note: files pulled in the first sync sit at the top level
 
 ---
 
+## Policies
+
+| file | net (shared instrument, h4) | what it is |
+|---|---|---|
+| `grpo_G0/policy_best.pt` | **+0.00186** | **The best policy.** Plain GRPO, step 3700, no method change — same optimiser, horizon and trust region as `grpo_bounded`, re-run against `bank_hud.npz` and the `gate_base` probe. The 26% gain over the previous best is not attributable to a technique. |
+| `grpo_bounded/policy_best.pt` | +0.00148 | Previous best, step 2700. Its blob records +0.002146, measured against a reference that cannot be reconstructed. |
+| `eval_final.json` | — | All five arms scored in one run at 6144 starts: G0, grpo, the banner-KO arms and the critic. Noise floor 1e-5. |
+
+Reproduce any comparison with `scripts/eval_policy.py`. Never compare two
+training runs' own `evaluate()` numbers — each builds its frozen reference from
+wherever its RNG happened to stand.
+
+---
+
 ## Banner classifier — the KO trigger
 
 | file | what it is |

@@ -37,10 +37,14 @@ which reads `+0.00148` on that same instrument against its recorded `+0.002146`.
 G0 is plain GRPO with no method change at all -- same optimiser, same horizon,
 same trust region -- re-run against the current bank and probe, so the 26% gain
 is not attributable to a technique and could be the bank, the probe, or
-run-to-run variance. `+0.00186` is the number any new policy must beat — the difference is the frozen reference each run builds from
-wherever its RNG stood, which cannot be reconstructed. See §2. It beats its own
-initialisation by a clear margin and, in world-model units, exceeds human damage
-throughput. Every number in §3 is still measured inside a world model that
+run-to-run variance. **`+0.00186` is the number any new policy must beat.**
+
+The recorded/instrument gap on the old policy (+0.002146 against +0.00148) is
+the frozen reference each run builds from wherever its RNG stood, which cannot
+be reconstructed — see §2, and never compare two runs' own `evaluate()` numbers.
+
+Both policies beat their own initialisation by a clear margin and, in
+world-model units, exceed human damage throughput. Every number in §3 is still measured inside a world model that
 inflates damage 2.11× and whose action signal is only trustworthy for about
 0.27 s — read them as world-model units, always.
 
@@ -111,9 +115,10 @@ effect with room to spare). Numbers from different training runs' own
 `evaluate()` are *not* comparable to each other, because each builds its
 reference from wherever its RNG happened to stand.
 
-**The bar for any new policy is +0.00147 at horizon 4 on that instrument**, not
-the +0.00215 recorded below — that figure is real but was taken against a
-reference that cannot be reconstructed.
+**The bar for any new policy is +0.00186 at horizon 4 on that instrument**
+(`artifacts/grpo_G0`), not the +0.00215 recorded below — that figure is real but
+was taken against a reference that cannot be reconstructed, and the same
+checkpoint reads +0.00148 here.
 
 ---
 
