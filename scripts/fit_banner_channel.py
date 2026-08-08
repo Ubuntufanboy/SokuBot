@@ -108,8 +108,8 @@ def main() -> int:
         tp = float((p & (tt > 0)).sum())
         prec = tp / max(p.sum(), 1)
         rec = tp / max(tt.sum(), 1)
-        rows.append({"threshold": thr, "precision": prec, "recall": rec,
-                     "fire_rate": float(p.mean())})
+        rows.append({"threshold": float(thr), "precision": float(prec),
+                     "recall": float(rec), "fire_rate": float(p.mean())})
         print(f"  {thr:9.2f}  {prec:9.3f}  {rec:6.3f}  {p.mean()*1000:8.1f}")
 
     # Refit on everything for the shipped weights -- the held-out split above was
@@ -120,11 +120,16 @@ def main() -> int:
     W = np.asarray(d["W"], dtype=np.float32)
     ymu = np.asarray(d["ymu"], dtype=np.float32)
     ysd = np.asarray(d["ysd"], dtype=np.float32)
-    # The probe applies `(z - zmu)/zsd @ W * ysd + ymu`. This row is fitted
-    # directly in output units, so it takes ysd 1 and ymu 0 and the ridge's bias
-    # is folded into ymu -- which keeps `LinearProbe` untouched.
-    d["W"] = np.concatenate([W, w[:-1, None]], axis=1)
-    d["ymu"] = np.concatenate([ymu, np.array([w[-1]], np.float32)])
+    # `LinearProbe.W` is [D+1, K] and already carries the bias as its last row --
+    # `predict` appends a column of ones before multiplying. So `w` goes in whole
+    # rather than split, and the new channel takes ysd 1 / ymu 0 because it was
+    # fitted directly in output units rather than on a standardised target.
+    if W.shape[0] != X.shape[1] + 1:
+        raise SystemExit(
+            f"probe W is {W.shape}, expected [{X.shape[1] + 1}, K] with a bias "
+            f"row; the fit here would land in the wrong space")
+    d["W"] = np.concatenate([W, w[:, None]], axis=1)
+    d["ymu"] = np.concatenate([ymu, np.array([0.0], np.float32)])
     d["ysd"] = np.concatenate([ysd, np.array([1.0], np.float32)])
     d["names"] = np.array(names + ["ko_banner"])
     a.out.parent.mkdir(parents=True, exist_ok=True)

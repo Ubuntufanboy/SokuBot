@@ -154,12 +154,24 @@ class RewardConfig:
     # it was "can it resolve an absolute health level to a twentieth of a bar".
     # It cannot, and for this purpose it does not have to.
     ko_source: str = "health"
-    # Probability above which the banner channel counts as lit. Set from the
-    # best-F1 operating point and deliberately conservative: precision falls from
-    # 0.803 to 0.190 if recall is pushed to 0.80, and the errors are not
-    # symmetric -- a missed KO forgoes a bonus, a false KO pays +-5 and masks
-    # everything after it.
-    ko_banner_threshold: float = 0.5
+    # Score above which the banner channel counts as lit.
+    #
+    # **Not 0.5.** The channel is a ridge fit to a 0/1 target whose positive
+    # class is 1.4% of frames, so its output is compressed toward zero and never
+    # reaches a half. Measured on held-out replays by
+    # `scripts/fit_banner_channel.py`:
+    #
+    #     threshold   precision   recall   fires per 1000 frames
+    #          0.20       0.844    0.447                     8.1
+    #          0.30       0.851    0.333                     6.0
+    #          0.40       0.827    0.148                     2.7
+    #          0.50       0.000    0.000                     0.0
+    #
+    # 0.20 is chosen for the recall, since precision is flat across the usable
+    # range. Left at the natural-looking 0.5 the detector would simply never
+    # fire, `win`/`lose` would be identically zero, and the run would look like a
+    # reward-shaping null rather than a threshold set from taste.
+    ko_banner_threshold: float = 0.20
     # How far apart the two health readings must be before a winner is called.
     # Below this the banner is still believed for termination, but no outcome is
     # scored: a KO the probe cannot attribute is worth nothing, and a coin flip
