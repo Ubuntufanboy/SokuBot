@@ -156,6 +156,13 @@ def main() -> int:
                          "estimates it better and samples a wider spread of "
                          "behaviour from one start")
     ap.add_argument("--starts", type=int, default=256, help="groups per batch")
+    ap.add_argument("--bank", type=Path, default=None,
+                    help="reuse an existing bank instead of encoding one into "
+                         "<out>/bank.npz. Added because argparse accepts "
+                         "unambiguous prefixes, so passing --bank to a parser "
+                         "that only had --bank-replays bound the path to the "
+                         "replay *count* and died on int('...npz') -- a "
+                         "confusing failure for what looked like a missing flag.")
     ap.add_argument("--bank-replays", type=int, default=200)
     ap.add_argument("--entropy-floor-frac", type=float, default=None,
                     help="floor under the policy entropy, as a fraction of its "
@@ -261,7 +268,7 @@ def main() -> int:
     rows = [json.loads(l) for l in manifest.read_text().splitlines()]
     rng.shuffle(rows)
     Z, A, E = build_bank(rows, manifest, wm, cfg, a.device, a.bank_replays,
-                         a.out / "bank.npz")
+                         a.bank or (a.out / "bank.npz"))
     starts = valid_starts(E, cfg.history, a.horizon)
     print(f"{len(starts)} valid start states", flush=True)
 
