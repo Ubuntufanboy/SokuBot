@@ -315,6 +315,27 @@ the disease.
 
 Recorded because each cost real time and the reasoning is worth not repeating.
 
+**Run the control arm first, or nothing else is interpretable.** Two arms
+(critic, banner KO) both landed near +0.0009 against a baseline of +0.00215, and
+two changes that different landing in the same place says the limiter is
+something they *share*. They shared a bank (150 replays from `build_hud_bank`)
+and a probe (`gate_base`, 8 channels) that the recorded baseline never used.
+
+Scoring the baseline **checkpoint** on the new instrument validates the
+*evaluation*; it says nothing about the *training* pipeline. The control arm —
+plain GRPO, baseline settings, this bank and probe — reached **+0.00191**, which
+tracks the recorded +0.00215 closely and makes every other arm attributable:
+
+| arm (own reference, horizon 4) | best `net` | vs control |
+|---|---|---|
+| baseline, as recorded | +0.00215 | — |
+| **G0 — control: plain GRPO, this bank + probe** | **+0.00191** | — |
+| K — banner KO at ±5 | +0.00140 | −27% |
+| H — critic bootstrap | +0.00091 | −52% |
+
+Without G0 there were two live explanations and no way to separate them. It cost
+1.4 h and it is the difference between a result and a rumour.
+
 **A critic as GRPO's baseline — null, and the measurement says it had to be.**
 Phase 2's premise was that a critic amortises the baseline over the batch,
 freeing the factor of `group_size` GRPO spends on variance reduction to buy that
