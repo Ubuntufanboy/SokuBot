@@ -163,7 +163,9 @@ def compute_losses(
     idm_metrics: Dict[str, float] = {}
     if getattr(cfg, "idm_coef", 0.0) > 0 and model.idm_head is not None:
         from .model.inverse_dynamics import inverse_dynamics_loss
-        l_idm, idm_metrics = inverse_dynamics_loss(model.idm_head, out.z, actions)
+        l_idm, idm_metrics = inverse_dynamics_loss(
+            model.idm_head, out.z, actions,
+            pos_weight=getattr(cfg, "idm_pos_weight", 1.0))
         total = total + cfg.idm_coef * l_idm
 
     l_hud = torch.zeros((), device=device)

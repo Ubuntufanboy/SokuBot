@@ -161,6 +161,12 @@ class Config:
     # naming all twenty buttons at every tick.
     idm_coef: float = 1.0
     idm_width: int = 512
+    # Positive-class weight inside the inverse-dynamics BCE. 1.0 reproduces the
+    # first run. Above 1.0 shifts the gradient toward the presses, which are
+    # 9.85% of ticks and carry all the information -- a hypothesis about why that
+    # run's IDM loss was the largest term in the objective and still barely
+    # moved. Untested; run 2 measures `idm_acc` and settles it.
+    idm_pos_weight: float = 1.0
 
     # ---------------- optimisation ----------------
     lr: float = 5e-4

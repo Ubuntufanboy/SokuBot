@@ -190,6 +190,11 @@ def main() -> None:
                     help="action-discrimination weight, applied throughout")
     ap.add_argument("--hud-coef", type=float, default=Config.hud_coef,
                     help="supervised HUD readout weight")
+    ap.add_argument("--idm-pos-weight", type=float, default=Config.idm_pos_weight,
+                    help="weight on pressed buttons inside the inverse-dynamics "
+                         "BCE. Presses are 9.85%% of ticks and carry the "
+                         "information; at 1.0 the gradient is mostly about "
+                         "correctly saying 'not pressed'.")
     ap.add_argument("--idm-coef", type=float, default=Config.idm_coef,
                     help="inverse-dynamics weight. This is the term that decides "
                          "what the representation keeps: prediction prefers the "
@@ -215,12 +220,15 @@ def main() -> None:
                num_workers=args.num_workers, total_steps=args.steps,
                warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
                cf_coef=args.cf_coef, hud_coef=args.hud_coef,
-               idm_coef=args.idm_coef, compile=not args.no_compile)
+               idm_coef=args.idm_coef,
+               idm_pos_weight=args.idm_pos_weight,
+               compile=not args.no_compile)
     if args.image_size not in (224, 448):
         cfg = replace(cfg, image_size=args.image_size)
     print(f"image {cfg.image_size} px, patch {cfg.patch_size} -> "
           f"{cfg.num_patches} patches | cf_coef {cfg.cf_coef} "
-          f"hud_coef {cfg.hud_coef} idm_coef {cfg.idm_coef}", flush=True)
+          f"hud_coef {cfg.hud_coef} idm_coef {cfg.idm_coef} "
+          f"idm_pos_weight {cfg.idm_pos_weight}", flush=True)
     cache = torch.load(args.corpus / "val.pt", map_location="cpu", weights_only=False)
     # The cache stores raw frames at whatever resolution it was built for, and a
     # mismatch does not surface until the first eval -- thousands of steps and

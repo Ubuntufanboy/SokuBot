@@ -80,7 +80,8 @@ class InverseDynamicsHead(nn.Module):
 
 
 def inverse_dynamics_loss(head: InverseDynamicsHead, z: torch.Tensor,
-                          actions: torch.Tensor) -> tuple[torch.Tensor, dict]:
+                          actions: torch.Tensor,
+                          pos_weight: float = 1.0) -> tuple[torch.Tensor, dict]:
     """z [B,T,latent] (with grad), actions [B,T,ticks,action_dim] in {0,1}.
 
     Returns (loss, metrics). The loss is a per-button binary cross entropy over
@@ -95,7 +96,19 @@ def inverse_dynamics_loss(head: InverseDynamicsHead, z: torch.Tensor,
         raise ValueError(f"need at least two timesteps, got {z.shape[1]}")
     tgt = actions[:, :-1]                                   # action at t
     logits = head(z[:, :-1], z[:, 1:])
-    loss = F.binary_cross_entropy_with_logits(logits, tgt)
+    # `pos_weight` because a human holds about 9.85% of buttons at any tick, so
+    # plain BCE over eighty button-bits is dominated by correctly saying "not
+    # pressed" nine times in ten. The first run showed exactly that signature:
+    # the term was the largest in the objective (0.26 against a prediction loss
+    # of 0.015) and yet moved barely at all across 30k steps, sitting at ~15% of
+    # the reduction available from its 0.3025 chance value. A loss that is big
+    # and stuck is not one to turn up; it is one whose gradient is being spent
+    # on the easy majority.
+    #
+    # 1.0 keeps the original behaviour, so the first run stays reproducible.
+    pw = (torch.full_like(tgt[:1, :1, :1, :1], pos_weight)
+          if pos_weight != 1.0 else None)
+    loss = F.binary_cross_entropy_with_logits(logits, tgt, pos_weight=pw)
     with torch.no_grad():
         pred = (logits > 0).float()
         pos = tgt.sum().clamp(min=1)
