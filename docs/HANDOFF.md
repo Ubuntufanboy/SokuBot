@@ -30,10 +30,14 @@ training:  captures (mp4 + CSV) → encoder → latent world model → reward pr
 live:      X11 capture → encoder → 1-step world-model compensation → policy → uinput device
 ```
 
-The best policy is `artifacts/grpo_bounded/policy_best.pt`, step 2700. Its
-recorded score is `net +0.002146`; **on the shared instrument
-(`scripts/eval_policy.py`) it reads `+0.00149`**, and that is the number any new
-policy must beat — the difference is the frozen reference each run builds from
+The best policy is **`artifacts/grpo_G0/policy_best.pt`**, step 3700, at
+**`net +0.00186`** on the shared instrument (`scripts/eval_policy.py`, 6144
+starts, noise floor 1e-5). It replaced `artifacts/grpo_bounded/policy_best.pt`,
+which reads `+0.00148` on that same instrument against its recorded `+0.002146`.
+G0 is plain GRPO with no method change at all -- same optimiser, same horizon,
+same trust region -- re-run against the current bank and probe, so the 26% gain
+is not attributable to a technique and could be the bank, the probe, or
+run-to-run variance. `+0.00186` is the number any new policy must beat — the difference is the frozen reference each run builds from
 wherever its RNG stood, which cannot be reconstructed. See §2. It beats its own
 initialisation by a clear margin and, in world-model units, exceeds human damage
 throughput. Every number in §3 is still measured inside a world model that
@@ -335,6 +339,24 @@ tracks the recorded +0.00215 closely and makes every other arm attributable:
 
 Without G0 there were two live explanations and no way to separate them. It cost
 1.4 h and it is the difference between a result and a rumour.
+
+**The verdict, all arms on one instrument (6144 starts, noise floor 1e-5):**
+
+| arm | net (h4) | net (h16) | outcome vs control (h16) |
+|---|---|---|---|
+| **G0 — plain GRPO, current bank+probe** | **+0.00186** | +0.00093 | +0.277% |
+| grpo — previous best | +0.00148 | +0.00096 | +0.488% |
+| K2 — banner KO at ±1 | +0.00142 | +0.00073 | +0.431% |
+| K — banner KO at ±5 | +0.00138 | +0.00070 | +0.374% |
+| H — critic bootstrap | +0.00095 | +0.00046 | +0.334% |
+| control | +0.00001 | −0.00000 | 0 by construction |
+
+Two things are settled and one is not. The critic is **half** the control's
+score, 90× the noise floor — not ambiguous. And the banner arms score *lower*
+damage but *higher* outcome than G0 at both horizons, consistently, which is the
+trade a finishing reward should produce. That last one is **not established**:
+the control deviates 0.098pp at h16 while the G0↔K2 gap is 0.154pp, only ~1.5×
+the noise. Separating them needs far more KO events than 6144 starts contain.
 
 **A critic as GRPO's baseline — null, and the measurement says it had to be.**
 Phase 2's premise was that a critic amortises the baseline over the batch,
