@@ -134,6 +134,13 @@ def main() -> None:
                     help="action-discrimination weight, applied throughout")
     ap.add_argument("--hud-coef", type=float, default=Config.hud_coef,
                     help="supervised HUD readout weight")
+    ap.add_argument("--idm-coef", type=float, default=Config.idm_coef,
+                    help="inverse-dynamics weight. This is the term that decides "
+                         "what the representation keeps: prediction prefers the "
+                         "predictable, inverse dynamics prefers the "
+                         "controllable. 0 reproduces the JEPA-only objective "
+                         "whose encoder cannot tell that the characters swapped "
+                         "sides (spatial_probe AUC 0.540).")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="continue from these weights instead of random init. "
                          "Optimiser state and LR schedule restart.")
@@ -152,13 +159,24 @@ def main() -> None:
                num_workers=args.num_workers, total_steps=args.steps,
                warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
                cf_coef=args.cf_coef, hud_coef=args.hud_coef,
-               compile=not args.no_compile)
+               idm_coef=args.idm_coef, compile=not args.no_compile)
     if args.image_size not in (224, 448):
         cfg = replace(cfg, image_size=args.image_size)
     print(f"image {cfg.image_size} px, patch {cfg.patch_size} -> "
           f"{cfg.num_patches} patches | cf_coef {cfg.cf_coef} "
-          f"hud_coef {cfg.hud_coef}", flush=True)
+          f"hud_coef {cfg.hud_coef} idm_coef {cfg.idm_coef}", flush=True)
     cache = torch.load(args.corpus / "val.pt", map_location="cpu", weights_only=False)
+    # The cache stores raw frames at whatever resolution it was built for, and a
+    # mismatch does not surface until the first eval -- thousands of steps and
+    # tens of minutes in, where it reads as a crash in the eval rather than as a
+    # setup error. Checked here, against the one thing that cannot be wrong.
+    got = tuple(cache["obs"].shape[-2:])
+    if got != (cfg.image_size, cfg.image_size):
+        raise SystemExit(
+            f"{args.corpus / 'val.pt'} holds {got[0]}x{got[1]} frames but this "
+            f"run trains at {cfg.image_size}. Rebuild it:\n"
+            f"  python -m scripts.build_val_cache --image-size {cfg.image_size} "
+            f"--manifest-root {args.corpus}")
     print(f"val cache: {cache['obs'].shape[0]} windows", flush=True)
 
     set_seed(args.seed)
