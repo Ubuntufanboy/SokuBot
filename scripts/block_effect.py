@@ -75,10 +75,14 @@ def main() -> int:
                     help="minimum health the defender must lose over the window "
                          "for it to count as 'under attack'. Below this the "
                          "window is neutral and blocking has nothing to do.")
-    ap.add_argument("--probe", type=Path,
-                    default=Path("~/gate_base/reward_probe.npz"),
-                    help="reads health out of the imagined latents; only used "
-                         "for the world-model half")
+    ap.add_argument("--probe", type=Path, default=None,
+                    help="reads health out of the imagined latents. OPTIONAL: a "
+                         "probe is fit against one specific encoder, so a new "
+                         "world model has none until horizon_ablation is re-run. "
+                         "Without it the health arms are skipped and only the "
+                         "latent comparison runs -- which is the decisive half "
+                         "anyway, since it is what measured the JEPA encoder at "
+                         "4.6% sensitivity to swapping LEFT and RIGHT.")
     ap.add_argument("--starts", type=int, default=4096)
     ap.add_argument("--out", type=Path, default=Path("block_effect.json"))
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -175,13 +179,17 @@ def main() -> int:
     z_ctx = Z[idx[:, None] + off[None, :]].float()
     a_hist = At[idx[:, None] + off[None, :-1]].float()
 
-    pd_ = np.load(a.probe.expanduser(), allow_pickle=True)
-    probe = LinearProbe(zmu=pd_["zmu"], zsd=pd_["zsd"], ymu=pd_["ymu"],
-                        ysd=pd_["ysd"], W=pd_["W"],
-                        names=[str(x) for x in pd_["names"]])
-    arena = ImaginedArena(wm, ProbeHead(probe).to(a.device),
-                          GRPOConfig(horizon=W, reward=RCFG),
-                          cfg.history, cfg.action_ticks)
+    arena = None
+    if a.probe is not None:
+        pd_ = np.load(a.probe.expanduser(), allow_pickle=True)
+        probe = LinearProbe(zmu=pd_["zmu"], zsd=pd_["zsd"], ymu=pd_["ymu"],
+                            ysd=pd_["ysd"], W=pd_["W"],
+                            names=[str(x) for x in pd_["names"]])
+        arena = ImaginedArena(wm, ProbeHead(probe).to(a.device),
+                              GRPOConfig(horizon=W, reward=RCFG),
+                              cfg.history, cfg.action_ticks)
+    else:
+        print("  (no --probe: health arms skipped, latent comparison only)")
 
     # The corpus half showed "away" and "toward" are indistinguishable, because
     # with no position data the label is a coin flip. So the model is asked a
@@ -210,13 +218,14 @@ def main() -> int:
         raise ValueError(mode)
 
     out2 = {}
-    with torch.no_grad():
-        for name in ("true", "mirrored", "no_direction"):
-            z_roll = wm.rollout(z_ctx, forced(name), a_hist)
-            st = arena.probe(z_roll)
-            dmg = float((st[:, 0, HP1] - st[:, -1, HP1]).mean())
-            out2[name] = dmg
-            print(f"  defender plays {name:<14} predicted damage {dmg:+.5f}")
+    if arena is not None:
+        with torch.no_grad():
+            for name in ("true", "mirrored", "no_direction"):
+                z_roll = wm.rollout(z_ctx, forced(name), a_hist)
+                st = arena.probe(z_roll)
+                dmg = float((st[:, 0, HP1] - st[:, -1, HP1]).mean())
+                out2[name] = dmg
+                print(f"  defender plays {name:<14} predicted damage {dmg:+.5f}")
     # The probe reads health with a residual of 0.116, and these gaps are ~0.002,
     # so the health comparison alone sits near its own noise floor. The latent
     # test does not depend on the probe at all: if swapping LEFT and RIGHT
@@ -245,26 +254,38 @@ def main() -> int:
     res["world_model"] = out2
     # Positive means the model thinks holding a direction helps, which is the
     # direction the corpus points.
-    gap = out2["no_direction"] - out2["true"]
+    gap = (out2["no_direction"] - out2["true"]) if out2 else float("nan")
     res["world_model_gap"] = gap
-    res["world_model_mirror_gap"] = out2["mirrored"] - out2["true"]
+    res["world_model_mirror_gap"] = ((out2["mirrored"] - out2["true"])
+                                     if out2 else float("nan"))
 
     print("\n" + "=" * 70)
     corpus_ok = nt > max(aw, tw)          # holding a direction beats holding none
-    model_ok = gap > 0
+    # With no probe the health arms are absent, so the latent test decides:
+    # does swapping LEFT and RIGHT move the prediction at all, relative to
+    # removing the direction entirely? JEPA scored 0.0429 against 0.3453.
+    model_ok = (gap > 0) if out2 else (l_mirr > 0.5 * l_none)
     d_corpus = nt - 0.5 * (aw + tw)
     if corpus_ok and model_ok:
+        detail = (f"the world model agrees ({gap:+.5f})" if out2 else
+                  f"the model distinguishes LEFT from RIGHT (mirroring moves "
+                  f"the\nprediction {l_mirr:.4f} against {l_none:.4f} for "
+                  f"removing the direction entirely)")
         print(f"BOTH HOLD. In the corpus, holding a direction takes {d_corpus:.4f} "
-              f"less damage\nthan holding none, and the world model agrees "
-              f"({gap:+.5f}). Defence is in the\nmodel, so a blocking gym has "
-              f"something real to optimise. H=4 is enough: the\n*decision* is "
-              f"per-step even though the hold lasts seconds.")
+              f"less damage\nthan holding none, and {detail}. Defence is in "
+              f"the model, so a blocking gym\nhas something real to optimise. "
+              f"H=4 is enough: the *decision* is per-step even\nthough the hold "
+              f"lasts seconds.")
     elif corpus_ok:
+        detail = (f"({gap:+.5f})" if out2 else
+                  f"(swapping LEFT and RIGHT moves the prediction only "
+                  f"{l_mirr:.4f}, against\n{l_none:.4f} for removing the "
+                  f"direction -- so it registers *whether* a direction is held "
+                  f"and\nnot *which*)")
         print(f"The corpus shows defence ({d_corpus:.4f} less damage) and the "
-              f"world model does\nNOT ({gap:+.5f}). A gym would optimise the "
-              f"model's blind spot. This is the\nargument for fixing the model "
-              f"first -- a supervised guard channel, or the 448\nretrain -- "
-              f"rather than for more reward engineering.")
+              f"world model does\nNOT {detail}. A gym would optimise the "
+              f"model's blind spot, so fix the model\nfirst rather than the "
+              f"reward.")
     else:
         print("The corpus does not show the effect even label-free. Check the "
               "window and\nattack-min settings before concluding anything about "
