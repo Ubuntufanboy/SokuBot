@@ -114,6 +114,8 @@ def score(arena: ImaginedArena, policy: SokuPolicy, reference: SokuPolicy,
     ah = At[eval_idx[:, None] + off[None, :-1]].float()
     out = {}
     wins = losses = 0.0
+    n_ko = 0
+    measurable = False
     for tag, s0 in (("p1", 0), ("p2", 1)):
         side = torch.full((len(eval_idx),), s0, device=device, dtype=torch.long)
         tr = arena.rollout(zc, ah, side, policy, PolicyOpponent(reference))
@@ -129,18 +131,28 @@ def score(arena: ImaginedArena, policy: SokuPolicy, reference: SokuPolicy,
         # on, because this is the ruler and the banner is the better instrument
         # (precision 0.803 against the health test's 0.003 on real frames).
         if tr["states"].shape[-1] > KO_BANNER:
+            measurable = True
             me, them = banner_ko_masks(tr["states"], side, BANNER_EVAL)
             losses += float(me.any(1).float().mean())
             wins += float(them.any(1).float().mean())
+            n_ko += int(me.any(1).sum()) + int(them.any(1).sum())
         if tag == "p1":
             out["press_rate"] = float(tr["mine"].mean())
             out["attack_rate"] = float(tr["mine"][..., 4:8].mean())
     out["net"] = ((out["p1_dealt"] + out["p1_taken"]) +
                   (out["p2_dealt"] + out["p2_taken"])) / 2
-    if wins or losses:
+    if measurable:
+        # Reported even when zero. An absent column and a measured zero look the
+        # same to a reader, and at small `--starts` this block silently produced
+        # no output at all -- which reads as "the probe cannot see outcomes"
+        # rather than "no KO happened in 256 rollouts".
         out["win_rate"] = wins / 2
         out["loss_rate"] = losses / 2
         out["outcome"] = (wins - losses) / 2
+        # The event count is the context that decides whether any of the above
+        # means anything: these are rates on a ~1% base rate, so a few hundred
+        # rollouts contain single-digit KOs and Poisson noise swamps the effect.
+        out["ko_events"] = n_ko
     return out
 
 
