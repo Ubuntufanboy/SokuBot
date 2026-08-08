@@ -143,6 +143,17 @@ def main() -> int:
                          "with, at precision 0.003. 'banner' reads the KNOCK OUT "
                          "announcement from a probe channel at precision 0.844, "
                          "and needs a probe fitted by scripts.fit_banner_channel.")
+    ap.add_argument("--win-magnitude", type=float, default=None,
+                    help="override RewardConfig.win/lose to +-this. 5.0 was set "
+                         "when the KO detector essentially never fired at "
+                         "horizon 4 (alive_frac 0.9999), so the term's size "
+                         "barely mattered. With --ko-source banner it fires at "
+                         "roughly the true rate, and at 0.93%% of rollouts a "
+                         "+-5 payout contributes a standard deviation of ~0.48 "
+                         "against a damage signal of ~0.009 -- so the outcome "
+                         "term, and any error in detecting it, now dominates "
+                         "the gradient. A KO is worth about one health bar, "
+                         "which is what 1.0 means in these units.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -170,6 +181,8 @@ def main() -> int:
     # Identical to train_grpo's, so the comparison is against the same landscape.
     rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
                         flying=0.0015, idle=-0.020, ko_source=a.ko_source)
+    if a.win_magnitude is not None:
+        rcfg.win, rcfg.lose = a.win_magnitude, -a.win_magnitude
     if a.ko_source == "banner" and "ko_banner" not in probe.names:
         raise SystemExit(
             f"--ko-source banner needs a probe with a ko_banner channel; "
