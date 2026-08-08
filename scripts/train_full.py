@@ -55,6 +55,62 @@ def eval_batch_for(cfg: Config, at_224: int = 64) -> int:
     return max(4, int(at_224 * (224 / cfg.image_size) ** 2))
 
 
+# Display-orientation rows of the play area at native 480 px; the HUD lives above
+# and below (data/hud.py: health 34-74, spirit and cards 428-470). Frames in the
+# val cache are stored vertically flipped, which is why this converts.
+DISP_PLAY_Y = (80, 420)
+NATIVE_PX = 480
+
+
+def _play_band(image_size: int) -> tuple[int, int]:
+    lo = int(round((NATIVE_PX - DISP_PLAY_Y[1]) * image_size / NATIVE_PX))
+    hi = int(round((NATIVE_PX - DISP_PLAY_Y[0]) * image_size / NATIVE_PX))
+    return lo, hi
+
+
+@torch.no_grad()
+def mirror_sensitivity(model: LeWorldModel, cache: dict, cfg: Config,
+                       batch: int) -> dict:
+    """How far the latent moves when the play area is mirrored horizontally.
+
+    The metric that actually matters for control, measured in the training loop
+    so a run can be checkpointed on it. `scripts/spatial_probe.py` asks the same
+    question with a linear probe and is the authority; this is the cheap
+    in-loop version, and it needs no fitting and no held-out split because it
+    compares a latent against itself.
+
+    Reported as a fraction of the across-batch latent spread, because an L2 of
+    0.04 means nothing until you know the states being separated are 0.93 apart.
+    `full` mirrors everything including the HUD and is the ceiling: whatever the
+    encoder can notice at all, it notices there.
+
+    Exists because the first inverse-dynamics run selected `best.pt` on skill
+    while spatial sensitivity peaked at step 4000 and settled lower -- so the
+    checkpoint that was best at the thing we cared about was overwritten by one
+    that was better at something else.
+    """
+    device = next(model.parameters()).device
+    O = cache["obs"]
+    lo, hi = _play_band(cfg.image_size)
+    out = {}
+    base, play, full = [], [], []
+    for i in range(0, len(O), batch):
+        o = O[i : i + batch].to(device, non_blocking=True)
+        b = o[:, :1]                                   # one frame per window
+        m_play = b.clone()
+        m_play[..., lo:hi, :] = torch.flip(m_play[..., lo:hi, :], dims=[-1])
+        m_full = torch.flip(b, dims=[-1])
+        base.append(model.encode(b)[:, 0])
+        play.append(model.encode(m_play)[:, 0])
+        full.append(model.encode(m_full)[:, 0])
+    z0 = torch.cat(base).float()
+    spread = float(z0.std(0).mean()) + 1e-9
+    out["mirror_play"] = float((torch.cat(play).float() - z0).norm(dim=-1).mean()) / spread
+    out["mirror_full"] = float((torch.cat(full).float() - z0).norm(dim=-1).mean()) / spread
+    out["latent_spread"] = spread
+    return out
+
+
 @torch.no_grad()
 def evaluate(model: LeWorldModel, cache: dict, cfg: Config,
              batch: int | None = None) -> dict:
@@ -260,6 +316,7 @@ def main() -> None:
         probe_model = copy.deepcopy(m)
         recalibrate_bn(probe_model, cache, batch=eb)
         ev = evaluate(probe_model, cache, cfg, batch=eb)
+        ev.update(mirror_sensitivity(probe_model, cache, cfg, batch=eb))
         # Keep the weights that were actually scored. Saving `m` instead writes
         # a checkpoint whose BatchNorm statistics are not the ones the recorded
         # skill describes -- mild here, since ordinary training keeps them close
@@ -305,9 +362,21 @@ def main() -> None:
                         "eval": ev, "bn_recalibrated": True},
                        Path(args.ckpt_dir) / "best.pt")
             print(f"  saved best.pt (skill {ev['skill']:+.4f} at step {step})", flush=True)
+        # And a second file selected on spatial sensitivity, because the two
+        # disagree: the first inverse-dynamics run peaked on mirror_play at step
+        # 4000 and on skill at the end, and keeping only the skill-best threw
+        # away the checkpoint that was best at the thing the agent needs.
+        if healthy and ev is healthy[-1] and ev["mirror_play"] >= max(
+                c.get("mirror_play", -1.0) for c in healthy):
+            torch.save({"model": eval_sd, "cfg": cfg, "step": step,
+                        "eval": ev, "bn_recalibrated": True},
+                       Path(args.ckpt_dir) / "best_spatial.pt")
+            print(f"  saved best_spatial.pt (mirror_play "
+                  f"{ev['mirror_play']:.3f} at step {step})", flush=True)
         print(f"  [eval] step {step:6d} | train {ev['train_pred']:.4f} "
               f"| val {ev['val_pred']:.4f} | identity {ev['identity']:.4f} "
               f"| skill {ev['skill']:+.4f} | AUC {ev['inv_dyn_auc']:.4f} "
+              f"| mirror {ev['mirror_play']:.3f}/{ev['mirror_full']:.3f} "
               f"| var {ev['latent_var']:.3f} | {ev['elapsed_h']:.2f}h elapsed, "
               f"{ev['eta_h']:.2f}h left", flush=True)
 
