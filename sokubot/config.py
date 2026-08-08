@@ -148,8 +148,17 @@ class Config:
     # lives in the second.
     #
     # Set at 1.0, i.e. co-primary with prediction rather than auxiliary, which is
-    # the whole point. `cf_coef` is a related idea deliberately detached from the
-    # encoder, and being detached is why it never fixed this.
+    # the whole point.
+    #
+    # `cf_coef` is a related idea and it is worth being precise about why it did
+    # not do this job, because the obvious explanation is wrong. It is detached
+    # in `scripts/finetune_action.py` -- which is what produced
+    # `wm_cf_bnfix.pt`, the model measured at 0.540 -- but `train.py` passes
+    # `out.z` attached, so the 448 runs trained with a contrastive term that
+    # *could* reach the encoder, at cf_coef 0.1, and still reached only 0.599.
+    # So the lever is dosage and formulation, not attachment: discriminating one
+    # true action from three rolled negatives is a much weaker constraint than
+    # naming all twenty buttons at every tick.
     idm_coef: float = 1.0
     idm_width: int = 512
 
