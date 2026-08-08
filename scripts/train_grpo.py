@@ -40,7 +40,7 @@ import torch
 
 from sokubot.config import Config
 from sokubot.data.soku import decode_frames, read_actions
-from sokubot.model.world_model import LeWorldModel
+from sokubot.model.loading import load_world_model
 from sokubot.probe import LinearProbe
 from sokubot.rl.grpo import (EntropyFloor, GRPOConfig, ImaginedArena,
                              PolicyOpponent, ProbeHead, ReplayOpponent,
@@ -192,12 +192,7 @@ def main() -> int:
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
 
-    blob = torch.load(a.wm, map_location=a.device, weights_only=False)
-    cfg: Config = blob["cfg"]
-    cfg.device = a.device
-    wm = LeWorldModel(cfg).to(a.device)
-    wm.load_state_dict(blob["model"])
-    wm.eval()
+    wm, cfg, _ = load_world_model(a.wm, a.device)
 
     d = np.load(a.probe, allow_pickle=True)
     probe = LinearProbe(zmu=d["zmu"], zsd=d["zsd"], ymu=d["ymu"], ysd=d["ysd"],

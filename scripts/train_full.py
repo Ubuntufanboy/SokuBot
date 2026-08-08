@@ -119,8 +119,12 @@ def main() -> None:
                          "the first step without one -- which on a box with no "
                          "sudo is not something a training run can fix.")
     ap.add_argument("--shuffle-buffer", type=int, default=0,
-                    help="windows held per worker; 0 sizes it to a ~2.5 GB "
-                         "budget, which is what 4096 windows cost at 224 px")
+                    help="windows held per worker; 0 derives it from --shuffle-gb")
+    ap.add_argument("--shuffle-gb", type=float, default=20.0,
+                    help="TOTAL host RAM for shuffle buffers across all workers. "
+                         "The original run used 4096 windows per worker, which is "
+                         "2.5 GB each at 224 px and 9.8 GB at 448 -- affordable "
+                         "only on the 754 GB box it was written for.")
     ap.add_argument("--image-size", type=int, default=224,
                     help="448 is the considered value for this game; 224 was "
                          "LeWorldModel's PushT default and throws away 4.6x the "
@@ -198,11 +202,15 @@ def main() -> None:
     # So the default is a memory budget rather than a window count, and it holds
     # the same ~2.5 GB the original run used whatever the resolution.
     win_bytes = cfg.seq_len * 3 * cfg.image_size ** 2
+    # A TOTAL budget split across workers, not a per-worker one. Each worker
+    # holds its own buffer, so a per-worker figure multiplies by the worker count
+    # and silently blows past host RAM: 16 workers at 2.5 GB each is 40 GB, which
+    # on this 62 GB box leaves nothing for the val cache or the parent.
+    workers = max(1, cfg.num_workers)
     shuffle_buffer = args.shuffle_buffer or max(
-        256, int(2.5e9 / win_bytes))
-    print(f"shuffle buffer {shuffle_buffer} windows "
-          f"({shuffle_buffer * win_bytes / 1e9:.2f} GB per worker x "
-          f"{cfg.num_workers} workers)", flush=True)
+        128, int(args.shuffle_gb * 1e9 / (win_bytes * workers)))
+    print(f"shuffle buffer {shuffle_buffer} windows x {workers} workers = "
+          f"{shuffle_buffer * win_bytes * workers / 1e9:.1f} GB total", flush=True)
     ds = build_soku_dataset(cfg, [str(args.corpus / "train")],
                             shuffle_buffer=shuffle_buffer, seed=args.seed)
 

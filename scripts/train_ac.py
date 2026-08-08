@@ -58,15 +58,17 @@ import torch
 
 from sokubot.config import Config
 from sokubot.probe import LinearProbe
-from sokubot.model.world_model import LeWorldModel
+from sokubot.model.loading import load_world_model
 from sokubot.rl.ac import ACConfig, advantages_from_returns
 from sokubot.rl.critic import (SokuCritic, TargetCritic, continuation,
                                lambda_returns)
-from sokubot.rl.grpo import (EntropyFloor, ImaginedArena, PolicyOpponent,
-                             ProbeHead, ReplayOpponent, SnapshotPool, grpo_loss)
+from sokubot.rl.grpo import (EntropyFloor, GRPOConfig, ImaginedArena,
+                             PolicyOpponent, ProbeHead, ReplayOpponent,
+                             SnapshotPool, grpo_loss)
 from sokubot.rl.ood import LatentOOD
 from sokubot.rl.policy import SokuPolicy
 from sokubot.rl.reward import RewardConfig
+from scripts.eval_policy import score as score_policy
 from scripts.train_grpo import build_bank, model_fingerprint, valid_starts
 
 
@@ -114,6 +116,14 @@ def main() -> int:
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--eval-every", type=int, default=100)
     ap.add_argument("--eval-starts", type=int, default=1024)
+    ap.add_argument("--eval-horizon", type=int, default=4,
+                    help="horizon the reported `net` is measured over, held "
+                         "separate from --horizon on purpose. `net` is damage "
+                         "per alive step averaged over a rollout of this length, "
+                         "so it changes with the length: GRPO's +0.00215 was "
+                         "taken at 4, and reading a horizon-16 number against it "
+                         "would compare an instrument change and a policy change "
+                         "at once. Training still runs at --horizon.")
     ap.add_argument("--ckpt-every", type=int, default=1000)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--uniform-init", action="store_true")
@@ -123,12 +133,7 @@ def main() -> int:
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
 
-    blob = torch.load(a.wm, map_location=a.device, weights_only=False)
-    cfg: Config = blob["cfg"]
-    cfg.device = a.device
-    wm = LeWorldModel(cfg).to(a.device)
-    wm.load_state_dict(blob["model"])
-    wm.eval()
+    wm, cfg, _ = load_world_model(a.wm, a.device)
 
     d = np.load(a.probe, allow_pickle=True)
     probe = LinearProbe(zmu=d["zmu"], zsd=d["zsd"], ymu=d["ymu"], ysd=d["ysd"],
@@ -163,8 +168,13 @@ def main() -> int:
     bank_path = a.bank or (a.out / "bank.npz")
     Z, A, E = build_bank(rows, manifest, wm, cfg, a.device, a.bank_replays,
                          bank_path)
-    starts = valid_starts(E, cfg.history, a.horizon)
-    print(f"{len(starts)} valid start states", flush=True)
+    # Sized at whichever horizon reaches further. A start valid for the longer
+    # one is valid for the shorter, so this keeps training and evaluation drawing
+    # from one pool -- otherwise a short eval horizon would silently widen the
+    # eval pool and score the policy on start states it never trained near.
+    starts = valid_starts(E, cfg.history, max(a.horizon, a.eval_horizon))
+    print(f"{len(starts)} valid start states (horizon {a.horizon}, eval "
+          f"{a.eval_horizon})", flush=True)
     Zt = torch.from_numpy(Z).to(a.device)
     At = torch.from_numpy(A).to(a.device)
 
@@ -232,27 +242,26 @@ def main() -> int:
     eval_rng = np.random.default_rng(12345)
     eval_idx = torch.from_numpy(eval_rng.choice(starts, size=a.eval_starts)).to(a.device)
 
-    @torch.no_grad()
+    # A second arena purely for measurement, at its own horizon and **without the
+    # OOD guard**. Both are deliberate. The horizon is separated because `net` is
+    # a per-step average over a rollout of that length and therefore changes with
+    # it. The guard is dropped because it truncates rollouts, which would make
+    # the reported number depend on how far off-manifold the policy currently is
+    # -- a policy could then improve its score by drifting sooner. Training keeps
+    # the guard; the ruler must not have one.
+    eval_cfg = GRPOConfig(horizon=a.eval_horizon, reward=rcfg)
+    eval_arena = ImaginedArena(wm, probe_head, eval_cfg, cfg.history,
+                               cfg.action_ticks)
+
     def evaluate() -> dict:
         """Net damage against the frozen initial policy, per step, both chairs.
 
-        Deliberately identical to `train_grpo.evaluate`, including the horizon it
-        is measured over, so the printed `net` is comparable to +0.00215.
+        Shares `scripts.eval_policy.score`, so the number logged here and the
+        number that script prints for a saved checkpoint are produced by the same
+        code rather than by two implementations that agree until one is edited.
         """
-        off = torch.arange(cfg.history, device=a.device) - (cfg.history - 1)
-        out = {}
-        for tag, s0 in (("p1", 0), ("p2", 1)):
-            side = torch.full((a.eval_starts,), s0, device=a.device, dtype=torch.long)
-            zc = Zt[eval_idx[:, None] + off[None, :]].float()
-            ah = At[eval_idx[:, None] + off[None, :-1]].float()
-            tr = arena.rollout(zc, ah, side, policy, PolicyOpponent(reference))
-            al = tr["alive"]
-            n = al.sum().clamp(min=1)
-            out[f"{tag}_dealt"] = float((tr["terms"]["dealt"] * al).sum() / n)
-            out[f"{tag}_taken"] = float((tr["terms"]["taken"] * al).sum() / n)
-        out["net"] = ((out["p1_dealt"] + out["p1_taken"]) +
-                      (out["p2_dealt"] + out["p2_taken"])) / 2
-        return out
+        return score_policy(eval_arena, policy, reference, Zt, At, eval_idx,
+                            cfg, a.device)
 
     def chair(traj: dict, opp: bool) -> dict:
         """One chair's view of a rollout as a flat trajectory dict.
