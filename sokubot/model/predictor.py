@@ -62,11 +62,19 @@ class LatentPredictor(nn.Module):
         nn.init.zeros_(self.adaln[1].weight)
         nn.init.zeros_(self.adaln[1].bias)
 
-    def forward(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, cond: torch.Tensor,
+                return_hidden: bool = False):
         """z: [B, T, latent] latents, cond: [B, T, pred_dim] action conditions.
 
         Returns [B, T, latent], where index ``t`` is the prediction of ``z_{t+1}``
         made from ``z_{<=t}`` and the action chunk applied at ``t``.
+
+        With ``return_hidden`` the pre-projector activations are returned as well,
+        as ``(zhat, h)``. That is what `model.augmented.HudDeltaHead` reads: it
+        needs the trunk's action-conditioned state without altering a single
+        weight of it, because fine-tuning this predictor is measured to destroy
+        the action-awareness the whole model exists for (`docs/HANDOFF.md` on
+        Phase 1). Default False, so no existing caller changes.
         """
         B, T, _ = z.shape
         if T > MAX_SEQ:
@@ -80,4 +88,5 @@ class LatentPredictor(nn.Module):
         mod = self.adaln(cond)                     # [B, T, 6D], per-token
         for blk in self.blocks:
             h = blk(h, mod, causal=True)
-        return self.projector(h)
+        out = self.projector(h)
+        return (out, h) if return_hidden else out
