@@ -191,6 +191,37 @@ characters are 31.5/255 apart sit at cosine 0.78, against 0.055 for arbitrary
 pairs. The six HUD readings explain only 0.0296 of latent variance, and no
 single dimension is half-explained (`scripts/what_is_encoded.py`).
 
+**The KO signal is readable — from the announcement, not the health bar.** The
+probe's KO detector runs at precision **0.003**, and anchoring its level to
+`data/hud.py` moved that to 0.015, i.e. not at all: the error is in the probe's
+per-step *deltas*. But the game draws "KNOCK OUT" across half the screen, and a
+60k-parameter CNN on a fixed crop reads it. 120 hand labels, out-of-fold, split
+**by capture** so nothing scores by memorising a stage, averaged over 5 seeds:
+
+| class | n | recall | precision |
+|---|---|---|---|
+| none | 84 | 94.0% | 97.5% |
+| round | 12 | 100% | 85.7% |
+| start | 3 | 100% | 100% |
+| down | 8 | 75.0% | 85.7% |
+| **knockout** | **8** | **75.0%** | **85.7%** |
+| other | 5 | 60.0% | 37.5% |
+
+`none` misread as a banner 6.0%; knockout↔down confused 12.5% each way.
+
+**KO precision 0.857 against the probe's 0.003.** That is what lets `win`/`lose`
+stay in the reward — the ±5 term can pay for outcomes rather than for probe
+noise. It stays inside the no-memory-reading rule: this reads pixels, and reading
+an announcement is a different and far easier problem than inferring the state
+that produced it.
+
+Two limits worth stating. 85.7% is 6 of 7 predicted knockouts, so the interval is
+wide, and more `knockout`/`down` labels are the cheapest available improvement.
+And the classifier only sees candidates that already passed
+`harvest_banners.py`'s blue-coverage filter — recall-first by design, with
+precision coming from the classifier — so the deployed rate is the product of the
+two, not this number alone. Model at `artifacts/banner/`.
+
 **Bounded logits stop the collapse.** Four GRPO runs died identically — entropy
 to 0.000, press rate 0.53, KL-to-reference 10¹⁴. Squashing logits to (−6, 6)
 made that impossible and produced the best result yet:
