@@ -32,12 +32,20 @@ def main() -> None:
     ap.add_argument("--manifest-root", default="/root/exp/val")
     ap.add_argument("--out", default="/root/exp/val.pt")
     ap.add_argument("--windows", type=int, default=2048)
+    ap.add_argument("--image-size", type=int, default=224,
+                    help="must match the model's. A cache built at one "
+                         "resolution and evaluated against a model trained at "
+                         "another fails on a shape mismatch at the first eval, "
+                         "which on a long run means losing the first checkpoint "
+                         "interval rather than failing at startup.")
     ap.add_argument("--stride", type=int, default=17,
                     help="keep every Nth window within a capture; prime, to avoid "
                          "locking onto any periodicity in the game's animation")
     args = ap.parse_args()
 
-    cfg = Config.soku()
+    cfg = (Config.soku448() if args.image_size == 448
+           else Config.soku(image_size=args.image_size))
+    print(f"building at {cfg.image_size} px", flush=True)
     ds = build_soku_dataset(cfg, [args.manifest_root], shuffle_buffer=1, stride=args.stride)
 
     obs, acts, n = [], [], 0

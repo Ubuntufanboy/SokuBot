@@ -44,8 +44,21 @@ from sokubot.probe import inverse_dynamics_probe
 from sokubot.train import save_checkpoint, set_seed, train
 
 
+def eval_batch_for(cfg: Config, at_224: int = 64) -> int:
+    """Eval batch that holds activation memory roughly constant across resolutions.
+
+    Hardcoding 64 was fine at 224 on a 32 GB card. At 448 each image carries 4x
+    the patches, and 64 of them will not fit in 4 GB -- the run dies at its first
+    eval, after the training steps have already proved they fit, which is a
+    confusing way to fail.
+    """
+    return max(4, int(at_224 * (224 / cfg.image_size) ** 2))
+
+
 @torch.no_grad()
-def evaluate(model: LeWorldModel, cache: dict, cfg: Config, batch: int = 64) -> dict:
+def evaluate(model: LeWorldModel, cache: dict, cfg: Config,
+             batch: int | None = None) -> dict:
+    batch = batch or eval_batch_for(cfg)
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
@@ -94,6 +107,20 @@ def main() -> None:
                     help="peak LR. The 5e-4 tuned on 16k-step runs diverged at "
                          "75k of a 320k-step schedule -- see module docstring.")
     ap.add_argument("--warmup", type=int, default=5_000)
+    ap.add_argument("--eval-batch", type=int, default=0,
+                    help="batch for the eval and BatchNorm recalibration passes; "
+                         "0 scales it from the image size. Both are extra peak "
+                         "memory on top of a training step that already fits, so "
+                         "on a small card this is the knob that decides whether "
+                         "the run survives its first eval.")
+    ap.add_argument("--no-compile", action="store_true",
+                    help="skip torch.compile. It is worth 1.38x when it works, "
+                         "but Inductor needs a C compiler on PATH and fails at "
+                         "the first step without one -- which on a box with no "
+                         "sudo is not something a training run can fix.")
+    ap.add_argument("--shuffle-buffer", type=int, default=0,
+                    help="windows held per worker; 0 sizes it to a ~2.5 GB "
+                         "budget, which is what 4096 windows cost at 224 px")
     ap.add_argument("--image-size", type=int, default=224,
                     help="448 is the considered value for this game; 224 was "
                          "LeWorldModel's PushT default and throws away 4.6x the "
@@ -120,7 +147,8 @@ def main() -> None:
     cfg = make(device=args.device, batch_size=args.batch_size,
                num_workers=args.num_workers, total_steps=args.steps,
                warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
-               cf_coef=args.cf_coef, hud_coef=args.hud_coef)
+               cf_coef=args.cf_coef, hud_coef=args.hud_coef,
+               compile=not args.no_compile)
     if args.image_size not in (224, 448):
         cfg = replace(cfg, image_size=args.image_size)
     print(f"image {cfg.image_size} px, patch {cfg.patch_size} -> "
@@ -161,8 +189,22 @@ def main() -> None:
     rep = model.param_report()
     print("params: " + ", ".join(f"{k} {v/1e6:.2f}M" for k, v in rep.items()), flush=True)
 
+    # The shuffle buffer holds decoded windows, so its cost scales with the
+    # square of the image size: 4096 windows is 2.5 GB at 224 px and 9.8 GB at
+    # 448, *per worker*. The original 320k run had 754 GB of host RAM and could
+    # ignore that; on anything smaller it is an out-of-memory kill in a DataLoader
+    # worker, which surfaces only as "worker exited unexpectedly".
+    #
+    # So the default is a memory budget rather than a window count, and it holds
+    # the same ~2.5 GB the original run used whatever the resolution.
+    win_bytes = cfg.seq_len * 3 * cfg.image_size ** 2
+    shuffle_buffer = args.shuffle_buffer or max(
+        256, int(2.5e9 / win_bytes))
+    print(f"shuffle buffer {shuffle_buffer} windows "
+          f"({shuffle_buffer * win_bytes / 1e9:.2f} GB per worker x "
+          f"{cfg.num_workers} workers)", flush=True)
     ds = build_soku_dataset(cfg, [str(args.corpus / "train")],
-                            shuffle_buffer=4096, seed=args.seed)
+                            shuffle_buffer=shuffle_buffer, seed=args.seed)
 
     hours = sum(json.loads(l)["frames"] for l in
                 (args.corpus / "train" / "manifest.jsonl").read_text().splitlines()) / 60 / 3600
@@ -181,9 +223,17 @@ def main() -> None:
         # reported val 1.1431 at step 30k while training loss was 0.058. The
         # copy keeps training's own running stats untouched.
         from scripts.eval_ckpt import recalibrate_bn
+        # Both of these forward the val cache in batches, and both defaulted to
+        # 64 -- fine at 224 on a 32 GB card, an out-of-memory kill at 448 on 4 GB
+        # *after* the training steps have already proved they fit. Releasing the
+        # training step's cached blocks first matters too: the allocator holds
+        # them, and a deepcopy plus a recalibration pass needs the room.
+        eb = args.eval_batch or eval_batch_for(cfg)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         probe_model = copy.deepcopy(m)
-        recalibrate_bn(probe_model, cache)
-        ev = evaluate(probe_model, cache, cfg)
+        recalibrate_bn(probe_model, cache, batch=eb)
+        ev = evaluate(probe_model, cache, cfg, batch=eb)
         # Keep the weights that were actually scored. Saving `m` instead writes
         # a checkpoint whose BatchNorm statistics are not the ones the recorded
         # skill describes -- mild here, since ordinary training keeps them close
