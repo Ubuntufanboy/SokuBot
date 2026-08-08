@@ -210,6 +210,19 @@ def main() -> int:
                          "term, and any error in detecting it, now dominates "
                          "the gradient. A KO is worth about one health bar, "
                          "which is what 1.0 means in these units.")
+    ap.add_argument("--gym", default=None, metavar="NAME",
+                    help="drill one situation instead of sampling the whole "
+                         "bank. Needs --gyms; names come from "
+                         "scripts.build_gyms (under_pressure, pressuring, "
+                         "losing, neutral).\n"
+                         "WARNING: a gym is only worth training on if the world "
+                         "model can represent the mechanic it drills. "
+                         "scripts/block_effect.py measured the JEPA model with "
+                         "the sign of guarding INVERTED, so training "
+                         "under_pressure on that model teaches the agent not to "
+                         "block, efficiently. Check block_effect first.")
+    ap.add_argument("--gyms", type=Path, default=None,
+                    help="the npz written by scripts.build_gyms")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -283,6 +296,22 @@ def main() -> int:
     Z, A, E = build_bank(rows, manifest, wm, cfg, a.device, a.bank_replays,
                          a.bank or (a.out / "bank.npz"))
     starts = valid_starts(E, cfg.history, a.horizon)
+    gym = None
+    if a.gym:
+        if not a.gyms:
+            raise SystemExit("--gym needs --gyms pointing at build_gyms' npz")
+        gd = np.load(a.gyms.expanduser())
+        names = [str(x) for x in gd["names"]]
+        if a.gym not in names:
+            raise SystemExit(f"unknown gym {a.gym!r}; {a.gyms} has {names}")
+        if int(gd["horizon"]) != a.horizon:
+            raise SystemExit(
+                f"{a.gyms} was built for horizon {int(gd['horizon'])} and this "
+                f"run uses {a.horizon}; its windows may run off the end of a "
+                f"replay")
+        gym = (gd[f"{a.gym}_starts"], gd[f"{a.gym}_sides"])
+        print(f"gym {a.gym!r}: {len(gym[0])} (start, side) pairs, side carried "
+              f"with each start", flush=True)
     print(f"{len(starts)} valid start states", flush=True)
 
     Zt = torch.from_numpy(Z).to(a.device)
@@ -402,9 +431,20 @@ def main() -> int:
                  if gcfg.entropy_floor_frac > 0 else None)
     for step in range(1, a.steps + 1):
         # Each group shares one start state and one side.
-        idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)
+        if gym is None:
+            idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)
+            side = torch.randint(0, 2, (S,), device=a.device)
+        else:
+            # A gym carries the side with each start, because "being combo'd" is
+            # a property of a state AND a chair -- the same frame is
+            # under_pressure for one player and pressuring for the other.
+            # Re-rolling the side here would seat the agent with the attacker
+            # half the time and drill the opposite mechanic.
+            pick = rng.choice(len(gym[0]), size=S)
+            idx = torch.from_numpy(gym[0][pick]).to(a.device)
+            side = torch.from_numpy(gym[1][pick]).to(a.device)
         idx = idx.repeat_interleave(G)
-        side = torch.randint(0, 2, (S,), device=a.device).repeat_interleave(G)
+        side = side.repeat_interleave(G)
         off = torch.arange(cfg.history, device=a.device) - (cfg.history - 1)
         z_ctx = Zt[idx[:, None] + off[None, :]].float()
         a_hist = At[idx[:, None] + off[None, :-1]].float()
