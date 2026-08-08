@@ -397,6 +397,58 @@ the policy is.
 
 ---
 
+## 5b. Rebuilding everything after a new world model
+
+A new encoder invalidates every derived artifact, and the order matters because
+each step's fingerprint check refuses the previous step's output if it is stale.
+Run it exactly like this:
+
+```bash
+WM=~/ckpt448/best.pt          # the new model
+
+# 1. bank — latents mean nothing except relative to the encoder that made them.
+#    Keep --replays and --seed identical to the old bank: build_hud_bank walks
+#    the shuffled manifest and numbers what it keeps 0..N-1, so the same seed
+#    reproduces the same replay ORDER, which is what lets the banner labels
+#    below be reused instead of re-decoded (~25 min).
+python -m scripts.build_hud_bank --ckpt $WM --replays 150 --seed 0 \
+    --corpus ~/corpus --out ~/bank448.npz
+
+# 2. reward probe — fit on *predictor outputs*, so it is invalidated by a
+#    predictor change as well as an encoder one.
+python -m scripts.horizon_ablation --ckpt $WM --corpus ~/corpus \
+    --out ~/gate448                       # writes reward_probe.npz
+
+# 3. banner channel — reuses ~/blp_labels.npz, which is per-frame pixel labels
+#    and therefore independent of the encoder. Only the latents changed.
+python -m scripts.fit_banner_channel --probe ~/gate448/reward_probe.npz \
+    --bank ~/bank448.npz --labels ~/blp_labels.npz \
+    --out ~/gate448/reward_probe_banner.npz
+
+# 4. re-check the two things that do not transfer across encoders
+python -m scripts.banner_in_imagination --wm $WM \
+    --probe ~/gate448/reward_probe_banner.npz --bank ~/bank448.npz
+python -m scripts.ood_calibration --wm $WM --bank ~/bank448.npz
+
+# 5. re-measure the baseline ON THE NEW INSTRUMENT before believing any new
+#    number. +0.00147 is a property of the 224 model, not a constant.
+python -m scripts.eval_policy --wm $WM --probe ~/gate448/reward_probe_banner.npz \
+    --bank ~/bank448.npz --policy grpo=~/sokubot-art/policy_best.pt --horizons 4
+```
+
+Step 5 is the one most likely to be skipped and the one that matters most. Every
+policy comparison in this document is against a reference and a probe built from
+one specific encoder; carrying `+0.00147` across a retrain would repeat exactly
+the mistake §2 exists to prevent.
+
+Two things worth re-deriving rather than assuming at 448: whether `down` becomes
+readable from the latent (it is not at 224, precision 0.132, which is the case
+for a supervised banner channel), and whether `spirit` becomes decodable at all —
+at 224 it sits at R² 0.036/0.015, and the 5×6 px gauges arriving as ~3 px is the
+reason the resolution was raised in the first place.
+
+---
+
 ## 6. Getting back up to speed on a fresh box
 
 Nothing is lost. The corpus is on HuggingFace and **public — no token needed**.
