@@ -80,6 +80,33 @@ called `0.0064` — two numbers for one quantity.
 
 **Everything below is per 0.27 s window (H=4) unless it says per step.**
 
+### `net` also depends on the horizon it was measured at
+
+The same trap, one level down. `net` is damage per alive step **averaged over a
+rollout of `cfg.horizon` steps**, and a longer rollout has had longer to blur, so
+the number falls with the horizon even for an unchanged policy. Measured on one
+policy (`grpo_bounded`, 2048 starts):
+
+| horizon | net |
+|---|---|
+| 4 | +0.00147 |
+| 16 | +0.00092 |
+
+So reading a horizon-16 actor-critic against GRPO's horizon-4 +0.00215 would
+have compared a policy change and an instrument change at once and credited the
+sum to the policy — a 35% handicap invented by the ruler.
+
+**Use `scripts/eval_policy.py`.** It scores every checkpoint in one run, against
+one frozen reference, at whatever horizons you ask for, and prints the reference
+against itself first as a zero point (measured: 2e-5, so it resolves the ~0.002
+effect with room to spare). Numbers from different training runs' own
+`evaluate()` are *not* comparable to each other, because each builds its
+reference from wherever its RNG happened to stand.
+
+**The bar for any new policy is +0.00147 at horizon 4 on that instrument**, not
+the +0.00215 recorded below — that figure is real but was taken against a
+reference that cannot be reconstructed.
+
 ---
 
 ## 3. The numbers that matter
@@ -184,6 +211,54 @@ the disease.
 ## 5. What was tried and did not work
 
 Recorded because each cost real time and the reasoning is worth not repeating.
+
+**A critic as GRPO's baseline — null, and the measurement says it had to be.**
+Phase 2's premise was that a critic amortises the baseline over the batch,
+freeing the factor of `group_size` GRPO spends on variance reduction to buy that
+many more distinct starts. Arm A ran it at horizon 4 for 1100 steps and `net`
+never left ±0.00005.
+
+`scripts/baseline_quality.py` (256 starts × 16 rollouts, horizon 4):
+
+| | value |
+|---|---|
+| var(λ-return), total | 8.51e-01 |
+| …within a group (same start) — **the action-driven part** | 1.02e-03 |
+| …between starts | 8.50e-01 |
+| action share of total | **0.12%** |
+| critic R² on the across-state mean return | +0.385 |
+| noise per sample, critic vs group baseline | **21.8×** |
+
+Only 0.12% of return variance is anything the policy did. A group mean removes
+the other 99.88% *exactly*, because every rollout in the group shares the state;
+a critic removes it only as well as it predicts, and the 61% it misses is still
+hundreds of times the signal. Eight times the start coverage does not pay for
+21.8× the noise per sample.
+
+The fix is not to drop the critic but to stop using it as the baseline:
+`--group 8` restores the exact conditional baseline, and the critic keeps
+supplying `v(s_H)` inside the λ-return, which is the job it is actually good at.
+**Baseline and bootstrap are two jobs and only one of them wanted a learned
+function.**
+
+**Horizon 16 — not available on this world model.** The other half of Phase 2
+was that a λ-return lets imagination be short while credit reaches long. True in
+principle, but `scripts/ood_calibration.py` measures how long the rollout stays
+in distribution at all, under the corpus's *own* actions:
+
+| h | cosine to truth | % inside the 99% band | ‖z‖ |
+|---|---|---|---|
+| 1 | 0.9961 | 100% | 14.05 |
+| 2 | 0.9895 | 88.9% | 13.75 |
+| 3 | 0.9813 | 41.8% | 13.45 |
+| 4 | 0.9717 | 6.1% | 13.17 |
+| 16 | 0.8238 | 0% | 10.88 |
+
+Under *policy* actions the guard cuts at ~1.5 steps. Note the norm **shrinks**
+(14.05 → 10.88) while Mahalanobis² rises 11×: the rollout is not inflating, it is
+leaking into directions the corpus never occupies. That rules out the cheap fix —
+rescaling the latent does nothing. It also means the guard is not miscalibrated:
+at h=1 it flags nothing at cosine 0.9961, so it is measuring real drift.
 
 **FF-JEPA terminal value — null, three independent runs.** The action-free
 latent planner (arXiv:2606.09311) works well as a *model*: it beats the flat

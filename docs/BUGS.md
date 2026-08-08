@@ -179,7 +179,52 @@ trace that broke it.
 
 ---
 
-## 8. Small ones that still cost time
+## 8. A new config default silently changed old checkpoints' architecture
+
+`Config` is a dataclass and a checkpoint stores a **pickled instance** of it. Add
+a field, and every config pickled before it existed unpickles without that entry
+in its `__dict__` — so reading the attribute falls through to the **class**
+default, i.e. whatever the value happens to be today.
+
+Some of those fields decide the architecture. Adding `hud_coef = 0.25` gave every
+pre-existing checkpoint a `hud_head` its `state_dict` has no weights for:
+
+```
+RuntimeError: Error(s) in loading state_dict for LeWorldModel:
+        Missing key(s) in state_dict: "hud_head.weight", "hud_head.bias"
+```
+
+on `wm_cf_bnfix.pt` — the model everything downstream is keyed to — which had
+loaded fine the day before. Nothing about the checkpoint changed; a default did.
+
+**The tempting fix is much worse than the crash.** `strict=False` builds the
+phantom head with *random* weights and reports nothing, so `predict_hud` returns
+noise and anything reading it measures the initialiser. This is the shape of
+several bugs above: the loud failure was the good outcome.
+
+The rule, now enforced by `sokubot/model/loading.py`: **the state dict is the
+source of truth for architecture, and the config is reconciled to match it.** A
+field that cannot be recovered from the weights must not change the
+architecture. Two are recovered today — the HUD head's presence, and
+`image_size`, which is readable off the positional grid and moved 224 → 448 for
+exactly the same reason. `tests/test_loading.py` pins both by simulating the
+default moving after the checkpoint was written.
+
+Roughly thirty scripts still build `LeWorldModel(cfg)` by hand and will meet this
+the moment another architecture field gains a default. They should move to
+`load_world_model`.
+
+---
+
+## 9. Small ones that still cost time
+
+**A monitor that stayed silent through a crash.** The 4090's 448 retrain died
+instantly on `unrecognized arguments: --shuffle-gb` — the box had a repo copy
+predating the flag — and the watch filter matched `Error` but not argparse's
+lowercase `error:`. The box sat idle and billing for ~30 minutes while the
+monitor showed nothing, because silence and success look identical. A filter has
+to match every terminal state, not the happy path; the check is "if this crashed
+right now, would anything be emitted?"
 
 **`train_full.py` never created its checkpoint directory.** `on_eval` writes
 `best.pt` into `--ckpt-dir`, but the only code that created that directory was
