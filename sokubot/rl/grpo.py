@@ -54,8 +54,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .ood import step_flags
 from .policy import SokuPolicy, jitter_actions, to_joint
-from .reward import RewardConfig, compute_rewards
+from .reward import RewardConfig, compute_rewards, terminal_mask
 
 
 @dataclass
@@ -215,7 +216,7 @@ class ImaginedArena:
     """Rolls a policy against an opponent inside the frozen world model."""
 
     def __init__(self, world_model, probe_head: ProbeHead, cfg: GRPOConfig,
-                 history: int, ticks: int):
+                 history: int, ticks: int, ood=None):
         self.wm = world_model.eval()
         for p in self.wm.parameters():
             p.requires_grad_(False)
@@ -223,15 +224,38 @@ class ImaginedArena:
         self.cfg = cfg
         self.H = history
         self.ticks = ticks
+        # Optional `rl.ood.LatentOOD`. When absent the rollout behaves exactly as
+        # it did before, which is what keeps the GRPO baseline reproducible.
+        self.ood = ood
 
     @torch.no_grad()
     def rollout(self, z_ctx: torch.Tensor, a_hist: torch.Tensor,
-                side: torch.Tensor, policy: SokuPolicy, opponent) -> dict:
+                side: torch.Tensor, policy: SokuPolicy, opponent,
+                two_sided: bool = False,
+                hud_ref: torch.Tensor | None = None) -> dict:
         """z_ctx [B,H,latent], a_hist [B,H-1,ticks,20], side [B] -> trajectory.
 
         Returns the policy inputs and sampled actions at every step, so the
         update can re-score them, plus the probed state sequence the reward
         reads. Nothing here carries gradient: the update recomputes log-probs.
+
+        BOTH CHAIRS OF ONE ROLLOUT
+        --------------------------
+        With ``two_sided`` the opponent's actions and its own reward are returned
+        alongside the agent's, under keys suffixed ``_opp``. This costs one extra
+        `compute_rewards` call and **no extra predictor steps at all**: the
+        predictor is conditioned on both players' twenty buttons, so a single
+        imagined rollout already *is* a two-player game, and the opponent's
+        experience was simply being discarded. In a near-zero-sum game that is
+        half the available learning signal thrown away per unit of the thing that
+        actually costs -- the rollout.
+
+        The caller is responsible for one condition: the opponent's experience is
+        only on-policy when the opponent **is** the current policy. Against a
+        frozen snapshot or replayed human input those transitions were drawn from
+        a different distribution, and using them in the actor update without an
+        importance correction would be plain off-policy bias. `train_ac.py`
+        therefore only consumes the ``_opp`` half on self-play steps.
         """
         cfg, T = self.cfg, self.cfg.horizon
         if hasattr(opponent, "reset"):
@@ -252,7 +276,7 @@ class ImaginedArena:
         # reads 0.3470 against 0.3438, i.e. no gap at all. Keeping the sequence
         # homogeneous is still the right call; the alarming number was a bug
         # elsewhere.
-        zs, mine_all, joint_all, obs_all = [], [], [], []
+        zs, mine_all, theirs_all, joint_all, obs_all = [], [], [], [], []
 
         for _ in range(T + 1):
             obs_all.append(z_win)
@@ -265,6 +289,7 @@ class ImaginedArena:
             zhat = self.wm.predictor(z_win, self.wm.action_encoder(a_full))[:, -1]
 
             mine_all.append(mine)
+            theirs_all.append(theirs)
             joint_all.append(joint)
             zs.append(zhat)
             z_win = torch.cat([z_win[:, 1:], zhat[:, None]], dim=1)
@@ -274,13 +299,94 @@ class ImaginedArena:
         # T+1 predicted states against the T actions that produced the last T of
         # them, so the state sequence is homogeneous and the action alignment is
         # unchanged: joint_all[k] carries zs[k] to zs[k+1].
-        states = self.probe(torch.stack(zs, dim=1))          # [B, T+1, K]
+        z_seq = torch.stack(zs, dim=1)                       # [B, T+1, latent]
+        states = self.probe(z_seq)                           # [B, T+1, K]
+
+        if hud_ref is not None:
+            # ANCHORING. `hud_ref` is data/hud.py's reading at the rollout's own
+            # first imagined step, taken from the native 480 px frame and
+            # validated against a human at MAE 0.012 for health. The probe, by
+            # contrast, carries a per-state offset: `scripts/probe_reliability.py`
+            # measures bias +0.154 and noise 0.251 in the 0.02-0.04 health band,
+            # and the KO detector built on it runs at precision 0.003, firing
+            # 20-45x more often than KOs happen.
+            #
+            # Those false KOs come from windows whose health is *genuinely* low,
+            # where the probe's absolute reading wanders across the 0.06
+            # threshold -- not from healthy windows. So the fix is to take the
+            # *level* from the HUD and the *change* from the probe:
+            #
+            #     state_t = hud_ref + [ probe(z_t) - probe(z_0) ]
+            #
+            # Two things this buys. The KO threshold is tested against a level
+            # that is right, and `ko_alive_margin` gates on a starting health
+            # that is right -- today a true 0.12 start can read as 0.20 and
+            # wrongly become KO-eligible.
+            #
+            # Carrying the HUD forward *unchanged* was the obvious idea and is
+            # useless: health would never fall, so damage -- the entire reward --
+            # would be identically zero. The change has to come from somewhere,
+            # and the probe's deltas are the only estimate available without
+            # retraining the world model.
+            if hud_ref.shape[-1] < states.shape[-1]:
+                raise ValueError(
+                    f"hud_ref has {hud_ref.shape[-1]} channels but the probe "
+                    f"reads {states.shape[-1]}; they are matched positionally")
+            states = (hud_ref[:, None, : states.shape[-1]]
+                      + states - states[:, :1])
         joint_seq = torch.stack(joint_all[1:], dim=1)        # [B, T, ticks, 20]
         reward, alive, terms = compute_rewards(states, joint_seq, side, cfg.reward)
-        return {"obs": torch.stack(obs_all[1:], dim=1),      # [B, T, H, latent]
-                "mine": torch.stack(mine_all[1:], dim=1),    # [B, T, ticks, 10]
-                "reward": reward, "alive": alive, "terms": terms,
-                "states": states, "side": side}
+        out = {"obs": torch.stack(obs_all[1:], dim=1),       # [B, T, H, latent]
+               "mine": torch.stack(mine_all[1:], dim=1),     # [B, T, ticks, 10]
+               "reward": reward, "alive": alive, "terms": terms,
+               "states": states, "side": side,
+               # The window ending at the *last* imagined state, which `obs` does
+               # not contain: `obs[t]` is the window a decision was taken from,
+               # so it stops one short of the state the rollout finishes in. A
+               # lambda-return needs a value there to bootstrap from -- without
+               # it the horizon would be treated as an absorbing state worth
+               # zero, which is precisely the "stops paying at the edge" failure
+               # the critic exists to remove.
+               "obs_boot": z_win,                            # [B, H, latent]
+               # Where the episode *ends*, as opposed to where it stops paying.
+               # The critic needs the difference; see rl/critic.continuation.
+               "terminal": terminal_mask(states, side, cfg.reward)}
+
+        if self.ood is not None:
+            # Scored on the *latents*, not the probed states: the probe is a
+            # linear readout that will happily return a plausible-looking health
+            # for a latent that means nothing, which is precisely the situation
+            # being detected. One matmul per step against a 9.9M-parameter
+            # predictor step is free.
+            excess, hard = self.ood.flags(z_seq)             # [B, T+1] each
+            ok, lam_scale = step_flags(hard)                 # [B, T] each
+            # Step t spans states t..t+1, so its drift is the worse endpoint --
+            # the same OR the mask uses, in continuous form.
+            out["ood_excess"] = torch.maximum(excess[:, :-1], excess[:, 1:])
+            out["ood_ok"] = ok
+            out["ood_lam_scale"] = lam_scale
+            # OOD is a property of the imagined *state sequence*, which both
+            # chairs share, so this is deliberately not recomputed per side.
+            if two_sided:
+                out["ood_ok_opp"] = ok
+                out["ood_lam_scale_opp"] = lam_scale
+                out["ood_excess_opp"] = out["ood_excess"]
+        if two_sided:
+            opp_side = 1 - side
+            r_o, alive_o, terms_o = compute_rewards(states, joint_seq, opp_side,
+                                                    cfg.reward)
+            out.update({
+                "mine_opp": torch.stack(theirs_all[1:], dim=1),
+                "reward_opp": r_o, "alive_opp": alive_o, "terms_opp": terms_o,
+                "side_opp": opp_side,
+                # Termination is a property of the *match*, not of a chair, so
+                # this is the same event read from the other seat and must come
+                # out identical. Recomputed rather than reused so that a future
+                # change making the reward chair-dependent shows up as a test
+                # failure instead of a silent asymmetry.
+                "terminal_opp": terminal_mask(states, opp_side, cfg.reward),
+            })
+        return out
 
 
 def group_advantages(reward: torch.Tensor, alive: torch.Tensor,

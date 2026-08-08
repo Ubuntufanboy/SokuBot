@@ -195,3 +195,66 @@ def test_snapshot_pool_keeps_a_bounded_history():
         pool.maybe_add(policy, step)
     assert len(pool.snaps) == 3
     assert pool.sample(np.random.default_rng(0)) is not None
+
+
+# --------------------------------------------------------------------------
+# Both chairs of one rollout
+# --------------------------------------------------------------------------
+
+def test_two_sided_rollout_returns_the_opponents_half():
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    traj = arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy),
+                         two_sided=True)
+    T = gcfg.horizon
+    assert traj["mine_opp"].shape == (B, T, cfg.action_ticks, 10)
+    assert traj["reward_opp"].shape == (B, T)
+    assert ((traj["side"] + traj["side_opp"]) == 1).all()
+
+
+def test_two_sided_costs_no_extra_predictor_steps():
+    """The claim that makes this free. If it ever stops being true, say so loudly."""
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    calls = {"n": 0}
+    real = wm.predictor.forward
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    wm.predictor.forward = counted
+    arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy))
+    one = calls["n"]
+    calls["n"] = 0
+    arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy),
+                  two_sided=True)
+    wm.predictor.forward = real
+    assert calls["n"] == one
+
+
+def test_termination_is_a_property_of_the_match_not_of_a_chair():
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    traj = arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy),
+                         two_sided=True)
+    assert torch.equal(traj["terminal"], traj["terminal_opp"])
+    assert torch.equal(traj["alive"], traj["alive_opp"])
+
+
+def test_the_two_chairs_see_the_same_exchange_from_opposite_sides():
+    """Damage I deal is damage they take. This is what makes the game zero-sum,
+    and it is the only reason the opponent's half of the rollout is worth
+    learning from at all -- if the two readings did not mirror, one of them
+    would be measuring something other than the match."""
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    traj = arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy),
+                         two_sided=True)
+    assert torch.allclose(traj["terms"]["dealt"], -traj["terms_opp"]["taken"],
+                          atol=1e-5)
+    assert torch.allclose(traj["terms_opp"]["dealt"], -traj["terms"]["taken"],
+                          atol=1e-5)
+
+
+def test_one_sided_rollout_is_unchanged():
+    """The default path must not grow keys; train_grpo reproduces +0.00215 on it."""
+    cfg, wm, arena, policy, gcfg, z_ctx, a_hist, side, B = build()
+    traj = arena.rollout(z_ctx, a_hist, side, policy, PolicyOpponent(policy))
+    assert not any(k.endswith("_opp") for k in traj)
