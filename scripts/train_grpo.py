@@ -50,6 +50,30 @@ from sokubot.rl.reward import RewardConfig
 from scripts.horizon_ablation import capture_paths, encode_all
 
 
+def encoder_fingerprint(model) -> str:
+    """Identity of the *encoder* alone.
+
+    A bank of latents is meaningful relative to whatever produced them, and what
+    produced them is the encoder. `model_fingerprint` hashes the whole state
+    dict, so a predictor fine-tune changes it even though the encoder never
+    moved -- which makes a perfectly valid bank look poisoned and pushes the
+    reader toward rebuilding 400k latents for no reason.
+
+    The two checks are genuinely different and both are needed:
+
+      bank of latents   -> encoder fingerprint (this)
+      calibrated probe  -> `model_fingerprint`, because that probe is fit on
+                           *predictor outputs* and a predictor fine-tune really
+                           does invalidate it.
+    """
+    import hashlib
+    h = hashlib.sha256()
+    for name, p in sorted(model.encoder.state_dict().items()):
+        h.update(name.encode())
+        h.update(p.detach().float().cpu().numpy().tobytes()[:1024])
+    return h.hexdigest()[:16]
+
+
 def model_fingerprint(model) -> str:
     """A cheap identity for the weights that produced a set of latents.
 

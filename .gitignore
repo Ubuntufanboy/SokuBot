@@ -24,3 +24,12 @@ __pycache__/
 # scratch
 *.log
 .DS_Store
+
+# Annotation/labelling working sets. The labels themselves are small and worth
+# keeping; the harvested crops and rendered sheets are regenerable from the
+# corpus and run to tens of megabytes.
+banners/
+banners_label/crops/
+banners_label/sheet_*.png
+hud_annot/crops/
+hud_annot/sheet_*.png

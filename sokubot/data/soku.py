@@ -193,6 +193,65 @@ def decode_frames(
             proc.stderr.close()
 
 
+NATIVE = 480          # the capture resolution data/hud.py's geometry assumes
+
+
+def decode_frames_hud(
+    video: Path, size: int, frame_skip: int, chunk_frames: int = 64
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Like `decode_frames`, but also reads the HUD -- before the resize.
+
+    Yields ``(frame[size,size,3] uint8, hud[8] float32)``.
+
+    The HUD has to be read at the native 480 px, not at whatever the model is
+    trained on, and that is the whole point. The spirit gauge is five six-pixel
+    hexagons; at the 224 px this project trained at they are about three pixels
+    and probe out of the latent at R^2 0.05. Reading them here, then handing the
+    model a resized frame, means the *labels* keep the resolution even where the
+    input does not.
+
+    Decoding at 480 and resizing in-process costs 1.15x the pipe bytes against
+    decoding at 448 directly, which is nothing next to what it buys.
+    """
+    from .hud import read_frame_hud
+    cmd = [
+        _ffmpeg_bin(), "-v", "error", "-nostdin",
+        "-i", str(video),
+        "-vf", f"select='not(mod(n\\,{frame_skip}))'",
+        "-vsync", "0",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+    ]
+    nbytes = NATIVE * NATIVE * 3
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            bufsize=nbytes * 4)
+    try:
+        assert proc.stdout is not None
+        import cv2
+        while True:
+            # A chunk at a time: read_frame_hud is vectorised over frames, and
+            # per-frame calls would pay its setup cost 43 million times.
+            raw = proc.stdout.read(nbytes * chunk_frames)
+            if not raw or len(raw) < nbytes:
+                break
+            n = len(raw) // nbytes
+            block = np.frombuffer(memoryview(raw)[: n * nbytes], dtype=np.uint8)
+            block = block.reshape(n, NATIVE, NATIVE, 3)
+            hud = read_frame_hud(block)
+            for i in range(n):
+                f = block[i]
+                if size != NATIVE:
+                    f = cv2.resize(f, (size, size), interpolation=cv2.INTER_LINEAR)
+                yield np.ascontiguousarray(f), hud[i]
+            if n < chunk_frames:
+                break
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.wait()
+        if proc.stderr:
+            proc.stderr.close()
+
+
 class SokuWindowDataset(IterableDataset):
     """Streams training windows out of SokuFrameExtractor captures.
 
@@ -241,12 +300,21 @@ class SokuWindowDataset(IterableDataset):
             return
 
         frame_buf: List[np.ndarray] = []
+        hud_buf: List[np.ndarray] = []
         idx = 0          # index of the next decision frame
         emitted = 0
-        for frame in decode_frames(cap.video, cfg.image_size, skip):
+        want_hud = cfg.hud_coef > 0
+        stream = (decode_frames_hud(cap.video, cfg.image_size, skip) if want_hud
+                  else ((f, None) for f in
+                        decode_frames(cap.video, cfg.image_size, skip)))
+        for frame, hud in stream:
             frame_buf.append(frame)
+            if want_hud:
+                hud_buf.append(hud)
             if len(frame_buf) > T:
                 frame_buf.pop(0)
+                if want_hud:
+                    hud_buf.pop(0)
             idx += 1
             if len(frame_buf) < T:
                 continue
@@ -263,10 +331,13 @@ class SokuWindowDataset(IterableDataset):
                 actions[(start + k) * skip : (start + k) * skip + skip]
                 for k in range(T)
             ])                                     # [T, skip, 20]
-            yield {
+            sample = {
                 "obs": frames_to_chw(np.stack(frame_buf), as_uint8=cfg.loader_uint8),
                 "actions": torch.from_numpy(chunks).float(),
             }
+            if want_hud:
+                sample["hud"] = torch.from_numpy(np.stack(hud_buf)).float()
+            yield sample
 
     def __iter__(self) -> Iterator[dict]:
         caps = self._shard()

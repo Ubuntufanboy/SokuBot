@@ -47,6 +47,7 @@ version of the same number and should be expected to be lower.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -60,20 +61,78 @@ from sokubot.data.soku import decode_frames, read_actions
 from sokubot.model.world_model import LeWorldModel
 from sokubot.probe import fit_ridge
 
-TARGETS = ("hp1", "hp2", "spirit1", "spirit2", "combo1", "combo2")
+# Order is load-bearing: `sokubot/rl/reward.py` indexes the probe's output
+# positionally (`HP1, HP2, SPIRIT1, SPIRIT2, COMBO1, COMBO2 = range(6)`), so new
+# targets are **appended** and never inserted. A probe fit with more targets is
+# still readable by the old reward code, which only ever looks at columns 0-5.
+#
+# cards1/cards2 are the lit fraction of each player's card stock. `read_trace`
+# has always computed them; they were simply never probed. They are worth
+# probing because the spirit channel -- the other half of the spellcard reward --
+# is not decodable at all (R^2 0.036/0.015 on real encoder latents, and only
+# 0.138 when refit), the five six-pixel hexagons not surviving the 224 px
+# downsample. The card strip spans 70 px, so it plausibly does survive, and if it
+# does then RewardConfig's whiff/spell_multiplier machinery has real state to
+# read instead of noise. The ceiling filter below decides that on measurement.
+TARGETS = ("hp1", "hp2", "spirit1", "spirit2", "combo1", "combo2",
+           "cards1", "cards2")
 HUD_W = HUD_H = 480
 
 
 def decode_hud(path: str, max_frames: int) -> np.ndarray:
-    """Native-resolution frames for HUD reading, capped at `max_frames`."""
+    """Native-resolution frames for HUD reading, capped at `max_frames`.
+
+    A whole capture is ~6800 frames of 480x480x3, about 4.7 GB. The obvious
+    implementation holds that **twice**: `p.stdout` is one copy, and slicing a
+    `bytes` object always copies, so `p.stdout[:k]` is a second. At ~9.4 GB plus
+    a CUDA context that is an out-of-memory kill on a 16 GB box -- which is how
+    `scripts/build_hud_bank.py` died on its first capture, silently, because the
+    kernel kills the process before Python can raise.
+
+    `memoryview` slices without copying and `np.frombuffer` wraps it without
+    copying either, so the peak is the one 4.7 GB buffer. The returned array is a
+    view onto it and keeps it alive, which is the intended lifetime.
+    """
+    stride = HUD_W * HUD_H * 3
+    cap = max_frames if max_frames > 0 else _probe_frames(path)
     cmd = ["ffmpeg", "-v", "error", "-i", path]
     if max_frames > 0:
         cmd += ["-frames:v", str(max_frames)]
     cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-    p = subprocess.run(cmd, capture_output=True)
-    n = len(p.stdout) // (HUD_W * HUD_H * 3)
-    return np.frombuffer(p.stdout[: n * HUD_W * HUD_H * 3],
-                         dtype=np.uint8).reshape(n, HUD_H, HUD_W, 3)
+
+    # Stream straight into a preallocated array. `subprocess.run(capture_output=
+    # True)` buffers the child's stdout as a list of chunks and then joins them,
+    # so a 4.7 GB capture peaks at about twice that before anything else runs --
+    # which OOM-killed this on a 16 GB box, silently, four times.
+    out = np.empty((cap, HUD_H, HUD_W, 3), dtype=np.uint8)
+    mv = memoryview(out.reshape(-1))
+    got = 0
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, bufsize=0) as proc:
+        end = cap * stride
+        while got < end:
+            n = proc.stdout.readinto(mv[got : min(got + stride, end)])
+            if not n:
+                break
+            got += n
+        proc.stdout.close()
+        proc.wait()
+    return out[: got // stride]
+
+
+def _probe_frames(path: str, default: int = 8000) -> int:
+    """Frame count, so the buffer can be sized exactly rather than grown."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=300)
+        n = int(r.stdout.strip().split(",")[0])
+        return n if n > 0 else default
+    except Exception:
+        # A generous fallback: too large only wastes address space, since the
+        # array is trimmed to what actually arrived.
+        return default
 
 
 def capture_paths(row: dict, manifest: Path) -> tuple[Path, Path]:
@@ -94,9 +153,19 @@ def capture_paths(row: dict, manifest: Path) -> tuple[Path, Path]:
     return video, inputs
 
 
+MASKS = ("healing", "flash", "clamped")
+
+
 def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int,
-                cache_dir: Path | None = None):
+                cache_dir: Path | None = None, return_masks: bool = False):
     """-> (obs [D,S,S,3] uint8, actions [D,ticks,20] float32, labels [D,K] float32).
+
+    With ``return_masks`` a fourth array [D, 3] of bools is appended, holding
+    `read_trace`'s healing / flash / clamped flags at decision-step resolution.
+    These are not probe targets -- they are the frames where the HUD reading is
+    known to be untrustworthy, and anything asking "is the probe reliable here"
+    has to be able to exclude them. The end-of-match heal in particular is the
+    reason `rl/reward.py` discards positive health deltas outright.
 
     Decision step d corresponds to source frame ``d * frame_skip``: that is the
     contract `sokubot.data.soku` trains under, and getting it wrong here would
@@ -110,12 +179,25 @@ def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int,
     key = None
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        key = cache_dir / f"{video.parent.name}-{max_frames}-{skip}.npz"
+        # The target list is part of the key. `labels` has one column per entry
+        # of TARGETS, so a cache written before a target was added returns an
+        # array of the wrong width -- and because the columns that *are* present
+        # are still correct, the failure is a silent shift rather than a crash.
+        # That is the same shape as three of the bugs in docs/BUGS.md: an
+        # instrument that could not see the change reporting success.
+        tag = hashlib.sha256(",".join(TARGETS).encode()).hexdigest()[:8]
+        key = cache_dir / f"{video.parent.name}-{max_frames}-{skip}-{tag}.npz"
 
+    labels = chunks = masks = None
     if key is not None and key.exists():
         with np.load(key) as d:
-            labels, chunks = d["labels"], d["chunks"]
-    else:
+            # A cache written before masks existed is a miss rather than an
+            # error, so an older cache directory degrades to a recompute instead
+            # of taking down the run.
+            if "masks" in d or not return_masks:
+                labels, chunks = d["labels"], d["chunks"]
+                masks = d["masks"] if "masks" in d else None
+    if labels is None:
         hud = decode_hud(str(video), max_frames)
         if len(hud) < skip * 8:
             raise ValueError(f"only {len(hud)} frames decoded")
@@ -125,10 +207,11 @@ def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int,
         n = min(len(tr.hp1) // skip, len(acts_full) // skip)
         idx = np.arange(n) * skip
         labels = np.stack([getattr(tr, t)[idx] for t in TARGETS], axis=1).astype(np.float32)
+        masks = np.stack([getattr(tr, m)[idx] for m in MASKS], axis=1)
         chunks = np.stack([acts_full[d * skip : d * skip + skip]
                            for d in range(n)]).astype(np.float32)
         if key is not None:
-            np.savez_compressed(key, labels=labels, chunks=chunks)
+            np.savez_compressed(key, labels=labels, chunks=chunks, masks=masks)
 
     obs = list(decode_frames(video, cfg.image_size, skip))
     acts = None
@@ -139,6 +222,8 @@ def load_replay(video: Path, inputs: Path, cfg: Config, max_frames: int,
         D = min(D, max_frames // skip)
     if D < 16:
         raise ValueError(f"only {D} decision steps")
+    if return_masks:
+        return np.stack(obs[:D]), chunks[:D], labels[:D], masks[:D]
     return np.stack(obs[:D]), chunks[:D], labels[:D]
 
 
@@ -155,20 +240,47 @@ def encode_all(model: LeWorldModel, obs: np.ndarray, device: str,
 
 
 @torch.no_grad()
-def rollout_starts(model: LeWorldModel, Z: np.ndarray, A: np.ndarray,
+def rollout_starts(model, Z: np.ndarray, A: np.ndarray,
                    starts: np.ndarray, P: int, H: int, device: str,
-                   batch: int = 256) -> np.ndarray:
-    """-> [n_starts, P, latent] imagined latents under the true action sequence."""
+                   batch: int = 256, Hd: np.ndarray | None = None):
+    """-> [n_starts, P, latent] imagined latents under the true action sequence.
+
+    With an `AugmentedWorldModel` (arm B of the predictor fine-tune) the state is
+    [latent ; hud] and the rollout needs both halves, so `Hd` -- the bank's HUD
+    array, aligned row-for-row with `Z` -- becomes required. The return is then a
+    tuple `(latents, huds)`.
+
+    Dispatching on the model's type rather than on a flag: an augmented model
+    handed no HUD cannot run at all, and the alternative to a clear error here is
+    a `TypeError` from deep inside a rollout after the caller has already spent
+    twenty minutes decoding video.
+    """
+    from sokubot.model.augmented import AugmentedWorldModel
+    aug = isinstance(model, AugmentedWorldModel)
+    if aug and Hd is None:
+        raise ValueError(
+            "this is an AugmentedWorldModel, whose state is [latent ; hud], so "
+            "rollout_starts needs the bank's `hud` array too. Pass Hd=...")
     Zt = torch.from_numpy(Z).to(device)
     At = torch.from_numpy(A).to(device)
-    out = []
+    Ht = torch.from_numpy(Hd).to(device) if Hd is not None else None
+    out, out_h = [], []
     for i in range(0, len(starts), batch):
         s = torch.from_numpy(starts[i : i + batch]).to(device)
         off = torch.arange(H, device=device) - (H - 1)          # -(H-1) .. 0
         z_ctx = Zt[s[:, None] + off[None, :]]                   # [B,H,latent]
         a_hist = At[s[:, None] + off[None, :-1]]                # [B,H-1,ticks,A]
         a_plan = At[s[:, None] + torch.arange(P, device=device)[None, :]]
-        out.append(model.rollout(z_ctx, a_plan, a_hist).float().cpu().numpy())
+        if aug:
+            h_ctx = Ht[s[:, None] + off[None, :]].float()
+            z, h = model.rollout(z_ctx.float(), h_ctx, a_plan.float(),
+                                 a_hist.float())
+            out.append(z.float().cpu().numpy())
+            out_h.append(h.float().cpu().numpy())
+        else:
+            out.append(model.rollout(z_ctx, a_plan, a_hist).float().cpu().numpy())
+    if aug:
+        return np.concatenate(out), np.concatenate(out_h)
     return np.concatenate(out)
 
 
