@@ -251,6 +251,24 @@ AUC alone would have been misleading here, and nearly was: `down` scores AUC
 0.730 and precision 0.132. At a 0.35% base rate a good ranking is worth nothing
 on its own, which is the health detector's failure exactly.
 
+**At the horizon the baseline trains at, the health detector fires too RARELY,
+not too often.** Worth stating plainly because the 0.003-precision figure from
+`probe_reliability.py` points the other way and is easy to over-generalise: that
+was measured over long windows. In training at `--horizon 4` with
+`ko_persist = 3`, a KO needs three consecutive sub-threshold reads inside a
+four-step rollout, which essentially never happens. From the runs' own logs:
+
+| | `alive_frac` | ⇒ rollouts terminating |
+|---|---|---|
+| `grpo_bounded` (health KO) | 0.9999 | ~0.03% |
+| arm K (banner KO) | 0.9965 | ~0.93% |
+
+A KO occupies roughly 1% of 0.27 s windows, so the banner sits near the true rate
+while the health detector was about **35× too rare**. The consequence is sharper
+than "noisy": `win`/`lose` was contributing almost nothing to the baseline at
+all, so the agent was very nearly the outcome-indifferent thing that deleting the
+term would have produced. The banner is what makes the ±5 term exist.
+
 **And it survives the move into imagination**, which is a separate question and
 not a given: the channel is fitted on *encoder* latents but the reward reads it
 on *predictor* outputs, and those measurably drift.
