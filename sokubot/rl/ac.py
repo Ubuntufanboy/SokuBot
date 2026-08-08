@@ -60,27 +60,18 @@ class ACConfig(GRPOConfig):
     two_sided: bool = True
 
 
-def advantages_from_returns(lam_ret: torch.Tensor, value: torch.Tensor,
-                            alive: torch.Tensor, scale: str = "batch",
-                            eps: float = 1e-6) -> torch.Tensor:
-    """lambda-return minus the critic's estimate, normalised the way GRPO's was.
+def _batch_scale(adv: torch.Tensor, alive: torch.Tensor, scale: str,
+                 eps: float = 1e-6) -> torch.Tensor:
+    """Normalise per timestep, over live steps only.
 
-    `value` is v(s_t) for t = 0..T-1, i.e. `lam_ret`'s own states -- not the
-    bootstrap value, which has already been consumed inside the return.
-
-    The scaling is inherited from `group_advantages` and for the same reason
-    given there: dividing by a *per-timestep* batch spread rather than one scalar
-    keeps early and late steps comparable, since return-to-go shrinks as the
-    horizon runs out. Dead steps are excluded from the statistics -- they are
-    identically zero, and letting them into the standard deviation would shrink
-    it in proportion to how often trajectories terminate, quietly inflating the
-    advantage of every surviving trajectory as the policy got better at KOs.
+    Inherited from `group_advantages` and for the reason given there: dividing by
+    a *per-timestep* batch spread rather than one scalar keeps early and late
+    steps comparable, since return-to-go shrinks as the horizon runs out. Dead
+    steps are excluded from the statistics -- they are identically zero, and
+    letting them into the standard deviation would shrink it in proportion to how
+    often trajectories terminate, quietly inflating the advantage of every
+    surviving trajectory as the policy got better at KOs.
     """
-    if lam_ret.shape != value.shape:
-        raise ValueError(
-            f"lam_ret {tuple(lam_ret.shape)} and value {tuple(value.shape)} "
-            f"must match; value must be v(s_t) over the same steps")
-    adv = lam_ret - value
     if scale == "none":
         return adv * alive
     if scale != "batch":
@@ -90,3 +81,62 @@ def advantages_from_returns(lam_ret: torch.Tensor, value: torch.Tensor,
     mean = (adv * m).sum(dim=0, keepdim=True) / n
     var = (((adv - mean) ** 2) * m).sum(dim=0, keepdim=True) / n
     return ((adv - mean) / (var.sqrt() + eps)) * alive
+
+
+def group_centred_advantages(lam_ret: torch.Tensor, alive: torch.Tensor,
+                             group_size: int, scale: str = "batch",
+                             eps: float = 1e-6) -> torch.Tensor:
+    """Lambda-return centred within each group sharing a start, not against v(s).
+
+    THE MEASUREMENT THAT PUT THIS HERE
+    ----------------------------------
+    `scripts/baseline_quality.py`, on 256 starts x 16 rollouts at horizon 4:
+
+        var(lambda-return) total              8.51e-01
+          within a group (same start)         1.02e-03   <- the action-driven part
+          between starts                      8.50e-01
+        critic R^2 on the across-state mean     +0.385
+        noise per sample, critic vs group        21.8x
+
+    Only **0.12%** of return variance is anything the policy did. A group mean
+    removes the other 99.88% exactly, because every rollout in the group shares
+    the state. A critic removes it only as well as it predicts, and at R^2 0.385
+    the 61% it misses is still hundreds of times the signal.
+
+    So the plan's trade -- drop the group, spend the freed rollouts on more
+    distinct starts -- buys `group_size` times the coverage at 21.8x the noise
+    per sample. Arm A ran it for 1100 steps and moved `net` by nothing
+    (+-0.00005, against a +0.00147 baseline).
+
+    The critic is not discarded. It still supplies `v(s_H)` inside the
+    lambda-return, which is the part of Phase 2 that does real work: it is what
+    lets credit reach past the imagined horizon without the return having to
+    cover it. What it stops being is the *baseline*. Those are two separate jobs
+    and only one of them needed a learned function.
+    """
+    B, T = lam_ret.shape
+    if group_size < 1 or B % group_size:
+        raise ValueError(
+            f"{B} rollouts do not divide into groups of {group_size}")
+    g = lam_ret.view(-1, group_size, T)
+    centred = (g - g.mean(dim=1, keepdim=True)).reshape(B, T)
+    return _batch_scale(centred, alive, scale, eps)
+
+
+def advantages_from_returns(lam_ret: torch.Tensor, value: torch.Tensor,
+                            alive: torch.Tensor, scale: str = "batch",
+                            eps: float = 1e-6) -> torch.Tensor:
+    """lambda-return minus the critic's estimate, normalised the way GRPO's was.
+
+    `value` is v(s_t) for t = 0..T-1, i.e. `lam_ret`'s own states -- not the
+    bootstrap value, which has already been consumed inside the return.
+
+    Kept as the `--group 1` path and as the control arm, but see
+    `group_centred_advantages` for why it is not the default: as a baseline this
+    is measured to be 21.8x noisier than a group mean on this problem.
+    """
+    if lam_ret.shape != value.shape:
+        raise ValueError(
+            f"lam_ret {tuple(lam_ret.shape)} and value {tuple(value.shape)} "
+            f"must match; value must be v(s_t) over the same steps")
+    return _batch_scale(lam_ret - value, alive, scale, eps)

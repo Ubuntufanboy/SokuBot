@@ -76,3 +76,51 @@ def test_unknown_scale_is_rejected():
     with pytest.raises(ValueError, match="unknown scale"):
         advantages_from_returns(torch.zeros(2, 3), torch.zeros(2, 3),
                                 torch.ones(2, 3), scale="group")
+
+
+def test_group_centred_advantages_removes_state_variance_exactly():
+    """The property the whole design rests on: state luck cancels, actions don't.
+
+    Built so the two sources are separable by construction -- a large per-start
+    offset and a small per-rollout term. A group mean must delete the first
+    completely and keep the second, which is what makes it an *exact* conditional
+    baseline rather than a good one.
+    """
+    from sokubot.rl.ac import group_centred_advantages
+
+    torch.manual_seed(0)
+    S, G, T = 32, 8, 4
+    state = torch.randn(S, 1, T) * 10.0          # the 99.88%
+    action = torch.randn(S, G, T) * 0.1          # the 0.12%
+    lam_ret = (state + action).reshape(S * G, T)
+    alive = torch.ones(S * G, T)
+
+    adv = group_centred_advantages(lam_ret, alive, G, scale="none")
+    centred_action = (action - action.mean(dim=1, keepdim=True)).reshape(S * G, T)
+    assert torch.allclose(adv, centred_action, atol=1e-5)
+
+
+def test_group_centring_rejects_a_batch_that_does_not_divide():
+    from sokubot.rl.ac import group_centred_advantages
+
+    with pytest.raises(ValueError, match="do not divide"):
+        group_centred_advantages(torch.zeros(10, 4), torch.ones(10, 4), 4)
+
+
+def test_two_sided_concatenation_keeps_groups_intact():
+    """`cat` stacks the agent's rollouts then the opponent's, both group-major.
+
+    If either half were interleaved instead, the view(-1, G, T) inside the
+    centring would average across starts and the baseline would silently stop
+    being conditional -- with no error and a plausible-looking number.
+    """
+    from sokubot.rl.ac import group_centred_advantages
+
+    S, G, T = 4, 8, 2
+    mine = torch.arange(S).repeat_interleave(G).float()[:, None].expand(-1, T)
+    opp = mine + 100.0
+    both = torch.cat([mine, opp], dim=0).contiguous()
+    adv = group_centred_advantages(both, torch.ones_like(both), G, scale="none")
+    # Every rollout in a group has the identical return here, so a correct
+    # grouping centres all of them to exactly zero.
+    assert torch.allclose(adv, torch.zeros_like(adv), atol=1e-6)

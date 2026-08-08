@@ -59,7 +59,8 @@ import torch
 from sokubot.config import Config
 from sokubot.probe import LinearProbe
 from sokubot.model.loading import load_world_model
-from sokubot.rl.ac import ACConfig, advantages_from_returns
+from sokubot.rl.ac import (ACConfig, advantages_from_returns,
+                           group_centred_advantages)
 from sokubot.rl.critic import (SokuCritic, TargetCritic, continuation,
                                lambda_returns)
 from sokubot.rl.grpo import (EntropyFloor, GRPOConfig, ImaginedArena,
@@ -82,9 +83,18 @@ def main() -> int:
                     help="reuse a bank built by train_grpo; defaults to <out>/bank.npz")
     ap.add_argument("--steps", type=int, default=40_000)
     ap.add_argument("--horizon", type=int, default=16)
-    ap.add_argument("--starts", type=int, default=1024,
-                    help="rollouts per batch. With a critic there is no group, so "
-                         "this is also the number of distinct start states.")
+    ap.add_argument("--starts", type=int, default=256,
+                    help="distinct start states per batch. Total rollouts are "
+                         "--starts x --group.")
+    ap.add_argument("--group", type=int, default=8,
+                    help="rollouts sharing one start and side. The advantage is "
+                         "then the lambda-return centred within the group rather "
+                         "than against v(s), and the critic's job narrows to the "
+                         "bootstrap inside the return. --group 1 restores the "
+                         "critic-as-baseline form, which scripts/"
+                         "baseline_quality.py measures at 21.8x the noise per "
+                         "sample because only 0.12% of return variance is "
+                         "action-driven.")
     ap.add_argument("--bank-replays", type=int, default=200)
     ap.add_argument("--lr", type=float, default=1.5e-4)
     ap.add_argument("--critic-lr", type=float, default=3e-4)
@@ -231,10 +241,13 @@ def main() -> int:
     arena = ImaginedArena(wm, probe_head, acfg, cfg.history, cfg.action_ticks,
                           ood=ood)
     pool = SnapshotPool(acfg)
-    S, T = a.starts, a.horizon
+    S, G, T = a.starts, a.group, a.horizon
+    acfg.group_size = G
     print(f"policy {sum(p.numel() for p in policy.parameters())/1e6:.2f}M | "
           f"critic {sum(p.numel() for p in critic.parameters())/1e6:.2f}M | "
-          f"{S} rollouts x {T} steps | two_sided {acfg.two_sided}", flush=True)
+          f"{S} starts x {G} = {S * G} rollouts x {T} steps | "
+          f"baseline {'group mean' if G > 1 else 'critic v(s)'} | "
+          f"two_sided {acfg.two_sided}", flush=True)
 
     reference = copy.deepcopy(policy).eval()
     for p in reference.parameters():
@@ -296,6 +309,12 @@ def main() -> int:
     for step in range(1, a.steps + 1):
         idx = torch.from_numpy(rng.choice(starts, size=S)).to(a.device)
         side = torch.randint(0, 2, (S,), device=a.device)
+        # Every rollout in a group must share the start *and* the side, or the
+        # group mean stops being a conditional baseline and starts averaging over
+        # the probe's mirrored chair bias instead.
+        if G > 1:
+            idx = idx.repeat_interleave(G)
+            side = side.repeat_interleave(G)
         off = torch.arange(cfg.history, device=a.device) - (cfg.history - 1)
         z_ctx = Zt[idx[:, None] + off[None, :]].float()
         a_hist = At[idx[:, None] + off[None, :-1]].float()
@@ -335,8 +354,16 @@ def main() -> int:
                 reward = reward - acfg.ood.penalty * tr["ood_excess"]
             lam_ret = lambda_returns(reward, values, cont, a.gamma,
                                      a.lam * tr["lam_scale"])
-            adv = advantages_from_returns(lam_ret, v, tr["alive"],
-                                          scale=acfg.advantage_scale)
+            # With a group, the baseline is the group mean and the critic's only
+            # remaining job is the bootstrap already folded into `lam_ret`. The
+            # concatenated two-sided batch stays group-major in both halves, so
+            # the reshape inside finds 2*S groups of G rather than mixing chairs.
+            if G > 1:
+                adv = group_centred_advantages(lam_ret, tr["alive"], G,
+                                               scale=acfg.advantage_scale)
+            else:
+                adv = advantages_from_returns(lam_ret, v, tr["alive"],
+                                              scale=acfg.advantage_scale)
 
         # ---- critic: regress the lambda-return, on live steps only ----
         alive_flat = tr["alive"].reshape(-1)
