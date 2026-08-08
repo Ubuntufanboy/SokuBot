@@ -26,6 +26,7 @@ from ..data.hud import FRAME_HUD_CHANNELS
 from .action_encoder import ActionEncoder
 from .encoder import ViTEncoder
 from .predictor import LatentPredictor
+from .inverse_dynamics import InverseDynamicsHead
 
 
 N_HUD = len(FRAME_HUD_CHANNELS)
@@ -62,6 +63,11 @@ class LeWorldModel(nn.Module):
         # linear probe.
         self.hud_head = (nn.Linear(cfg.latent_dim, N_HUD)
                          if cfg.hud_coef > 0 else None)
+        # Reads a latent *transition* and names the buttons that caused it. See
+        # model/inverse_dynamics.py for why its gradient is allowed into the
+        # encoder when the counterfactual loss's deliberately is not.
+        self.idm_head = (InverseDynamicsHead(cfg, cfg.idm_width)
+                         if getattr(cfg, "idm_coef", 0.0) > 0 else None)
 
     # ---------------- training ----------------
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> ForwardOut:

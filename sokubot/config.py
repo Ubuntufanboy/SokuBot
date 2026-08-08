@@ -136,6 +136,22 @@ class Config:
     # 0.117 against hud.py's 0.012, a 10x degradation of information that is
     # present in its input. 0 disables the head entirely.
     hud_coef: float = 0.25
+    # Weight on recovering both players' buttons from a latent transition, with
+    # the gradient reaching the ENCODER. This is the term that decides what the
+    # representation keeps.
+    #
+    # `scripts/spatial_probe.py` measured the JEPA-only encoder at AUC 0.540 for
+    # "did the characters swap sides", against 0.956 for "did the HUD swap
+    # sides" -- position is absent, and blocking, dodging and spacing are all
+    # positional. Prediction alone prefers content that is *predictable*;
+    # inverse dynamics prefers content that is *controllable*, and the game
+    # lives in the second.
+    #
+    # Set at 1.0, i.e. co-primary with prediction rather than auxiliary, which is
+    # the whole point. `cf_coef` is a related idea deliberately detached from the
+    # encoder, and being detached is why it never fixed this.
+    idm_coef: float = 1.0
+    idm_width: int = 512
 
     # ---------------- optimisation ----------------
     lr: float = 5e-4

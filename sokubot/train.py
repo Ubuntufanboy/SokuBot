@@ -152,6 +152,20 @@ def compute_losses(
     # reads, and the cost is measured: the encoder degrades health to a residual
     # of 0.117 where data/hud.py reads 0.012 from the same pixels. Labels are free
     # and human-validated; see data/hud.read_frame_hud.
+    # ---- inverse dynamics: what the representation is FOR ----
+    # Prediction shapes the latent toward what is easy to predict, which is how
+    # position, spirit and projectiles were lost while health and the KO banner
+    # survived (spatial_probe: AUC 0.540 for the characters swapping sides
+    # against 0.956 for the HUD swapping sides). Naming the buttons that caused a
+    # transition requires keeping what distinguishes them, so this pulls the
+    # opposite way, and its gradient reaches the encoder on purpose.
+    l_idm = torch.zeros((), device=device)
+    idm_metrics: Dict[str, float] = {}
+    if getattr(cfg, "idm_coef", 0.0) > 0 and model.idm_head is not None:
+        from .model.inverse_dynamics import inverse_dynamics_loss
+        l_idm, idm_metrics = inverse_dynamics_loss(model.idm_head, out.z, actions)
+        total = total + cfg.idm_coef * l_idm
+
     l_hud = torch.zeros((), device=device)
     if cfg.hud_coef > 0 and "hud" in batch:
         hud = batch["hud"].to(device, non_blocking=True)       # [B, T, N_HUD]
@@ -171,6 +185,8 @@ def compute_losses(
             "l_pred": float(l_pred.item()),
             "l_sigreg": float(l_sig.item()),
             "l_cf": float(l_cf.item()),
+            "l_idm": float(l_idm.item()),
+            **idm_metrics,
             "cf_acc": float(cf_acc.item()) if cfg.cf_coef > 0 else 0.0,
             "l_hud": float(l_hud.item()),
             "latent_var": float(flat.var(dim=0).mean().item()),

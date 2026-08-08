@@ -59,15 +59,17 @@ def test_a_224_state_dict_loads_into_a_448_model():
 def test_auxiliary_losses_are_off_by_default_when_weights_are_zero():
     """Setting both to zero must reproduce the original objective exactly, so the
     320k-step run on record stays reproducible."""
-    cfg = Config.tiny(base=Config.soku(), cf_coef=0.0, hud_coef=0.0)
+    cfg = Config.tiny(base=Config.soku(), cf_coef=0.0, hud_coef=0.0,
+                      idm_coef=0.0)
     m = LeWorldModel(cfg)
     assert m.hud_head is None
+    assert m.idm_head is None
     B, T = 2, cfg.seq_len
     batch = {"obs": torch.randint(0, 255, (B, T, 3, cfg.image_size, cfg.image_size),
                                  dtype=torch.uint8),
              "actions": torch.rand(B, T, cfg.action_ticks, cfg.action_dim).round()}
     _, mets = compute_losses(m, batch, cfg)
-    assert mets["l_cf"] == 0.0 and mets["l_hud"] == 0.0
+    assert mets["l_cf"] == 0.0 and mets["l_hud"] == 0.0 and mets["l_idm"] == 0.0
     assert mets["loss"] == pytest.approx(
         mets["l_pred"] + cfg.lambda_sigreg * mets["l_sigreg"], rel=1e-5)
 
