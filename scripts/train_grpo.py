@@ -186,6 +186,12 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--uniform-init", action="store_true",
                     help="skip the corpus action prior and start uniform")
+    ap.add_argument("--ko-source", default="health", choices=("health", "banner"),
+                    help="where 'the match ended' comes from. 'health' is the "
+                         "probe threshold every recorded number was measured "
+                         "with, at precision 0.003. 'banner' reads the KNOCK OUT "
+                         "announcement from a probe channel at precision 0.844, "
+                         "and needs a probe fitted by scripts.fit_banner_channel.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -233,7 +239,16 @@ def main() -> int:
     # 0.16, barely covering that; at 0.020 it is 0.32, so standing still is
     # clearly unprofitable even when the model is wrong about why.
     rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
-                        flying=0.0015, idle=-0.020)
+                        flying=0.0015, idle=-0.020, ko_source=a.ko_source)
+    if a.ko_source == "banner" and "ko_banner" not in probe.names:
+        raise SystemExit(
+            f"--ko-source banner needs a probe with a ko_banner channel; "
+            f"{a.probe} has {probe.names}. Build one with "
+            f"scripts.fit_banner_channel.")
+    print(f"KO detector: {rcfg.ko_source}"
+          + (f" (threshold {rcfg.ko_banner_threshold}, margin {rcfg.ko_margin})"
+             if rcfg.ko_source == "banner" else " (probe health threshold)"),
+          flush=True)
     gcfg = GRPOConfig(horizon=a.horizon, group_size=a.group_size,
                       starts_per_batch=a.starts, lr=a.lr, reward=rcfg)
     if a.kl_ref_coef is not None:
