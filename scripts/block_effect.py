@@ -242,7 +242,8 @@ def main() -> int:
                     float((x[:, step] - y[:, step]).norm(dim=-1).mean()))
         c_mirr, l_mirr = cmp(z_true, z_mirr)
         c_none, l_none = cmp(z_true, z_none)
-        spread = float(z_true[:, step].std(0).mean())
+        # L2 yardstick for an L2 displacement; see train_full.
+        spread = float(z_true[:, step].std(0).norm())
     res["latent"] = {"cos_true_vs_mirrored": c_mirr, "l2_true_vs_mirrored": l_mirr,
                      "cos_true_vs_nodir": c_none, "l2_true_vs_nodir": l_none,
                      "latent_spread": spread}
@@ -278,9 +279,25 @@ def main() -> int:
     # This is a proxy either way -- pass --probe and let the health arms answer
     # the question that actually matters.
     mirror_frac = l_mirr / max(spread, 1e-9)
-    model_ok = (gap > 0) if out2 else (mirror_frac >= 0.10)
+    # Without the health arms there is NO pass/fail here any more. Two criteria
+    # were tried and both were wrong: the ratio to the no-direction displacement
+    # can be satisfied by the model going numb to direction entirely, and an
+    # absolute threshold was set against a mis-normalised number. The latent
+    # geometry is descriptive; the question is whether the model predicts
+    # guarding reduces damage, and only the probe answers that.
+    model_ok = (gap > 0) if out2 else None
     d_corpus = nt - 0.5 * (aw + tw)
-    if corpus_ok and model_ok:
+    if model_ok is None:
+        print(f"INCONCLUSIVE. The corpus shows defence ({d_corpus:.4f} less "
+              f"damage), and the\nlatent geometry is reported above for "
+              f"reference -- swapping LEFT and RIGHT moves\nthe prediction "
+              f"{mirror_frac:.3%} of the latent spread against "
+              f"{l_none / max(spread, 1e-9):.3%} for removing the\ndirection. "
+              f"But that is a proxy. Fit a reward probe on this encoder "
+              f"(scripts/\nhorizon_ablation.py) and re-run with --probe: the "
+              f"question is whether the model\npredicts guarding *reduces "
+              f"damage*, and nothing else settles it.")
+    elif corpus_ok and model_ok:
         detail = (f"the world model agrees ({gap:+.5f})" if out2 else
                   f"swapping LEFT and RIGHT moves the prediction "
                   f"{mirror_frac:.1%} of a\nlatent standard deviation "

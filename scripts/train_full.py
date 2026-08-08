@@ -80,7 +80,9 @@ def mirror_sensitivity(model: LeWorldModel, cache: dict, cfg: Config,
     compares a latent against itself.
 
     Reported as a fraction of the across-batch latent spread, because an L2 of
-    0.04 means nothing until you know the states being separated are 0.93 apart.
+    0.04 means nothing until you know how far apart the states being separated
+    are. Both quantities are L2s: mixing an L2 with a per-dimension std was an
+    actual bug here and inflated the number by sqrt(latent_dim).
     `full` mirrors everything including the HUD and is the ceiling: whatever the
     encoder can notice at all, it notices there.
 
@@ -104,7 +106,13 @@ def mirror_sensitivity(model: LeWorldModel, cache: dict, cfg: Config,
         play.append(model.encode(m_play)[:, 0])
         full.append(model.encode(m_full)[:, 0])
     z0 = torch.cat(base).float()
-    spread = float(z0.std(0).mean()) + 1e-9
+    # L2 over all dimensions, so the scale it is compared against must also be
+    # an L2. Dividing an L2 displacement by a *per-dimension* std overstates the
+    # ratio by sqrt(latent_dim) -- a factor of 13.86 at 192 dims -- which is how
+    # a mirror displacement got reported as "4.7x a standard deviation".
+    # `z0.std(0).norm()` is the RMS distance of a latent from the mean, which is
+    # the right yardstick for a distance.
+    spread = float(z0.std(0).norm()) + 1e-9
     out["mirror_play"] = float((torch.cat(play).float() - z0).norm(dim=-1).mean()) / spread
     out["mirror_full"] = float((torch.cat(full).float() - z0).norm(dim=-1).mean()) / spread
     out["latent_spread"] = spread
