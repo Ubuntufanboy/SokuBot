@@ -219,15 +219,20 @@ def main() -> int:
         arena = ImaginedArena(wm, probe_head, gcfg, cfg.history, cfg.action_ticks)
         print(f"\n=== horizon {H} ({H * cfg.frame_skip / 60:.2f} s) "
               f"{'=' * 40}", flush=True)
-        base = None
+        base = base_oc = None
         for name, pol in arms:
             r = score(arena, pol, reference, Zt, At, eval_idx, cfg, a.device)
             if base is None:
                 base = r["net"]
             row = {"horizon": H, "arm": name, **r, "net_over_control": r["net"] - base}
+            if "outcome" in r:
+                if base_oc is None:
+                    base_oc = r["outcome"]
+                row["outcome_over_control"] = r["outcome"] - base_oc
             res["rows"].append(row)
-            oc = (f" | win {r['win_rate']:.3%} lose {r['loss_rate']:.3%} "
-                  f"net-outcome {r['outcome']:+.3%}" if "outcome" in r else "")
+            oc = (f" | outcome {r['outcome']:+.3%} "
+                  f"(vs control {row['outcome_over_control']:+.3%})"
+                  if "outcome" in r else "")
             print(f"  {name:<22} net {r['net']:+.5f} "
                   f"(vs control {row['net_over_control']:+.5f}) | "
                   f"P1 {r['p1_dealt']:+.4f}/{r['p1_taken']:+.4f} "
