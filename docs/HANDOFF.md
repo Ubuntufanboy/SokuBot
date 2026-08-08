@@ -192,6 +192,105 @@ action-driven variance is only **3.2%** of across-state variance. The effect is
 
 ---
 
+## 3b. The representation was the blocker, and JEPA is why
+
+**This is the most consequential finding in the document.** Everything in §5's
+list of nulls — the critic, the longer horizon, the undecodable spirit and cards
+— sits downstream of it.
+
+### The agent never blocks, and the world model is why
+
+In Hisoutensoku, failing to guard is not suboptimal, it is fatal: a competent
+attacker converts one opening into the whole bar, and a match that should last
+minutes lasts seconds. The corpus is unambiguous that defence works — over 65k
+under-attack windows, a defender holding *some* horizontal direction takes
+**0.0371** damage against **0.0473** for holding none, 27% less.
+
+The world model had the sign **inverted** (`scripts/block_effect.py`): 0.01151
+predicted damage for the defender's true inputs against 0.00910 for no direction
+at all. And the latent test says why:
+
+| | cosine | L2 | as % of latent spread (0.931) |
+|---|---|---|---|
+| true vs **mirrored** (LEFT↔RIGHT swapped) | 0.99999 | 0.0429 | **4.6%** |
+| true vs no direction held | 0.99939 | 0.3453 | 37% |
+
+It registers *whether* a direction is held and almost not *which*. Blocking is
+entirely about which. So GRPO was faithfully optimising a model that reports
+guarding does not help — a complete mechanistic explanation, and it means **a
+blocking gym built on that model would efficiently teach the agent not to
+block.**
+
+### The encoder does not represent position at all
+
+`scripts/spatial_probe.py` mirrors the play area horizontally while holding the
+HUD fixed, and asks a linear probe to spot it. Held out by capture:
+
+| encoder | play-area mirror | full-frame (control) | identity (control) |
+|---|---|---|---|
+| JEPA, 225k steps, 224 px | **0.540** | 0.956 | 0.490 |
+| JEPA, 12k steps, 448 px | 0.599 | 0.947 | 0.505 |
+| **IDM, 4k steps, 224 px** | **0.764** | 0.981 | 0.504 |
+
+Both controls pass, so the measurement is sound: the JEPA encoder notices the
+health bars swapping ends instantly and cannot tell that the *characters* swapped
+sides. Position is not weakly held, it is absent — and blocking, dodging and
+spacing are all positional.
+
+**Resolution is not the variable.** 4× the pixels bought 0.06 AUC.
+
+### Why: JEPA predicts its own latent
+
+Encoder and predictor can jointly agree to represent only what is easy to
+predict, and still score a low loss. SIGReg prevents total collapse but says
+nothing about *which* content survives. Look at what did:
+
+| kept | dropped |
+|---|---|
+| health — large, slow, smooth (R² 0.88) | position — fast, input-dependent |
+| KO banner — half the screen (AUC 0.947) | spirit — 5×6 px (R² 0.036) |
+| | projectiles — small, fast, many |
+
+That is not an assortment of unrelated failures. It is precisely the set of
+things that are *hard to predict*, and dropping them **lowers** the loss. The
+objective rewarded the wrong thing, and per-variable patches were never going to
+converge on it.
+
+### Inverse dynamics inverts the pressure
+
+Naming the buttons that caused a transition requires keeping whatever
+distinguishes them — pose, position, contact. Where prediction prefers the
+*predictable*, inverse dynamics prefers the *controllable*, and the game lives in
+the second. The action vector spans **both** players, so the head must also
+recover what the opponent did, which closes the usual objection that
+inverse-dynamics representations discard everything the agent cannot control.
+
+The gradient must reach the **encoder**. `counterfactual_loss` takes `z`
+detached and explains why — letting it reshape the encoder "would hand it a
+second way to cheat" — which is right when prediction is the goal and exactly
+wrong when the latent has thrown away what the policy needs. That is also why
+`cf_coef`, on all along, never fixed this.
+
+Measured at matched steps, IDM is better on *every* axis, including the one it
+was expected to cost:
+
+| step | JEPA skill | JEPA inv_dyn_auc | | IDM skill | IDM inv_dyn_auc |
+|---|---|---|---|---|---|
+| ~4–5k | +0.1975 | 0.6676 | | **+0.2565** | **0.7202** |
+| ~8–10k | +0.3541 | 0.6658 | | **+0.4253** | **0.7216** |
+| ~16–20k | +0.5200 | 0.6873 | | **+0.5492** | 0.7053 |
+
+JEPA's best `inv_dyn_auc` anywhere in 225k steps is 0.7347.
+
+### What is gated on this
+
+`scripts/build_gyms.py` (186k `under_pressure` pairs) and
+`sokubot/rl/counterfactual.py` are both built and both **deliberately unused**
+until `block_effect` shows the model predicting that guarding reduces damage. On
+a model with the sign inverted they would teach the opposite, efficiently.
+
+---
+
 ## 4. What is settled
 
 **The world model is not invariant to controller inputs.** This was the central
@@ -556,7 +655,15 @@ forty minutes. Write the PID to a file and use `kill -0 $PID`.
 
 ---
 
-## 7. Do not retrain the world model, and check one thing first
+## 7. Retraining the world model — the advice here is now REVERSED
+
+**Read §3b first.** This section said "do not retrain, it costs 8+ hours and buys
+nothing". That was correct while the only lever was more steps of the same
+objective. It is wrong now: the JEPA objective is measured to drop character
+position entirely (mirror AUC 0.540), which is the root cause of the agent never
+blocking, and retraining with an inverse-dynamics term recovers it (0.764 at 4k
+steps). **Retraining is the work.** What follows is kept because the checkpoint
+comparison and the BatchNorm lesson still hold.
 
 `artifacts/ckpt/best.pt` is 225k steps at skill **+0.8642**, and
 `artifacts/ckpt_cf/best_bnfix.pt` is that model counterfactually fine-tuned to
