@@ -91,6 +91,12 @@ def main() -> int:
     ap.add_argument("--skip", type=int, default=4)
     ap.add_argument("--alpha", type=float, default=100.0)
     ap.add_argument("--out", type=Path, default=Path("banner_latent_probe.json"))
+    ap.add_argument("--label-cache", type=Path, default=None,
+                    help="npz of per-frame banner labels. Written on first run "
+                         "and reused after, because the native-resolution decode "
+                         "costs ~25 min and the probe itself costs seconds -- so "
+                         "re-asking a question of the same labels should not "
+                         "re-decode the corpus.")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -112,8 +118,19 @@ def main() -> int:
     np.random.default_rng(a.seed).shuffle(rows)
 
     counts = np.bincount(E)
-    labels, kept = [], 0
-    for r in rows:
+    cache_path = a.label_cache
+    if cache_path is not None and cache_path.expanduser().exists():
+        cd = np.load(cache_path.expanduser())
+        if int(cd["replays"]) != a.replays or int(cd["skip"]) != a.skip:
+            raise SystemExit(
+                f"{cache_path} holds {int(cd['replays'])} replays at skip "
+                f"{int(cd['skip'])}, not {a.replays} at {a.skip}")
+        y, kept = cd["y"], int(cd["replays"])
+        print(f"labels from cache: {len(y)} frames over {kept} replays")
+        labels = None
+    else:
+        labels, kept = [], 0
+    for r in (rows if labels is not None else []):
         if kept >= a.replays:
             break
         try:
@@ -134,7 +151,11 @@ def main() -> int:
         if kept % 5 == 0:
             print(f"   labelled {kept}/{a.replays}", flush=True)
 
-    y = np.concatenate(labels)
+    if labels is not None:
+        y = np.concatenate(labels)
+        if cache_path is not None:
+            np.savez(cache_path.expanduser(), y=y, replays=kept, skip=a.skip)
+            print(f"labels cached -> {cache_path}")
     n = len(y)
     Zs = Z[:n].astype(np.float32)
     print(f"\n{n} labelled decision steps over {kept} replays")
@@ -201,16 +222,55 @@ def main() -> int:
         print(f"  {c:<9} {int(t.sum()):5d}   {res['auc'][c]:9.4f}   "
               f"{ho:8.4f}")
 
+    # AUC is not the number the reward depends on. `knockout` is 1.4% of frames,
+    # and at that base rate a threshold-free ranking score of 0.95 is perfectly
+    # compatible with terrible precision -- which is exactly the failure the
+    # health-probe detector had (it ranked KOs fine and still fired 20-45x too
+    # often). So report the precision-recall curve on held-out replays and pick
+    # the operating point by F1.
+    print("\nheld-out precision/recall for the two classes the reward needs")
+    print("  class      best-F1 threshold: precision  recall  |  P@recall=0.80")
+    for c in ("knockout", "down"):
+        i = CLASSES.index(c)
+        t = (y == i).astype(np.float32)
+        if len(te) == 0 or t[te].sum() < 5 or t[tr].sum() < 5:
+            continue
+        s = X[te] @ fit(X[tr], t[tr])
+        tt = t[te]
+        order = np.argsort(-s)
+        tp = np.cumsum(tt[order])
+        prec = tp / np.arange(1, len(order) + 1)
+        rec = tp / max(tt.sum(), 1)
+        f1 = 2 * prec * rec / np.clip(prec + rec, 1e-9, None)
+        k = int(np.argmax(f1))
+        j = int(np.argmax(rec >= 0.80)) if (rec >= 0.80).any() else len(rec) - 1
+        res.setdefault("pr", {})[c] = {
+            "precision": float(prec[k]), "recall": float(rec[k]),
+            "f1": float(f1[k]), "precision_at_recall_80": float(prec[j]),
+            "base_rate": float(tt.mean())}
+        print(f"  {c:<9}                    {prec[k]:9.3f}  {rec[k]:6.3f}  |  "
+              f"{prec[j]:.3f}   (base rate {tt.mean():.3%})")
+
     ko = res["auc_heldout"].get("knockout", res["auc"].get("knockout"))
+    kp = res.get("pr", {}).get("knockout", {}).get("precision")
     print("\n" + "=" * 68)
     if ko is None:
         print("Not enough knockout frames in this sample to score. Raise "
               "--replays.")
+    elif ko > 0.9 and kp is not None and kp >= 0.5:
+        print(f"The latent carries it: KO AUC {ko:.3f} held out, precision "
+              f"{kp:.3f} at its\nbest-F1 threshold against a "
+              f"{res['pr']['knockout']['base_rate']:.2%} base rate. The health "
+              f"probe's detector runs\nat 0.003. So the terminal signal can be "
+              f"read inside imagination and\n`win`/`lose` can be wired to it "
+              f"without retraining the encoder.")
     elif ko > 0.9:
-        print(f"The latent carries it: KO AUC {ko:.3f} on **held-out replays**, "
-              f"from a\nlinear probe. So the terminal signal can be read inside "
-              f"imagination and\n`win`/`lose` can be wired to the banner without "
-              f"retraining the encoder.")
+        print(f"KO ranks well (AUC {ko:.3f} held out) but precision at the "
+              f"operating point is\n{kp if kp is not None else float('nan'):.3f} "
+              f"-- which is the health probe's failure exactly: a\ndetector can "
+              f"rank KOs correctly and still fire far too often at a 1.4% base\n"
+              f"rate. Do not pay +-5 on this yet; a supervised banner channel in "
+              f"the next\nworld-model run is the fix.")
     else:
         print(f"KO AUC {ko:.3f} held out. Nothing in the objective asks the "
               f"encoder to\ncarry a round-end announcement, so this is expected "
