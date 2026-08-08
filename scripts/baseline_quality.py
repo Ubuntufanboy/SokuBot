@@ -167,6 +167,42 @@ def main() -> int:
     print(f"  action share of total           {out['action_share']:.2%}"
           f"   (HANDOFF measured 3.2%)")
 
+    # ---- is the critic's bootstrap signal or noise? ----
+    # At horizon 4 the accumulated reward is ~0.009 while v(s_H) is ~0.07, so the
+    # lambda-return is roughly 86% bootstrap. Once the group mean is subtracted
+    # what survives is the *within-group* differences, and those now come from
+    # two places: four steps of real reward, and the critic's opinion of four
+    # different end states. If the second is approximation error rather than
+    # judgement, the bootstrap is diluting exactly the signal it was added to
+    # extend. The correlation against the plain discounted return says which.
+    with torch.no_grad():
+        plain = torch.zeros_like(tr["reward"])
+        run = torch.zeros(B, device=a.device)
+        for t in range(T - 1, -1, -1):
+            run = tr["reward"][:, t] + a.gamma * run * tr["alive"][:, t]
+            plain[:, t] = run
+    Pg = plain.sum(dim=1).view(S, G)
+    Pc = (Pg - Pg.mean(dim=1, keepdim=True)).flatten()
+    Lc = (Rg - Rg.mean(dim=1, keepdim=True)).flatten()
+    # With no critic v is identically 0, so the lambda-return *is* the plain
+    # return and the correlation would be a tautological 1.0.
+    corr = (float(torch.corrcoef(torch.stack([Pc, Lc]))[0, 1])
+            if critic is not None else float("nan"))
+    out["within_group_var_plain_return"] = float(Pg.var(dim=1, unbiased=False).mean())
+    out["bootstrap_alignment"] = corr
+    print(f"\n--- what the critic's bootstrap does inside a group ---")
+    print(f"within-group var, plain discounted return  "
+          f"{out['within_group_var_plain_return']:.6e}")
+    print(f"within-group var, lambda-return            {var_within:.6e}")
+    if critic is not None:
+        print(f"correlation between the two                {corr:+.3f}"
+              f"   (1.0 = the bootstrap adds nothing but scale)")
+        if corr < 0.5:
+            print(f"  LOW. Most of what the group baseline now sees is the "
+                  f"critic's opinion of\n  the end state, not four steps of "
+                  f"reward -- and at R^2 0.385 that opinion is\n  mostly "
+                  f"approximation error. The bootstrap is diluting the signal.")
+
     print(f"\n--- what each baseline leaves in the advantage ---")
     print(f"group mean   residual var {var_within:.6e}  SNR 1.00  (exact by "
           f"construction)")
