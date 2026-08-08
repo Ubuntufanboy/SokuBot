@@ -258,12 +258,26 @@ def main() -> int:
         print("Not enough knockout frames in this sample to score. Raise "
               "--replays.")
     elif ko > 0.9 and kp is not None and kp >= 0.5:
-        print(f"The latent carries it: KO AUC {ko:.3f} held out, precision "
-              f"{kp:.3f} at its\nbest-F1 threshold against a "
-              f"{res['pr']['knockout']['base_rate']:.2%} base rate. The health "
-              f"probe's detector runs\nat 0.003. So the terminal signal can be "
-              f"read inside imagination and\n`win`/`lose` can be wired to it "
-              f"without retraining the encoder.")
+        pr = res["pr"]["knockout"]
+        dn = res.get("pr", {}).get("down", {})
+        print(f"KNOCKOUT is usable: precision {kp:.3f} at recall "
+              f"{pr['recall']:.3f}, against a\n{pr['base_rate']:.2%} base rate "
+              f"and the health detector's precision of 0.003.\n"
+              f"`win`/`lose` can be wired to this without retraining the "
+              f"encoder.\n\n"
+              f"Run it at THIS operating point, not a higher-recall one: "
+              f"precision falls to\n{pr['precision_at_recall_80']:.3f} at recall "
+              f"0.80. Missing half the KOs costs a bonus that is\nnot paid; a "
+              f"false KO pays +-5 and masks the rest of the trajectory. The "
+              f"errors\nare not symmetric and the threshold should not be "
+              f"either.")
+        if dn and dn.get("precision", 0) < 0.5:
+            print(f"\nDOWN is NOT usable: precision {dn['precision']:.3f}. The "
+                  f"pixel classifier reads it at\n0.857, so the information "
+                  f"exists in the frame and simply is not in the latent --\n"
+                  f"which is what a supervised banner channel in the next "
+                  f"world-model run would\nfix. Round-end reward stays off until "
+                  f"then.")
     elif ko > 0.9:
         print(f"KO ranks well (AUC {ko:.3f} held out) but precision at the "
               f"operating point is\n{kp if kp is not None else float('nan'):.3f} "

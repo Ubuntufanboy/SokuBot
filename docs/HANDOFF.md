@@ -222,6 +222,35 @@ And the classifier only sees candidates that already passed
 precision coming from the classifier — so the deployed rate is the product of the
 two, not this number alone. Model at `artifacts/banner/`.
 
+**And the latent carries KNOCKOUT, so it works inside imagination — but only
+knockout.** A pixel CNN cannot fire in a rollout, where there are no pixels. So
+the classifier was used to label 65 599 decision steps across 24 replays, and a
+**linear** probe fit on the existing 224 encoder's latents, held out **by
+replay**:
+
+| class | AUC (held out) | precision | recall | P @ recall 0.80 | base rate |
+|---|---|---|---|---|---|
+| **knockout** | **0.947** | **0.803** | 0.487 | 0.190 | 1.54% |
+| round | 0.976 | — | — | — | 2.17% |
+| down | 0.730 | **0.132** | 0.117 | 0.004 | 0.35% |
+
+**`win`/`lose` can be switched on**, against the health detector's precision of
+0.003 — a 268× improvement — with no encoder retraining. Two conditions:
+
+* **Hold the conservative operating point.** Precision collapses to 0.190 at
+  recall 0.80. The errors are not symmetric: a missed KO forgoes a bonus, while a
+  false KO pays ±5 *and* masks the rest of the trajectory. Recall 0.487 is the
+  right trade.
+* **Round-end reward stays off.** `down` reads at precision 0.132 from the
+  latent, though the *pixel* classifier gets 0.857 — so the information is in the
+  frame and simply is not in the latent. That is the case for a supervised banner
+  channel alongside `hud_coef`'s in the next world-model run, not for a cleverer
+  probe.
+
+AUC alone would have been misleading here, and nearly was: `down` scores AUC
+0.730 and precision 0.132. At a 0.35% base rate a good ranking is worth nothing
+on its own, which is the health detector's failure exactly.
+
 **Bounded logits stop the collapse.** Four GRPO runs died identically — entropy
 to 0.000, press rate 0.53, KL-to-reference 10¹⁴. Squashing logits to (−6, 6)
 made that impossible and produced the best result yet:
