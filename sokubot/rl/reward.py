@@ -53,6 +53,11 @@ import torch.nn.functional as F
 
 # Column order of the probe's output, fixed by scripts/horizon_ablation.py.
 HP1, HP2, SPIRIT1, SPIRIT2, COMBO1, COMBO2 = range(6)
+# Appended by scripts/fit_banner_channel.py, after cards1/cards2. Read by index
+# rather than by name because `ProbeHead` hands `compute_rewards` a bare tensor;
+# the fitter writes the probe's `names` array and refuses to append if the
+# position it would land in is not this one.
+KO_BANNER = 8
 
 # Button offsets within one player's 10-wide block (see data/soku.py).
 UP, DOWN, LEFT, RIGHT, A, B, C, D, CHANGE, SPELL = range(10)
@@ -118,6 +123,49 @@ class RewardConfig:
     ko_persist: int = 3
     ko_alive_margin: float = 0.10
 
+    # Where "the match ended" comes from.
+    #
+    #   "health"  the threshold test above. Measured at precision **0.003** by
+    #             `scripts/probe_reliability.py` -- twenty to forty-five false
+    #             fires per real KO, each paying +-5 against damage worth ~0.1
+    #             and masking the rest of the trajectory. Kept as the default so
+    #             every recorded number stays reproducible, not because it works.
+    #
+    #   "banner"  a probe channel trained on the KNOCK OUT banner the game draws
+    #             across the screen. Precision **0.803** at recall 0.487 on
+    #             held-out replays (`scripts/banner_latent_probe.py`), i.e. 268x
+    #             the health detector.
+    #
+    # THE SPLIT THAT MAKES THIS WORK
+    # ------------------------------
+    # The banner says the match ended. It does *not* say who won -- the glyphs
+    # are the same whoever lost. So the two questions go to different
+    # instruments, each where it is strong:
+    #
+    #   *when*  from the banner, because detecting a drawn event is what it is
+    #           good at;
+    #   *who*   from sign(my health - their health), because that is a
+    #           **difference** and the probe's error is largely common-mode. The
+    #           absolute test needs |error| < 0.06 against a residual of 0.116
+    #           and loses. The comparison only needs the sign of a gap that is
+    #           half a bar wide at a KO, and wins comfortably.
+    #
+    # Which is the point: the failing test was never "can the latent see a KO",
+    # it was "can it resolve an absolute health level to a twentieth of a bar".
+    # It cannot, and for this purpose it does not have to.
+    ko_source: str = "health"
+    # Probability above which the banner channel counts as lit. Set from the
+    # best-F1 operating point and deliberately conservative: precision falls from
+    # 0.803 to 0.190 if recall is pushed to 0.80, and the errors are not
+    # symmetric -- a missed KO forgoes a bonus, a false KO pays +-5 and masks
+    # everything after it.
+    ko_banner_threshold: float = 0.5
+    # How far apart the two health readings must be before a winner is called.
+    # Below this the banner is still believed for termination, but no outcome is
+    # scored: a KO the probe cannot attribute is worth nothing, and a coin flip
+    # at +-5 is worth rather less than nothing.
+    ko_margin: float = 0.10
+
     # A spirit drop this large at a card press means a card actually went off.
     # One orb is 0.2 of the gauge; a real cast spends at least one. Set above 1.0
     # to disable card detection entirely, which is correct wherever spirit is not
@@ -165,6 +213,66 @@ def ko_mask(hp: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
     return (down * started_alive).bool()
 
 
+def banner_ko_masks(states: torch.Tensor, side: torch.Tensor,
+                    cfg: RewardConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """[B, T+1] probed state -> (I am KO'd, they are KO'd), each [B, T].
+
+    The banner answers *when*; the health comparison answers *who*. See
+    `RewardConfig.ko_source` for why those are two different instruments.
+
+    The persistence requirement carries over from `ko_mask` and does the same
+    job for the same reason: the banner probe's false positives are roughly
+    independent across steps while a real banner is drawn for about two seconds,
+    so requiring `ko_persist` consecutive lit steps costs almost no true
+    detections and removes most of the isolated ones.
+
+    Both outputs are False where the margin is too small to attribute the loss.
+    That is not a fudge: the alternative is paying +-5 on the sign of a
+    difference smaller than the probe's own noise, which is a coin flip with a
+    five-bar stake.
+    """
+    if states.shape[-1] <= KO_BANNER:
+        raise ValueError(
+            f"ko_source='banner' needs a probe with at least {KO_BANNER + 1} "
+            f"channels, got {states.shape[-1]}. Fit one with "
+            f"scripts/fit_banner_channel.py.")
+    lit = (states[..., KO_BANNER][:, 1:] >= cfg.ko_banner_threshold).float()
+    if cfg.ko_persist > 1:
+        k = cfg.ko_persist
+        pad = torch.zeros(states.shape[0], k - 1, device=states.device)
+        run = F.avg_pool1d(torch.cat([lit, pad], dim=1)[:, None], k, 1)[:, 0]
+        lit = (run >= 1.0 - 1e-6).float()
+
+    mine_hp, thr_hp, _, _ = _sides(states, side)
+    gap = (mine_hp - thr_hp)[:, 1:]
+    decided = (gap.abs() >= cfg.ko_margin).float()
+    # Same "started alive" guard as the health detector, for the same reason: a
+    # rollout that begins at the tail of someone else's KO must not be paid for
+    # it. Read from the banner rather than from health, so it does not reinherit
+    # the absolute-level test this exists to replace.
+    began_clear = (states[..., KO_BANNER][:, :1] < cfg.ko_banner_threshold).float()
+
+    i_lost = lit * decided * began_clear * (gap < 0).float()
+    they_lost = lit * decided * began_clear * (gap > 0).float()
+    return i_lost.bool(), they_lost.bool()
+
+
+def ko_masks(states: torch.Tensor, side: torch.Tensor,
+             cfg: RewardConfig) -> tuple[torch.Tensor, torch.Tensor]:
+    """(I am KO'd, they are KO'd), from whichever detector `cfg.ko_source` names.
+
+    One dispatch point, used by both `terminal_mask` and `compute_rewards`, so
+    the two can never disagree about whether the match ended -- a split that
+    would pay a match outcome on one step and keep the trajectory alive past it.
+    """
+    if cfg.ko_source == "health":
+        mine_hp, thr_hp, _, _ = _sides(states, side)
+        return ko_mask(mine_hp, cfg), ko_mask(thr_hp, cfg)
+    if cfg.ko_source == "banner":
+        return banner_ko_masks(states, side, cfg)
+    raise ValueError(f"unknown ko_source {cfg.ko_source!r}; want health or banner")
+
+
 def terminal_mask(states: torch.Tensor, side: torch.Tensor,
                   cfg: RewardConfig | None = None) -> torch.Tensor:
     """[B, T+1] probed states -> [B, T] "the episode *ends* at this step".
@@ -180,8 +288,8 @@ def terminal_mask(states: torch.Tensor, side: torch.Tensor,
     difference explicit instead of guessed.
     """
     cfg = cfg or RewardConfig()
-    mine_hp, thr_hp, _, _ = _sides(states, side)
-    ko_any = ko_mask(mine_hp, cfg) | ko_mask(thr_hp, cfg)
+    ko_me, ko_them = ko_masks(states, side, cfg)
+    ko_any = ko_me | ko_them
     T = ko_any.shape[1]
     dev = states.device
     first = torch.where(ko_any.any(1), ko_any.float().argmax(1),
@@ -221,7 +329,7 @@ def compute_rewards(
     btn = _my_buttons(actions, side)                       # [B,T,ticks,10]
 
     # ---- termination: everything after the first KO is masked out ----
-    ko_me, ko_them = ko_mask(mine_hp, cfg), ko_mask(thr_hp, cfg)
+    ko_me, ko_them = ko_masks(states, side, cfg)
     ko_any = ko_me | ko_them
     first_ko = torch.where(ko_any.any(1), ko_any.float().argmax(1),
                            torch.full((B,), T - 1, device=dev))
