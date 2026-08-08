@@ -474,6 +474,38 @@ python -m scripts.eval_ckpt --ckpt ~/sokubot-art/wm_225k_best.pt  --val ~/corpus
 python -m scripts.eval_ckpt --ckpt ~/sokubot-art/wm_320k_final.pt --val ~/corpus/val.pt
 ```
 
+### Retraining at 448: halve the learning rate, and read the eval as noisy
+
+The 224 → 448 move (because captures are 480×480 and 224 threw away 4.6× the
+pixels — spirit hexagons are 5×6 px and arrive as ~3) needs one change that is
+not obvious, and one habit.
+
+**`--lr 1e-4`, not the 2e-4 that was healthy at 224.** At patch 14, 448 px is
+**1024 patches against 256**, so the same learning rate arrives four times
+hotter. Measured at step 4000, warm-started from `wm_cf_bnfix.pt`, everything
+else identical:
+
+| | val | skill |
+|---|---|---|
+| `--lr 2e-4` | 0.2657 | **−3.08** |
+| `--lr 1e-4` | 0.0229 | **+0.6571** |
+
+The 2e-4 run reproduced the signature of the earlier run that diverged at 5e-4 —
+training loss falling while held-out loss bounced — which is what identified it.
+
+**The eval is noisy; do not read a trend off three points.** Held-out skill at
+lr 1e-4 went +0.657 → +0.304 → +0.024 → +0.650 → +0.508 → −0.543 → +0.606. The
+first three of those look like a clean monotone collapse and are not; a restart
+on that reading would have thrown away a healthy run. Only 512 val windows, plus
+a BatchNorm recalibration per eval, so the sampling error is large. Judge on the
+best-checkpoint envelope over many evals, and note that `on_eval` already keeps
+`best.pt` by skill, so a bad eval costs nothing.
+
+**Warm-starting works.** 224/225 tensors transfer; only `encoder.pos_embed` is
+re-gridded (16×16 → 32×32, bicubic) and `hud_head` is fresh. That is why skill
+starts near +0.65 rather than climbing from zero as the original run did
+(+0.1975 at step 5000).
+
 ---
 
 ## 8. The constraint that shapes everything
