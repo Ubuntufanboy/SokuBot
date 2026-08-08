@@ -251,6 +251,27 @@ AUC alone would have been misleading here, and nearly was: `down` scores AUC
 0.730 and precision 0.132. At a 0.35% base rate a good ranking is worth nothing
 on its own, which is the health detector's failure exactly.
 
+**And it survives the move into imagination**, which is a separate question and
+not a given: the channel is fitted on *encoder* latents but the reward reads it
+on *predictor* outputs, and those measurably drift.
+`scripts/banner_in_imagination.py`, at threshold 0.20:
+
+| | fire rate | mean | p99 |
+|---|---|---|---|
+| imagined rollout states | 2.11% | 0.0196 | 0.253 |
+| real encoder latents | 1.06% | 0.0173 | 0.217 |
+| true `knockout` base rate | 1.44% | | |
+
+Imagination inflates the detector **2×**. Even taking every extra fire as
+spurious, imagined precision is ~0.42 against the health detector's 0.003. Worth
+re-running whenever the world model changes — a reward term that is silently
+zero and a reward term that is absent produce the same training curve.
+
+The threshold itself is not 0.5, which is what it looks like it should be. The
+channel is a ridge fit to a 1.4% positive class, so its output compresses toward
+zero and never reaches a half; at 0.5 the detector fires **zero** times. Measured
+operating points are in `RewardConfig.ko_banner_threshold`.
+
 **Bounded logits stop the collapse.** Four GRPO runs died identically — entropy
 to 0.000, press rate 0.53, KL-to-reference 10¹⁴. Squashing logits to (−6, 6)
 made that impossible and produced the best result yet:
