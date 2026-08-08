@@ -10,6 +10,25 @@ Layout note: files pulled in the first sync sit at the top level
 
 ---
 
+## Banner classifier — the KO trigger
+
+| file | what it is |
+|---|---|
+| `banner/banner.pt` | 60 k-param CNN over a fixed centre-band crop, 6 classes (`none`/`round`/`start`/`down`/`knockout`/`other`). Trained on 120 hand labels from 29 replays. Out-of-fold, split **by capture**, 5 seeds: **knockout precision 0.857, recall 0.750**; `none` misread as a banner 6.0%. |
+| `banner/report.json` | The confusion matrix and per-class figures behind that row. |
+
+Why it exists: the reward's KO detector reads probed health and runs at
+precision **0.003**. The game announces the event in letters half a screen wide,
+and reading the announcement is a far easier problem than inferring the state
+that caused it. Reproduce with `scripts/train_banner.py`; the labels live in
+`SokuBot/banners_label/`.
+
+Not by itself enough — imagination has no pixels, so the reward needs a *latent*
+readout. `scripts/banner_latent_probe.py` measures whether the encoder already
+carries it (KO AUC 0.947 on held-out replays, linear probe).
+
+---
+
 ## World models — the irreplaceable ones
 
 All are `LeWorldModel`: ViT-Tiny encoder (patch 14, 12L, 3H, dim 192) → `[CLS]`
