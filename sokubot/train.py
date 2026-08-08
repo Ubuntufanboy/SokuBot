@@ -316,9 +316,16 @@ def train(
         if callback and callback_every and (step + 1) % callback_every == 0:
             callback(model, step + 1, history)
         if verbose and metrics and (step % log_every == 0 or step == steps - 1):
+            # `idm_acc` is shown only when the term is active, so runs without it
+            # keep their existing line format. It is shown *at all* because the
+            # first inverse-dynamics run printed loss, pred and sigreg and left
+            # the one quantity the run existed to move invisible until the eval.
+            extra = (f"| idm {metrics['idm_acc']:5.3f} "
+                     if "idm_acc" in metrics else "")
             print(
                 f"step {step:6d} | loss {metrics['loss']:8.4f} "
                 f"| pred {metrics['l_pred']:7.4f} | sigreg {metrics['l_sigreg']:7.4f} "
+                f"{extra}"
                 f"| var {metrics['latent_var']:6.3f} | erank {metrics['eff_rank']:7.2f} "
                 f"| {(time.time() - t0) / (step + 1):5.2f}s/it"
             )
