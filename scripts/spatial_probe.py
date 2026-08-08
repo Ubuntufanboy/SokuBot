@@ -199,10 +199,18 @@ def main() -> int:
               f"reward can recover it. Grounding the\nlatent with supervision is "
               f"mandatory, and if that fails the architecture is\nimplicated.")
     else:
-        print(f"Partial: {play:.3f} against a {full:.3f} ceiling. The information "
-              f"is present but\nweakly linearly available -- consistent with an "
-              f"encoder that keeps position\nonly as far as predicting the next "
-              f"frame required.")
+        # Deliberately does not name a cause. The first version of this branch
+        # explained a partial score as "an encoder that keeps position only as
+        # far as predicting the next frame required", which is a JEPA story --
+        # and the first model to land in this branch was an inverse-dynamics one,
+        # where that explanation is simply wrong. A verdict that asserts a
+        # mechanism it did not measure is worse than one that reports the number.
+        print(f"Partial: {play:.3f} against a {full:.3f} ceiling. Position is "
+              f"present and only\npartly available to a linear read. Compare "
+              f"against other checkpoints of the\nsame objective before "
+              f"concluding anything: 0.540 is the JEPA-only encoder at\n225k "
+              f"steps, so anything well above that is the objective working, and "
+              f"the\nremaining gap to the ceiling may just be training time.")
     a.out.write_text(json.dumps(res, indent=1))
     print(f"\n-> {a.out}")
     return 0
