@@ -140,6 +140,56 @@ def _sides(states: torch.Tensor, side: torch.Tensor):
     return mine_hp, thr_hp, mine_sp, thr_cb
 
 
+def ko_mask(hp: torch.Tensor, cfg: RewardConfig) -> torch.Tensor:
+    """[B, T+1] probed health -> [B, T] "this side is KO'd from here".
+
+    Down for `ko_persist` consecutive steps, having started alive.
+
+    Module-level rather than a closure inside `compute_rewards` so that anything
+    auditing the detector -- `scripts/probe_reliability.py` measures its false
+    positive and false negative rates against true HUD health -- tests the
+    detector the reward actually uses instead of a reimplementation that can
+    drift away from it.
+    """
+    B, dev = hp.shape[0], hp.device
+    down = (hp[:, 1:] <= cfg.ko_threshold).float()
+    if cfg.ko_persist > 1:
+        k = cfg.ko_persist
+        # Pad with "not down". A KO within k steps of the end is therefore
+        # missed rather than assumed, which is the right way to be wrong:
+        # the alternative pays +-5 for a single noisy read at the boundary.
+        pad = torch.zeros(B, k - 1, device=dev)
+        run = F.avg_pool1d(torch.cat([down, pad], dim=1)[:, None], k, 1)[:, 0]
+        down = (run >= 1.0 - 1e-6).float()
+    started_alive = (hp[:, :1] > cfg.ko_threshold + cfg.ko_alive_margin).float()
+    return (down * started_alive).bool()
+
+
+def terminal_mask(states: torch.Tensor, side: torch.Tensor,
+                  cfg: RewardConfig | None = None) -> torch.Tensor:
+    """[B, T+1] probed states -> [B, T] "the episode *ends* at this step".
+
+    Distinct from `alive`, and the distinction is not cosmetic. `alive` is 1 up
+    to and including the KO step, so it cannot tell a KO that lands on the final
+    step of a rollout from a rollout that simply ran out of horizon. Those need
+    opposite treatment when bootstrapping: a terminal state must not carry value
+    across the boundary, while a truncated one must, because the episode really
+    does continue and the critic's estimate of what follows is the whole point.
+
+    Reading it from the KO masks rather than inferring it from `alive` makes the
+    difference explicit instead of guessed.
+    """
+    cfg = cfg or RewardConfig()
+    mine_hp, thr_hp, _, _ = _sides(states, side)
+    ko_any = ko_mask(mine_hp, cfg) | ko_mask(thr_hp, cfg)
+    T = ko_any.shape[1]
+    dev = states.device
+    first = torch.where(ko_any.any(1), ko_any.float().argmax(1),
+                        torch.full((states.shape[0],), T, device=dev))
+    steps = torch.arange(T, device=dev)[None, :]
+    return (steps == first[:, None]).float()
+
+
 def _my_buttons(actions: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
     """[B,T,ticks,20] -> [B,T,ticks,10] for the side the agent controls."""
     B = actions.shape[0]
@@ -171,21 +221,7 @@ def compute_rewards(
     btn = _my_buttons(actions, side)                       # [B,T,ticks,10]
 
     # ---- termination: everything after the first KO is masked out ----
-    def _ko(hp: torch.Tensor) -> torch.Tensor:
-        """Down for `ko_persist` consecutive steps, having started alive."""
-        down = (hp[:, 1:] <= cfg.ko_threshold).float()
-        if cfg.ko_persist > 1:
-            k = cfg.ko_persist
-            # Pad with "not down". A KO within k steps of the end is therefore
-            # missed rather than assumed, which is the right way to be wrong:
-            # the alternative pays +-5 for a single noisy read at the boundary.
-            pad = torch.zeros(B, k - 1, device=dev)
-            run = F.avg_pool1d(torch.cat([down, pad], dim=1)[:, None], k, 1)[:, 0]
-            down = (run >= 1.0 - 1e-6).float()
-        started_alive = (hp[:, :1] > cfg.ko_threshold + cfg.ko_alive_margin).float()
-        return (down * started_alive).bool()
-
-    ko_me, ko_them = _ko(mine_hp), _ko(thr_hp)
+    ko_me, ko_them = ko_mask(mine_hp, cfg), ko_mask(thr_hp, cfg)
     ko_any = ko_me | ko_them
     first_ko = torch.where(ko_any.any(1), ko_any.float().argmax(1),
                            torch.full((B,), T - 1, device=dev))
