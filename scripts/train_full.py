@@ -113,9 +113,24 @@ def mirror_sensitivity(model: LeWorldModel, cache: dict, cfg: Config,
     # `z0.std(0).norm()` is the RMS distance of a latent from the mean, which is
     # the right yardstick for a distance.
     spread = float(z0.std(0).norm()) + 1e-9
-    out["mirror_play"] = float((torch.cat(play).float() - z0).norm(dim=-1).mean()) / spread
-    out["mirror_full"] = float((torch.cat(full).float() - z0).norm(dim=-1).mean()) / spread
+    zp, zf = torch.cat(play).float(), torch.cat(full).float()
+    out["mirror_play"] = float((zp - z0).norm(dim=-1).mean()) / spread
+    out["mirror_full"] = float((zf - z0).norm(dim=-1).mean()) / spread
     out["latent_spread"] = spread
+
+    # Displacement is NOT decodability, and selecting on it picked the wrong
+    # checkpoint: at step 4000 mirror_play was 4.704 with a probe AUC of 0.7446,
+    # and at 36000 it was 5.163 with an AUC of 0.6903. The latent moved further
+    # and became *less* separable.
+    #
+    # What a linear probe needs is for the displacement to point the same way
+    # every time. So this measures the consistency of the mirror direction: the
+    # norm of the mean displacement over the mean of the norms. 1.0 means every
+    # sample moves identically (trivially separable), 0 means the directions
+    # cancel (nothing to read). No fitting, no held-out split, and unlike a
+    # probe it cannot be inflated by memorising the val cache.
+    d = zp - z0
+    out["mirror_align"] = float(d.mean(0).norm() / (d.norm(dim=-1).mean() + 1e-9))
     return out
 
 
@@ -382,17 +397,19 @@ def main() -> None:
         # disagree: the first inverse-dynamics run peaked on mirror_play at step
         # 4000 and on skill at the end, and keeping only the skill-best threw
         # away the checkpoint that was best at the thing the agent needs.
-        if healthy and ev is healthy[-1] and ev["mirror_play"] >= max(
-                c.get("mirror_play", -1.0) for c in healthy):
+        # Selected on alignment, not displacement -- see mirror_sensitivity.
+        if healthy and ev is healthy[-1] and ev["mirror_align"] >= max(
+                c.get("mirror_align", -1.0) for c in healthy):
             torch.save({"model": eval_sd, "cfg": cfg, "step": step,
                         "eval": ev, "bn_recalibrated": True},
                        Path(args.ckpt_dir) / "best_spatial.pt")
-            print(f"  saved best_spatial.pt (mirror_play "
-                  f"{ev['mirror_play']:.3f} at step {step})", flush=True)
+            print(f"  saved best_spatial.pt (mirror_align "
+                  f"{ev['mirror_align']:.3f} at step {step})", flush=True)
         print(f"  [eval] step {step:6d} | train {ev['train_pred']:.4f} "
               f"| val {ev['val_pred']:.4f} | identity {ev['identity']:.4f} "
               f"| skill {ev['skill']:+.4f} | AUC {ev['inv_dyn_auc']:.4f} "
-              f"| mirror {ev['mirror_play']:.3f}/{ev['mirror_full']:.3f} "
+              f"| mirror {ev['mirror_play']:.2f}/{ev['mirror_full']:.2f} "
+              f"align {ev['mirror_align']:.3f} "
               f"| var {ev['latent_var']:.3f} | {ev['elapsed_h']:.2f}h elapsed, "
               f"{ev['eta_h']:.2f}h left", flush=True)
 
