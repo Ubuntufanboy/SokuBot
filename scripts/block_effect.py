@@ -261,16 +261,30 @@ def main() -> int:
 
     print("\n" + "=" * 70)
     corpus_ok = nt > max(aw, tw)          # holding a direction beats holding none
-    # With no probe the health arms are absent, so the latent test decides:
-    # does swapping LEFT and RIGHT move the prediction at all, relative to
-    # removing the direction entirely? JEPA scored 0.0429 against 0.3453.
-    model_ok = (gap > 0) if out2 else (l_mirr > 0.5 * l_none)
+    # With no probe the health arms are absent and the latent test has to
+    # decide. The obvious criterion -- mirrored displacement as a fraction of
+    # no-direction displacement -- is WRONG, and it handed out a false pass:
+    #
+    #     JEPA   mirrored 4.6% of spread, no-direction 37%    ratio 0.12
+    #     IDM    mirrored 7.1%,           no-direction 11.5%  ratio 0.61
+    #
+    # The ratio quintupled, but mostly because the denominator collapsed. A
+    # model that stopped responding to directional input at all would score a
+    # perfect ratio. So the criterion is the *absolute* left/right sensitivity
+    # against the spread, with the ratio reported alongside for context.
+    #
+    # 0.10 of a standard deviation is the bar: JEPA sat at 0.046 while having
+    # the sign of guarding inverted, so anything near that is not evidence.
+    # This is a proxy either way -- pass --probe and let the health arms answer
+    # the question that actually matters.
+    mirror_frac = l_mirr / max(spread, 1e-9)
+    model_ok = (gap > 0) if out2 else (mirror_frac >= 0.10)
     d_corpus = nt - 0.5 * (aw + tw)
     if corpus_ok and model_ok:
         detail = (f"the world model agrees ({gap:+.5f})" if out2 else
-                  f"the model distinguishes LEFT from RIGHT (mirroring moves "
-                  f"the\nprediction {l_mirr:.4f} against {l_none:.4f} for "
-                  f"removing the direction entirely)")
+                  f"swapping LEFT and RIGHT moves the prediction "
+                  f"{mirror_frac:.1%} of a\nlatent standard deviation "
+                  f"(JEPA: 4.6%, with the sign of guarding inverted)")
         print(f"BOTH HOLD. In the corpus, holding a direction takes {d_corpus:.4f} "
               f"less damage\nthan holding none, and {detail}. Defence is in "
               f"the model, so a blocking gym\nhas something real to optimise. "
@@ -279,9 +293,10 @@ def main() -> int:
     elif corpus_ok:
         detail = (f"({gap:+.5f})" if out2 else
                   f"(swapping LEFT and RIGHT moves the prediction only "
-                  f"{l_mirr:.4f}, against\n{l_none:.4f} for removing the "
-                  f"direction -- so it registers *whether* a direction is held "
-                  f"and\nnot *which*)")
+                  f"{mirror_frac:.1%} of a latent\nstandard deviation, against "
+                  f"{l_none / max(spread, 1e-9):.1%} for removing the direction "
+                  f"entirely -- so it\nregisters *whether* a direction is held "
+                  f"more than *which*)")
         print(f"The corpus shows defence ({d_corpus:.4f} less damage) and the "
               f"world model does\nNOT {detail}. A gym would optimise the "
               f"model's blind spot, so fix the model\nfirst rather than the "
