@@ -338,6 +338,18 @@ class ImaginedArena:
         reward, alive, terms = compute_rewards(states, joint_seq, side, cfg.reward)
         out = {"obs": torch.stack(obs_all[1:], dim=1),       # [B, T, H, latent]
                "mine": torch.stack(mine_all[1:], dim=1),     # [B, T, ticks, 10]
+               # Both players' buttons, always. Already computed, and a
+               # counterfactual needs to replay the opponent exactly: comparing
+               # "what I did" against "doing nothing" only isolates the agent's
+               # contribution if the opponent does the same thing in both arms.
+               # Re-rolling an opponent policy against the counterfactual state
+               # would let it react, and the difference would then contain its
+               # reaction as well as the agent's choice.
+               #
+               # Stored joint (20-wide) rather than as the opponent's half,
+               # because `ReplayOpponent` extracts the chair it needs and would
+               # index off the end of a 10-wide tensor.
+               "joint": joint_seq,
                "reward": reward, "alive": alive, "terms": terms,
                "states": states, "side": side,
                # The window ending at the *last* imagined state, which `obs` does
