@@ -30,11 +30,15 @@ training:  captures (mp4 + CSV) → encoder → latent world model → reward pr
 live:      X11 capture → encoder → 1-step world-model compensation → policy → uinput device
 ```
 
-The best policy is `artifacts/grpo_bounded/policy_best.pt`, step 2700,
-`net +0.002146`. It beats its own initialisation by a clear margin and, in
-world-model units, exceeds human damage throughput. Every number in §3 is still
-measured inside a world model that inflates damage 2.11× and whose action signal
-is only trustworthy for about 0.27 s — read them as world-model units, always.
+The best policy is `artifacts/grpo_bounded/policy_best.pt`, step 2700. Its
+recorded score is `net +0.002146`; **on the shared instrument
+(`scripts/eval_policy.py`) it reads `+0.00149`**, and that is the number any new
+policy must beat — the difference is the frozen reference each run builds from
+wherever its RNG stood, which cannot be reconstructed. See §2. It beats its own
+initialisation by a clear margin and, in world-model units, exceeds human damage
+throughput. Every number in §3 is still measured inside a world model that
+inflates damage 2.11× and whose action signal is only trustworthy for about
+0.27 s — read them as world-model units, always.
 
 **Milestone 5 is done: the agent has played a human.** On 2026-08-06 it played
 the author in Vs Player, Reimu (human) vs Cirno (agent), driving the game itself
