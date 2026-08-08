@@ -74,3 +74,41 @@ class ViTEncoder(nn.Module):
 
         z = self.projector(tok[:, 0])            # [CLS] -> MLP + BatchNorm
         return z.reshape(*lead, self.cfg.latent_dim)
+
+
+def resize_pos_embed(pos_embed: torch.Tensor, old_grid: int,
+                     new_grid: int) -> torch.Tensor:
+    """Re-grid a ViT positional embedding for a different input resolution.
+
+    ``pos_embed`` is [1, 1 + old_grid**2, dim] with the CLS position first.
+    Returns [1, 1 + new_grid**2, dim].
+
+    This is what makes warm-starting a higher-resolution encoder from a trained
+    lower-resolution one possible, and it is the *only* tensor that needs it:
+
+      * ``patch_embed.proj`` is a Conv2d with kernel == stride == patch, so it
+        sees one patch at a time and does not care how many there are. A 224 px
+        model produces 16x16 patches and a 448 px model 32x32, from identical
+        weights.
+      * the transformer blocks are attention plus MLP over tokens, so they are
+        token-count independent.
+      * ``cls_token``, ``norm`` and ``projector`` never see the grid at all.
+      * the predictor and action encoder consume latents, not pixels.
+
+    Only ``pos_embed`` is tied to the grid, and interpolating it is the standard
+    recipe from the original ViT paper's higher-resolution fine-tuning. Bicubic
+    rather than nearest because these are smooth learned coordinates, and nearest
+    would quantise every position onto its coarse neighbour.
+    """
+    if pos_embed.ndim != 3 or pos_embed.shape[1] != old_grid ** 2 + 1:
+        raise ValueError(
+            f"expected [1, 1 + {old_grid}^2, dim], got {tuple(pos_embed.shape)}")
+    if old_grid == new_grid:
+        return pos_embed.clone()
+    cls, grid = pos_embed[:, :1], pos_embed[:, 1:]
+    d = grid.shape[-1]
+    grid = grid.reshape(1, old_grid, old_grid, d).permute(0, 3, 1, 2)
+    grid = torch.nn.functional.interpolate(
+        grid, size=(new_grid, new_grid), mode="bicubic", align_corners=False)
+    grid = grid.permute(0, 2, 3, 1).reshape(1, new_grid ** 2, d)
+    return torch.cat([cls, grid], dim=1)

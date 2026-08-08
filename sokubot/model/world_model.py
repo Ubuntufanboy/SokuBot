@@ -22,9 +22,13 @@ import torch
 import torch.nn as nn
 
 from ..config import Config
+from ..data.hud import FRAME_HUD_CHANNELS
 from .action_encoder import ActionEncoder
 from .encoder import ViTEncoder
 from .predictor import LatentPredictor
+
+
+N_HUD = len(FRAME_HUD_CHANNELS)
 
 
 def count_params(m: nn.Module) -> int:
@@ -44,6 +48,20 @@ class LeWorldModel(nn.Module):
         self.encoder = ViTEncoder(cfg)
         self.action_encoder = ActionEncoder(cfg)
         self.predictor = LatentPredictor(cfg)
+        # Supervised readout of the HUD from the latent. Its job is not to be
+        # used at inference -- `data/hud.py` reads the HUD from pixels far more
+        # accurately than this ever will -- but to put a *gradient* on the
+        # encoder that says "carry health, spirit and combo". Without it nothing
+        # in the objective asks for them, and they arrive at R^2 0.88 / 0.05 /
+        # 0.32 respectively, which is what makes the reward unreadable.
+        #
+        # A single linear layer on purpose: a deeper head would recover the
+        # channels from a latent that does not linearly expose them, which is
+        # precisely the property the reward needs and would therefore hide the
+        # failure it exists to prevent. This mirrors `probe.py`'s argument for a
+        # linear probe.
+        self.hud_head = (nn.Linear(cfg.latent_dim, N_HUD)
+                         if cfg.hud_coef > 0 else None)
 
     # ---------------- training ----------------
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> ForwardOut:
@@ -54,6 +72,13 @@ class LeWorldModel(nn.Module):
 
     def encode(self, obs: torch.Tensor) -> torch.Tensor:
         return self.encoder(obs)
+
+    def predict_hud(self, z: torch.Tensor) -> torch.Tensor:
+        """[..., latent] -> [..., N_HUD] in [0,1]. Requires cfg.hud_coef > 0."""
+        if self.hud_head is None:
+            raise RuntimeError(
+                "this model was built with hud_coef = 0, so it has no HUD head")
+        return torch.sigmoid(self.hud_head(z))
 
     # ---------------- planning ----------------
     def rollout(

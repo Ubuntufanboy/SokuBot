@@ -33,7 +33,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from dataclasses import replace
+
 from sokubot.config import Config
+from sokubot.model.encoder import resize_pos_embed
 from sokubot.data.soku import ACTION_COLUMNS, build_soku_dataset
 from sokubot.losses import prediction_loss
 from sokubot.model.world_model import LeWorldModel
@@ -91,6 +94,15 @@ def main() -> None:
                     help="peak LR. The 5e-4 tuned on 16k-step runs diverged at "
                          "75k of a 320k-step schedule -- see module docstring.")
     ap.add_argument("--warmup", type=int, default=5_000)
+    ap.add_argument("--image-size", type=int, default=224,
+                    help="448 is the considered value for this game; 224 was "
+                         "LeWorldModel's PushT default and throws away 4.6x the "
+                         "pixels of a 480x480 capture, which is why spirit "
+                         "probes at R^2 0.05")
+    ap.add_argument("--cf-coef", type=float, default=Config.cf_coef,
+                    help="action-discrimination weight, applied throughout")
+    ap.add_argument("--hud-coef", type=float, default=Config.hud_coef,
+                    help="supervised HUD readout weight")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="continue from these weights instead of random init. "
                          "Optimiser state and LR schedule restart.")
@@ -104,9 +116,16 @@ def main() -> None:
     args.ckpt_dir.mkdir(parents=True, exist_ok=True)
     args.log.parent.mkdir(parents=True, exist_ok=True)
 
-    cfg = Config.soku(device=args.device, batch_size=args.batch_size,
-                      num_workers=args.num_workers, total_steps=args.steps,
-                      warmup_steps=args.warmup, lr=args.lr, seed=args.seed)
+    make = Config.soku448 if args.image_size == 448 else Config.soku
+    cfg = make(device=args.device, batch_size=args.batch_size,
+               num_workers=args.num_workers, total_steps=args.steps,
+               warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
+               cf_coef=args.cf_coef, hud_coef=args.hud_coef)
+    if args.image_size not in (224, 448):
+        cfg = replace(cfg, image_size=args.image_size)
+    print(f"image {cfg.image_size} px, patch {cfg.patch_size} -> "
+          f"{cfg.num_patches} patches | cf_coef {cfg.cf_coef} "
+          f"hud_coef {cfg.hud_coef}", flush=True)
     cache = torch.load(args.corpus / "val.pt", map_location="cpu", weights_only=False)
     print(f"val cache: {cache['obs'].shape[0]} windows", flush=True)
 
@@ -117,7 +136,26 @@ def main() -> None:
         # which is the honest thing to say about it: this continues training
         # from a set of weights, it does not resume an interrupted run.
         blob = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        model.load_state_dict(blob["model"])
+        sd = dict(blob["model"])
+        old_cfg = blob.get("cfg")
+        old_size = getattr(old_cfg, "image_size", cfg.image_size)
+        if old_size != cfg.image_size:
+            # Re-grid the one tensor tied to the patch count. Everything else --
+            # the stride-14 patch convolution, every transformer block, the CLS
+            # token, the projector, the predictor -- is resolution-independent,
+            # so 222 of 223 tensors transfer untouched. See
+            # model.encoder.resize_pos_embed for why.
+            og, ng = old_size // cfg.patch_size, cfg.image_size // cfg.patch_size
+            sd["encoder.pos_embed"] = resize_pos_embed(
+                sd["encoder.pos_embed"], og, ng)
+            print(f"warm start {old_size} -> {cfg.image_size} px: pos_embed "
+                  f"re-gridded {og}x{og} -> {ng}x{ng}", flush=True)
+        # The HUD head is new when warm-starting a model trained without it.
+        missing = model.load_state_dict(sd, strict=False)
+        if missing.missing_keys:
+            print(f"  freshly initialised: {missing.missing_keys}", flush=True)
+        if missing.unexpected_keys:
+            print(f"  ignored from checkpoint: {missing.unexpected_keys}", flush=True)
         print(f"initialised from {args.init_from} (step {blob.get('step')}); "
               f"optimiser and LR schedule start fresh", flush=True)
     rep = model.param_report()

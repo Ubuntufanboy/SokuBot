@@ -26,6 +26,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from .config import Config
+import torch.nn.functional as F
+
 from .losses import prediction_loss, sigreg_stepwise
 from .model.world_model import LeWorldModel
 
@@ -130,6 +132,32 @@ def compute_losses(
     l_sig = sigreg_stepwise(out.z, cfg)
     total = l_pred + cfg.lambda_sigreg * l_sig
 
+    # ---- action discrimination, carried throughout rather than bolted on ----
+    # `scripts/finetune_action.py` bought this as a 12k-step post-hoc fine-tune:
+    # discrimination 1.3869 -> 0.118 nats, at a cost of skill 0.8642 -> 0.7948.
+    # Phase 1 then measured that any further predictive fine-tuning erodes it
+    # again -- held-out action->return correlation at h=4 fell from +0.2622 to
+    # +0.1938 (unrolled loss) and +0.1545 (one-step). A property that decays
+    # under ordinary training belongs in the objective, not in a finishing step.
+    l_cf = torch.zeros((), device=device)
+    if cfg.cf_coef > 0:
+        from scripts.finetune_action import counterfactual_loss
+        l_cf, cf_acc = counterfactual_loss(model, out.z, actions, cfg.cf_negatives)
+        total = total + cfg.cf_coef * l_cf
+    else:
+        cf_acc = torch.zeros((), device=device)
+
+    # ---- supervised HUD readout ----
+    # Nothing else in the objective asks the latent to carry the state the reward
+    # reads, and the cost is measured: the encoder degrades health to a residual
+    # of 0.117 where data/hud.py reads 0.012 from the same pixels. Labels are free
+    # and human-validated; see data/hud.read_frame_hud.
+    l_hud = torch.zeros((), device=device)
+    if cfg.hud_coef > 0 and "hud" in batch:
+        hud = batch["hud"].to(device, non_blocking=True)       # [B, T, N_HUD]
+        l_hud = F.mse_loss(model.predict_hud(out.z), hud)
+        total = total + cfg.hud_coef * l_hud
+
     # Every entry below ends in .item(), which synchronises the GPU and drains
     # the pipeline, and effective_rank runs a CPU eigendecomposition on top.
     # Skipping it on non-logging steps is most of what `metrics_every` buys.
@@ -142,6 +170,9 @@ def compute_losses(
             "loss": float(total.item()),
             "l_pred": float(l_pred.item()),
             "l_sigreg": float(l_sig.item()),
+            "l_cf": float(l_cf.item()),
+            "cf_acc": float(cf_acc.item()) if cfg.cf_coef > 0 else 0.0,
+            "l_hud": float(l_hud.item()),
             "latent_var": float(flat.var(dim=0).mean().item()),
             "eff_rank": effective_rank(flat.detach()),
         }

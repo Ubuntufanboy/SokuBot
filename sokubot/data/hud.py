@@ -457,3 +457,56 @@ def spellcard_events(frames: np.ndarray, t: HudTrace, who: int, flip: bool = Tru
             continue
         i = max(j + 1, i + 1)
     return out
+
+
+# The channels, in the order scripts/horizon_ablation.py and
+# sokubot/model/augmented.py use. rl/reward.py indexes the first six
+# positionally, so this order is load-bearing.
+FRAME_HUD_CHANNELS = ("hp1", "hp2", "spirit1", "spirit2", "combo1", "combo2",
+                      "cards1", "cards2")
+
+
+def read_frame_hud(frames: np.ndarray, flip: bool = True) -> np.ndarray:
+    """Per-frame HUD readings with no temporal processing. [N,480,480,3] -> [N,8].
+
+    `read_trace` is the analysis instrument: it smooths with a 3-frame median,
+    detects the end-of-match heal, and rejects physically impossible drops. All
+    of that is temporal, and a streaming loader emitting short windows cannot do
+    it -- there is no whole capture in scope.
+
+    This is the *supervision* instrument instead. It runs the same stateless
+    per-frame extraction and stops there.
+
+    WHERE IT DIFFERS FROM `read_trace`, EXACTLY
+    -------------------------------------------
+    `spirit1/2` and `cards1/2` agree to float32 precision (max 3e-8, which is
+    the cast) -- neither path gives those channels any temporal treatment. `hp1/2` differ only by `_fill_dips`, a 0.6 s
+    repair removing frames where a sprite or hit effect crosses the bar and it
+    briefly reads empty. Those artifacts last one or two source frames, so after
+    decimation to 15 Hz a small percentage of labels carry a health dip that did
+    not happen.
+
+    That is noise on the label rather than bias, and it is accepted
+    deliberately: `_fill_dips` needs 36 frames of future context, which a loader
+    emitting 4-frame windows does not have without either a second pass over each
+    capture or a lagged ring buffer. Neither is worth adding to an already subtle
+    streaming path for a few percent of frames. If it ever looks like it matters,
+    the fix is a per-capture label cache, not a change here.
+
+    Deliberately kept next to `read_trace` so that a change to the bar geometry
+    cannot update one and miss the other.
+    """
+    if frames.ndim != 4 or frames.shape[1:3] != (480, 480):
+        raise ValueError(f"expected [N,480,480,3], got {frames.shape}")
+    if flip:
+        frames = frames[:, ::-1]
+    fr, fc = FILL_ROWS
+    y1, r1 = _split_bar(frames[:, fr:fc, P1_HP_X[0]:P1_HP_X[1]])
+    y2, r2 = _split_bar(frames[:, fr:fc, P2_HP_X[0]:P2_HP_X[1]])
+    out = np.stack([
+        y1, y2,
+        _spirit(frames, P1_SPIRIT_X), _spirit(frames, P2_SPIRIT_X),
+        np.maximum(0.0, r1 - RED_FLOOR), np.maximum(0.0, r2 - RED_FLOOR),
+        _cards_lit(frames, P1_CARD_X), _cards_lit(frames, P2_CARD_X),
+    ], axis=1).astype(np.float32)
+    return np.clip(out, 0.0, 1.0)

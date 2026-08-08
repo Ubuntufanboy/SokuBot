@@ -286,18 +286,37 @@ be action-aware (action discrimination 1.3869 nats → 0.118, chance is 1.3863)
 at skill **+0.7948**. Both are safe locally. Retraining costs 8+ hours and buys
 nothing.
 
-**Unresolved, five minutes to settle:** `artifacts/final/ckpt/sokubot.pt` is
-**step 320000** — the final checkpoint of the full run, never evaluated, where
-everything to date has used `best.pt` from step 225000. `best.pt` was selected
-on skill mid-schedule; the 320k model is the end of a completed cosine decay and
-may be better. Check it before any further work:
+**SETTLED 2026-08-07 — 225k wins, so nothing downstream moves.** This was open
+across two sessions. `artifacts/final/ckpt/sokubot.pt` is step 320000, the end of
+a completed cosine decay, and the worry was that `best.pt`, selected on skill
+mid-schedule, might be the worse model. It is not:
+
+| checkpoint | skill, as saved | skill, BN recalibrated |
+|---|---|---|
+| `ckpt/best.pt` (225k) | +0.8787 | **+0.8789** |
+| `final/ckpt/sokubot.pt` (320k) | +0.8709 | +0.8733 |
+
+The last 95k steps of the schedule made the model slightly *worse* on held-out
+data. `ckpt/best.pt` stays the base, `ckpt_cf/best_bnfix.pt` stays the model
+everything uses, and the bank, probe and policies all stay valid. No rebuild.
+
+**Both were measured in one sitting rather than comparing 320k against the
++0.8642 recorded in this document — and that is the only reason the answer is
+right.** On this val set `best.pt` scores +0.8789, not +0.8642:
+`build_val_cache` samples 2048 windows, and a different sample moves the
+absolute figure by more than the gap being tested. Against the *documented*
+number, 320k would have appeared to win by +0.009 and triggered a full rebuild
+of the counterfactual fine-tune, the bank and the probe, for nothing. Two
+checkpoints, one instrument, one sitting — the same discipline `BUGS.md` opens
+with, applied to a number rather than to an artifact.
+
+Reproduce (split with `--seed 20260803`, which regenerates the original
+94.75 h / 3.01 h split exactly):
 
 ```bash
-python -m scripts.eval_ckpt --ckpt /root/ckpt/sokubot.pt --val /root/corpus/val.pt
+python -m scripts.eval_ckpt --ckpt ~/sokubot-art/wm_225k_best.pt  --val ~/corpus/val.pt
+python -m scripts.eval_ckpt --ckpt ~/sokubot-art/wm_320k_final.pt --val ~/corpus/val.pt
 ```
-
-If it beats +0.8642, redo the counterfactual fine-tune from it and rebuild the
-bank and probe — everything downstream is keyed to the world model's weights.
 
 ---
 
@@ -324,8 +343,8 @@ weeks.
 
 ## 9. Next steps, in order
 
-1. **Evaluate `sokubot.pt` (320k)** against `best.pt` (225k). Five minutes,
-   possibly invalidates the base of everything else. §7. Still not done.
+1. ~~**Evaluate `sokubot.pt` (320k)** against `best.pt` (225k).~~ **Done
+   2026-08-07: 225k wins (+0.8789 vs +0.8733), nothing downstream changes.** §7.
 2. **Chase the two behaviours the live match exposed** — §10. Both are policy or
    reward questions, which is the first time that has been the honest place to
    point.
@@ -369,21 +388,71 @@ Full rationale lives next to each decision in `sokubot/live/`; the short form:
 
 ### Two behaviours worth chasing, in priority order
 
-**It gives up when its health gets low.** The most interesting observation from
-the match, and there is a mechanistic candidate that can be tested without
-touching the live loop: `compute_rewards` returns an `alive` mask and GRPO
-divides by `alive.sum()`, so imagined trajectories that reach a KO stop
-contributing gradient. Low-health states therefore carry the *least* training
-signal precisely where fighting back matters most — and they are rarer among
-corpus start states to begin with. Measure the per-start gradient magnitude as a
-function of probed health before assuming; it is a falsifiable claim about the
-reward, not about the policy.
+**It gives up when its health gets low.** — **RESOLVED 2026-08-07, and both
+candidate mechanisms are wrong.** The reward down there is noise.
+
+`scripts/probe_reliability.py`, on held-out replays:
+
+| true health | n | bias | noise |
+|---|---|---|---|
+| 0.02–0.04 | 294 | **+0.154** | **0.251** |
+| 0.25–0.40 | 5214 | −0.011 | 0.123 |
+| 0.80–1.01 | 15862 | −0.002 | 0.137 |
+
+The probe is at its worst exactly where the agent gives up — double the noise
+and a large positive bias. And the KO detector built on it barely works at all:
+
+| | true KO rate | detector fires | precision | recall |
+|---|---|---|---|---|
+| encoder latents | 0.016% | 0.727% | **0.003** | 0.143 |
+| imagined latents | 0.016% | 0.310% | **0.000** | 0.000 |
+
+It fires 20–45× more often than KOs happen and essentially every one is false,
+each paying `win`/`lose` = ±5 against damage terms worth ~0.1 and masking out
+every later step. **So `win`/`lose` should be 0**, the same call already made for
+`crush` and spell-cost: terms computed from unreadable state get switched off,
+not tuned. No threshold retuning saves precision 0.003.
+
+Both hypotheses in the original note are dead. The `alive`-mask starvation story
+does not matter if the signal being starved was noise, and the scarcity story is
+simply false — low-health states are **8.5%** of frames, not rare.
+
+**It is not the HUD reader's fault, and that was checked rather than assumed.**
+48 blind-annotated frames (`scripts/make_hud_annotation.py`, stratified to
+oversample low health) put `data/hud.py` at **MAE 0.012 for health and 0.025 for
+spirit**, and 0.012/0.013 in the low-health band specifically. The labels are
+sound; the 224 px downsample is what destroys the information before the encoder
+ever sees it — five six-pixel spirit hexagons become about three pixels.
+
+That is why the fix is architectural: carry HUD state explicitly
+(`sokubot/model/augmented.py`) instead of hoping a probe recovers it. With health
+as a state channel at MAE 0.012 rather than a probe readout at 0.25 noise, the
+KO detector becomes meaningful and the endgame stops being trained on noise.
 
 **It presses too much.** The trained policy sits at a 0.113–0.130 press rate
 against the corpus prior's 0.094 (`scripts/build_action_prior.py`, 361k frames).
 Human players spam too, so this is mild — but it is a measurable drift from the
 reference the whole evaluation is anchored to, and worth knowing whether it is
 the entropy floor, the bounded logits, or a genuine strategy.
+
+### What the card channel turned out to be worth (2026-08-07)
+
+Nothing. Added to the probe's targets to see whether the spellcard reward could
+be switched on, and measured:
+
+| channel | ceiling (real latents) | calibrated, h = 1 / 4 / 16 |
+|---|---|---|
+| hp1 / hp2 | +0.878 / +0.896 | +0.78 / +0.83 / +0.81 |
+| cards1 | +0.156 | +0.031 / +0.063 / +0.094 |
+| cards2 | +0.051 | **−0.067 / −0.024** / +0.008 |
+
+`cards2` is *negative* — worse than predicting the mean. The two strips are
+geometrically symmetric, so +0.156 against +0.051 is noise straddling the 0.15
+inclusion cutoff rather than signal. `spell_cost_min = 1e9` stays.
+
+Note this moved `usable_horizon` from 5 to 0 without the model changing:
+that figure is a mean over whichever targets clear the cutoff, so admitting a
+near-zero channel drags it. It is not comparable across different target sets.
 
 ### A caution about instruments, from this session
 

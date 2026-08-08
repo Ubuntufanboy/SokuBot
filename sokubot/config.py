@@ -117,6 +117,26 @@ class Config:
     sigreg_scale_n: bool = True
     lambda_sigreg: float = 0.1
 
+    # Weight on the counterfactual action-discrimination term, carried through
+    # the whole run rather than bolted on afterwards. `scripts/finetune_action.py`
+    # bought discrimination 1.3869 -> 0.118 nats as a 12k-step post-hoc
+    # fine-tune, at a cost of skill 0.8642 -> 0.7948 -- and Phase 1 then measured
+    # that *any* further predictive fine-tuning erodes it again, taking the
+    # held-out action->return correlation at h=4 from +0.2622 to +0.1545. A
+    # property that decays under ordinary training has to be part of the
+    # objective, not a finishing step. 0 reproduces the original run exactly.
+    cf_coef: float = 0.1
+    cf_negatives: int = 3
+
+    # Weight on supervised HUD prediction from the encoder latent. The labels are
+    # free -- data/hud.py reads them from the native 480 px frame at MAE 0.012 for
+    # health, validated against a human over 48 blind-annotated frames -- and
+    # without this nothing in the objective asks the latent to carry the state the
+    # reward reads. Measured today the encoder loses health to a residual of
+    # 0.117 against hud.py's 0.012, a 10x degradation of information that is
+    # present in its input. 0 disables the head entirely.
+    hud_coef: float = 0.25
+
     # ---------------- optimisation ----------------
     lr: float = 5e-4
     weight_decay: float = 0.05
@@ -252,6 +272,30 @@ class Config:
             ),
             **overrides,
         )
+
+    @classmethod
+    def soku448(cls, **overrides) -> "Config":
+        """Hisoutensoku at 448 px -- the resolution the game actually gives us.
+
+        `image_size = 224` was inherited wholesale from LeWorldModel's PushT
+        setting and was never a decision about this game. Captures are 480x480,
+        so the loader was throwing away 4.6x the pixels before the encoder saw a
+        frame, and the cost is measured: the spirit gauge is five six-pixel
+        hexagons that become about three pixels and probe out of the latent at
+        R^2 0.05, cards at 0.05-0.16. Health survives (its bar is 189 px) and
+        probes at 0.88.
+
+        448 rather than 480 because 480 is not divisible by patch 14, and keeping
+        the patch size is what lets a trained 224 model warm-start this one:
+        `patch_embed` is a stride-14 convolution that does not care how many
+        patches it produces, so 222 of 223 tensors transfer unchanged and only
+        `pos_embed` needs re-gridding (see `model.encoder.resize_pos_embed`).
+        The 480 -> 448 resample is 7%, which leaves a six-pixel gauge at 5.6 px.
+
+        Cost is about 4x the tokens (256 -> 1024) and, with attention quadratic
+        and the MLP linear in token count, roughly 5-7x the encoder compute.
+        """
+        return replace(cls.soku(), image_size=448, **overrides)
 
     @classmethod
     def tiny(cls, base: Optional["Config"] = None, **overrides) -> "Config":
