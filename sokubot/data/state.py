@@ -48,17 +48,29 @@ STATE_CHANNELS: tuple[str, ...] = (
     "dx",            # x_opponent - x_me, normalised; sign is "which way is away"
     "facing",        # +1 if I face right, -1 if left, from the game's own flag
     "guarding",      # correct guard, ground or air
-    "wrongblock",    # guarded the wrong way -- a gap-detection false negative
+    # Blocked in the right direction at the wrong HEIGHT, not in the wrong
+    # direction: SokuLib names the range ACTION_WRONGBLOCK_{HIGH,LOW}_*_
+    # BLOCKSTUN, beside ACTION_RIGHTBLOCK_{HIGH,LOW}_*. Measured on a real
+    # capture, 96.4% of these frames hold away, the same as a right block.
+    # It is still a gap-detection failure and still the road to a crush; it is
+    # simply not a positional error, so a model can only tell the two apart
+    # from the attack, never from the defender's stick.
+    "wrongblock",
     "crushed",       # the guard broke
     "knockdown",     # knocked down, or grabbed
     "airborne",      # y above the floor; free from position, and dodging needs it
 )
 
-# Stage width in game units. Positions run roughly -600..600 in Soku's
-# coordinates, so this maps `dx` into about [-1, 1] without clipping real play.
-# Only the scale matters -- the sign is what carries the mechanic.
-STAGE_HALF_WIDTH = 600.0
-FLOOR_EPS = 1.0            # y above this counts as airborne
+# Maximum separation in game units, measured rather than assumed. A capture of
+# a real match (10 073 frames, replay 5262777) puts x in [40, 1240] and the
+# signed separation in [-1200, +839], so the stage is about 1280 units wide with
+# the origin at one edge -- NOT centred, which is what an earlier value of 600
+# here assumed. Dividing by the full span is what puts `dx` in [-1, 1]; at 600
+# it reached +-2. Only the scale is affected -- the sign is what carries the
+# mechanic -- but a channel that silently exceeds its stated range is the kind
+# of thing that later reads as a bug in something else.
+STAGE_SPAN = 1200.0
+FLOOR_EPS = 1.0            # y above this counts as airborne; the floor is 0.0
 
 # Columns the extractor writes per player, from dll/src/video_encoder.cpp.
 _PER_PLAYER = ("x", "y", "dir", "action",
@@ -116,7 +128,7 @@ def read_state(path: Path) -> np.ndarray:
                 them = 1 - me
                 # The signed separation, from my point of view. This is the
                 # whole reason the labels exist: "away" is the sign of this.
-                out[me, 0] = (x[them] - x[me]) / STAGE_HALF_WIDTH
+                out[me, 0] = (x[them] - x[me]) / STAGE_SPAN
                 # The game stores direction as a signed flag; normalise it to
                 # +-1 so a model never has to learn the encoding.
                 d = float(row[f"p{me+1}_dir"])

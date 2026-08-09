@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from sokubot.data.state import (STATE_CHANNELS, has_state_columns, read_state,
-                                STAGE_HALF_WIDTH)
+                                STAGE_SPAN)
 
 _BASE = ("frame,game_frame,p1_input,p2_input,"
          "p1_up,p1_down,p1_left,p1_right,p1_a,p1_b,p1_c,p1_d,p1_change,p1_spell,"
@@ -30,8 +30,8 @@ def test_dx_is_signed_and_opposite_for_the_two_players(tmp_path):
     row = _ZEROS + ",-100,0,1,0,0,0,0,0,200,0,-1,0,0,0,0,0"
     st = read_state(_write(tmp_path, [row]))
     dx = STATE_CHANNELS.index("dx")
-    assert st[0, 0, dx] == pytest.approx(300 / STAGE_HALF_WIDTH)
-    assert st[0, 1, dx] == pytest.approx(-300 / STAGE_HALF_WIDTH)
+    assert st[0, 0, dx] == pytest.approx(300 / STAGE_SPAN)
+    assert st[0, 1, dx] == pytest.approx(-300 / STAGE_SPAN)
 
 
 def test_facing_is_normalised_to_plus_minus_one(tmp_path):
