@@ -282,6 +282,41 @@ was expected to cost:
 
 JEPA's best `inv_dyn_auc` anywhere in 225k steps is 0.7347.
 
+### Three objectives, one wall
+
+Measured end to end. Each row is a full training run, then a reward probe fitted
+on that encoder, then `block_effect --probe` asking the only question that
+matters: does the model predict that guarding *reduces* damage?
+
+| objective | spatial AUC | `inv_dyn_auc` | guarding predicts less damage? |
+|---|---|---|---|
+| JEPA, 225k steps | 0.540 | 0.7347 | **no** |
+| JEPA + inverse dynamics (`idm_coef 1.0`) | 0.651 | 0.7733 | **no** |
+| ditto, class-balanced (`idm_pos_weight 9.0`) | 0.688 | 0.7898 | **no** |
+
+Both levers worked on the representation. Spatial decodability rose from chance
+to 0.69, action-decodability passed JEPA's 225k-step ceiling in 4k steps. **None
+of it reached the predictor's damage forecast.** In the last run the defender's
+true inputs and their mirror image differ by 0.00007 of predicted damage, and
+holding no direction at all is still forecast as *safer* than holding one.
+
+Two independent levers -- what the loss asks for, and how it is weighted -- both
+improved the proxy and left the target untouched. That is the argument against a
+fourth objective: the bottleneck is not how hard the encoder is pushed, it is
+that the supervision for guarding is not present in pixels-and-inputs at this
+scale. Blocking is holding *away*, "away" is a fact about relative position, and
+nothing in the training signal ever states it.
+
+Hence `sokubot/data/state.py` and the extractor's state columns: tell the model
+what it cannot infer. The constraint was always about inference, and these
+labels never reach the policy.
+
+**A checkpoint was lost to this.** Run 2's weights were on a rented instance
+that became unreachable before they were synced -- the measurements above
+survive because they were printed, the model does not. Run 1's was synced the
+moment it finished and is in `artifacts/ckpt_idm224/`. Sync when a run ends, not
+when you next think of it.
+
 ### What is gated on this
 
 `scripts/build_gyms.py` (186k `under_pressure` pairs) and
