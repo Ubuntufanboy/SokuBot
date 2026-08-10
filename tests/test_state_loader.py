@@ -125,3 +125,20 @@ def test_a_capture_without_the_column_reports_every_frame_valid(tmp_path):
     but it must come from the column being absent, not from a parse failure."""
     st, valid = read_state(_write(tmp_path, [_ROW, _ROW]))
     assert valid.tolist() == [True, True]
+
+
+def test_a_gzipped_sidecar_reads_identically(tmp_path):
+    """`align_sidecar` writes state.csv.gz by default -- 1.42 GB of plain CSV
+    does not fit on the box that holds the corpus. If the loader could not open
+    it the labels would simply be unreadable."""
+    import gzip
+
+    plain = _write_valid(tmp_path, [_ROW] * 3, [1, 0, 1])
+    gz = tmp_path / "state.csv.gz"
+    with gzip.open(gz, "wt", newline="") as fh:
+        fh.write(plain.read_text())
+
+    a, va = read_state(plain)
+    b, vb = read_state(gz)
+    assert (a == b).all() and va.tolist() == vb.tolist()
+    assert has_state_columns(gz)

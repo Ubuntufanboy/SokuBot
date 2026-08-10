@@ -36,6 +36,7 @@ target is the relative quantity.
 from __future__ import annotations
 
 import csv
+import gzip
 from pathlib import Path
 from typing import List
 
@@ -77,6 +78,19 @@ _PER_PLAYER = ("x", "y", "dir", "action",
                "guarding", "wrongblock", "crushed", "knockdown")
 
 
+def _open(path: Path):
+    """Text handle for a sidecar, gzipped or not.
+
+    `align_sidecar.py` writes `state.csv.gz` by default: the full sidecars are
+    1.42 GB across the corpus against 1.1 GB free on the machine that holds it,
+    and gzip takes that to about 0.1 GB. Deciding by suffix rather than by a
+    flag means a caller cannot pass the wrong one.
+    """
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", newline="")
+    return path.open(newline="")
+
+
 def has_state_columns(path: Path) -> bool:
     """True if this sidecar was written by an extractor that logs game state.
 
@@ -84,7 +98,7 @@ def has_state_columns(path: Path) -> bool:
     everything else, so a corpus mixing both must load rather than fail -- the
     columns were appended for exactly this reason.
     """
-    with path.open(newline="") as fh:
+    with _open(path) as fh:
         cols = set(csv.DictReader(fh).fieldnames or [])
     return all(f"p{i}_{c}" in cols for i in (1, 2) for c in _PER_PLAYER)
 
@@ -120,7 +134,7 @@ def read_state(path: Path) -> tuple[np.ndarray, np.ndarray]:
     does for the HUD. Flattening it here would push that gather into every
     caller.
     """
-    with path.open(newline="") as fh:
+    with _open(path) as fh:
         reader = csv.DictReader(fh)
         cols = reader.fieldnames or []
         for i in (1, 2):

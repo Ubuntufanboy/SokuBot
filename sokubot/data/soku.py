@@ -93,7 +93,11 @@ def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
                 if not video.is_absolute():
                     video = mf.parent / video
                 inputs = video.parent / "inputs.csv"
-                state = video.parent / "state.csv"
+                # gz first: align_sidecar writes that by default, and a
+                # plain .csv beside it would be a stale full-column leftover.
+                state = next((c for c in (video.parent / "state.csv.gz",
+                                          video.parent / "state.csv")
+                              if c.exists()), None)
                 if not (video.exists() and inputs.exists()):
                     continue
                 seen.add(rid)
@@ -102,7 +106,7 @@ def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
                         replay_id=rid,
                         video=video,
                         inputs=inputs,
-                        state=state if state.exists() else None,
+                        state=state,
                         frames=int(e.get("frames") or 0),
                     )
                 )
