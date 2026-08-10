@@ -118,6 +118,23 @@ def enable_fast_math(cfg: Config) -> None:
     torch.backends.cudnn.benchmark = True
 
 
+_STATE_PW = None
+
+
+def _state_pos_weight() -> torch.Tensor:
+    """Per-channel positive weights for the binary state channels, built once.
+
+    The values come from measured base rates and never change, so constructing
+    the tensor on every training step would be a pointless allocation on the
+    hot path.
+    """
+    global _STATE_PW
+    if _STATE_PW is None:
+        from .model.state_head import default_pos_weight
+        _STATE_PW = default_pos_weight()
+    return _STATE_PW
+
+
 def compute_losses(
     model: LeWorldModel, batch: Dict, cfg: Config, want_metrics: bool = True
 ) -> Tuple[torch.Tensor, Dict[str, float]]:

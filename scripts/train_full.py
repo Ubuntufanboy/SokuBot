@@ -225,6 +225,12 @@ def main() -> None:
                          "controllable. 0 reproduces the JEPA-only objective "
                          "whose encoder cannot tell that the characters swapped "
                          "sides (spatial_probe AUC 0.540).")
+    ap.add_argument("--state-coef", type=float, default=Config.state_coef,
+                    help="weight on predicting the game's own state from the "
+                         "latent. 0 (the default) leaves the model exactly as "
+                         "it was; a positive value builds the head, which is "
+                         "freshly initialised when warm-starting from weights "
+                         "that predate it. See model/state_head.py.")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="continue from these weights instead of random init. "
                          "Optimiser state and LR schedule restart.")
@@ -243,6 +249,7 @@ def main() -> None:
                num_workers=args.num_workers, total_steps=args.steps,
                warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
                cf_coef=args.cf_coef, hud_coef=args.hud_coef,
+               state_coef=args.state_coef,
                idm_coef=args.idm_coef,
                idm_pos_weight=args.idm_pos_weight,
                compile=not args.no_compile)
