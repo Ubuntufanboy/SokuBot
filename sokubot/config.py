@@ -151,6 +151,10 @@ class Config:
     # `model/state_head.py` for the three objectives that failed to recover
     # position from pixels before this was reached for.
     state_coef: float = 0.0
+    # Hidden width of the state head. 0 makes it linear, which is what
+    # it was until a linear head proved unable to fit dx and therefore
+    # unable to teach it. See model/state_head.py.
+    state_width: int = 512
     # Weight on recovering both players' buttons from a latent transition, with
     # the gradient reaching the ENCODER. This is the term that decides what the
     # representation keeps.

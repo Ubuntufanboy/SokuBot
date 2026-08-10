@@ -73,7 +73,7 @@ def reconcile_config(cfg: Config, state: Dict[str, Any]) -> List[str]:
     for coef_name, weight_key, rebuild_with in (
             ("hud_coef", "hud_head.weight", None),
             ("idm_coef", "idm_head.net.0.weight", None),
-            ("state_coef", "state_head.net.weight", 1.0)):
+            ("state_coef", "state_head.net.0.weight", 1.0)):
         present = weight_key in state
         value = getattr(cfg, coef_name, 0.0)
         if present and value <= 0:

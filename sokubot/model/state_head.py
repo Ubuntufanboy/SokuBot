@@ -31,13 +31,14 @@ its own inputs, nothing else. These labels never reach it. They shape a world
 model, which is the same asymmetric arrangement `hud_coef` already uses -- the
 only difference being that the HUD is legible in pixels and position is not.
 
-WHY THE HEAD IS LINEAR
-----------------------
-Deliberately, and for the same reason `probe.py` keeps the reward probe linear:
-a head with enough capacity to recover position from a representation that
-does not hold it would let the encoder off the hook. A linear head can only
-succeed if the latent is linearly separable in the quantity, which is exactly
-the property the spatial probe measures and the property downstream needs.
+TEACHING AND MEASURING ARE DIFFERENT JOBS
+-----------------------------------------
+The head was linear at first so that it could only succeed if the latent held
+position linearly -- `probe.py`'s argument for the reward probe. On real data
+that produced a head which could not fit its target and therefore could not
+teach it either; see the class docstring for the measurement. The head now has
+a hidden layer, and the linear-decodability question is asked afterwards by a
+separate probe on the frozen latent, which is where that argument belongs.
 """
 
 from __future__ import annotations
@@ -84,12 +85,36 @@ class StateHead(nn.Module):
 
     Continuous channels come out raw; binary channels come out as logits, so
     the loss can apply BCE-with-logits and stay numerically sane.
+
+    ONE HIDDEN LAYER, AND WHY THAT REVERSES AN EARLIER ARGUMENT
+    ----------------------------------------------------------
+    This head was linear at first, on the reasoning `probe.py` uses for the
+    reward probe: a head with enough capacity to recover position from a
+    representation that does not hold it lets the encoder off the hook.
+
+    That argument is right about *measurement* and wrong about *teaching*, and
+    16 000 steps of supervision on the real corpus showed the difference. The
+    linear head reached dx R2 -0.09 with predictions of standard deviation
+    0.15 against the truth's 0.30 -- it was regressing toward the mean because
+    it could not express the mapping. A head that cannot fit its target emits a
+    weak and uninformative gradient, so the encoder was pushed hard by
+    everything else (its weights moved 24.6%) and barely at all by this.
+
+    So the head gets capacity to learn from, and the *measurement* moves to a
+    separate linear probe fit after the fact, which is the honest split. Set
+    `state_width = 0` for the original linear head.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, width: int | None = None):
         super().__init__()
         self.n_channels = len(STATE_CHANNELS)
-        self.net = nn.Linear(cfg.latent_dim, N_PLAYERS * self.n_channels)
+        out_dim = N_PLAYERS * self.n_channels
+        w = getattr(cfg, "state_width", 512) if width is None else width
+        if w and w > 0:
+            self.net = nn.Sequential(
+                nn.Linear(cfg.latent_dim, w), nn.GELU(), nn.Linear(w, out_dim))
+        else:
+            self.net = nn.Linear(cfg.latent_dim, out_dim)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z).reshape(*z.shape[:-1], N_PLAYERS, self.n_channels)
