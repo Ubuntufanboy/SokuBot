@@ -40,6 +40,7 @@ import torch
 from sokubot.config import Config
 from sokubot.data.state import STATE_CHANNELS, read_state
 from sokubot.model.augmented import HUD_CHANNELS
+from sokubot.model.loading import load_world_model
 from sokubot.model.world_model import LeWorldModel
 from scripts.eval_ckpt import predictor_skill
 from scripts.horizon_ablation import TARGETS, capture_paths, encode_all, load_replay
@@ -70,11 +71,16 @@ def main() -> int:
             f"{HUD_CHANNELS} disagree. These index the same array positionally; "
             f"letting them drift would silently permute the state.")
 
-    blob = torch.load(a.ckpt, map_location=a.device, weights_only=False)
-    cfg: Config = blob["cfg"]
-    cfg.device = a.device
-    wm = LeWorldModel(cfg).to(a.device)
-    wm.load_state_dict(blob["model"])
+    # Through load_world_model, not LeWorldModel(cfg) + strict load. The
+    # config in a checkpoint is a PICKLED dataclass, so any field added since
+    # it was written falls through to today's class default -- and the fields
+    # that gate a head thereby invent heads the weights have no entries for.
+    # Building by hand here died with "Missing key(s): hud_head.weight,
+    # idm_head..." on a checkpoint that predates both, which is the failure
+    # docs/BUGS.md 8 describes and load_world_model exists to prevent.
+    wm, cfg, notes = load_world_model(a.ckpt, device=a.device)
+    for n in notes:
+        print(f"  cfg reconciled: {n}", flush=True)
     wm.eval()
     fp = model_fingerprint(wm)
     print(f"{a.ckpt}  fingerprint {fp}", flush=True)
