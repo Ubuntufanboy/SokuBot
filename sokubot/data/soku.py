@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Sequence
 
+from .state import read_state
+
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -59,6 +61,11 @@ class Capture:
     video: Path
     inputs: Path
     frames: int
+    # Written beside the video by pipeline/align_sidecar.py, indexed so row i
+    # is video frame i. None for captures that predate the state labels, which
+    # is most of the corpus until the re-run lands -- so this must stay
+    # optional rather than becoming a reason to drop a capture.
+    state: Path | None = None
 
 
 def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
@@ -86,6 +93,7 @@ def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
                 if not video.is_absolute():
                     video = mf.parent / video
                 inputs = video.parent / "inputs.csv"
+                state = video.parent / "state.csv"
                 if not (video.exists() and inputs.exists()):
                     continue
                 seen.add(rid)
@@ -94,6 +102,7 @@ def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
                         replay_id=rid,
                         video=video,
                         inputs=inputs,
+                        state=state if state.exists() else None,
                         frames=int(e.get("frames") or 0),
                     )
                 )
@@ -304,6 +313,20 @@ class SokuWindowDataset(IterableDataset):
         idx = 0          # index of the next decision frame
         emitted = 0
         want_hud = cfg.hud_coef > 0
+        # Game-state labels, if this capture has them and the objective wants
+        # them. A capture without them is skipped rather than yielded with the
+        # channel missing: a batch where only some samples carry supervision
+        # would train the head on an unrepresentative subset without saying so.
+        want_state = getattr(cfg, "state_coef", 0.0) > 0
+        state_arr = state_valid = None
+        if want_state:
+            if cap.state is None:
+                return
+            try:
+                state_arr, state_valid = read_state(cap.state)
+            except (ValueError, OSError) as exc:
+                print(f"[soku] skipping {cap.replay_id}: {exc}")
+                return
         stream = (decode_frames_hud(cap.video, cfg.image_size, skip) if want_hud
                   else ((f, None) for f in
                         decode_frames(cap.video, cfg.image_size, skip)))
@@ -337,6 +360,16 @@ class SokuWindowDataset(IterableDataset):
             }
             if want_hud:
                 sample["hud"] = torch.from_numpy(np.stack(hud_buf)).float()
+            if want_state:
+                # Decision step d is source frame d*skip, and state.csv is
+                # indexed by source frame, so the labels are gathered rather
+                # than streamed alongside the decode.
+                rows = [(start + k) * skip for k in range(T)]
+                if rows[-1] >= len(state_arr):
+                    break          # labels end before the video does
+                sample["state"] = torch.from_numpy(state_arr[rows]).float()
+                sample["state_valid"] = torch.from_numpy(
+                    state_valid[rows].copy())
             yield sample
 
     def __iter__(self) -> Iterator[dict]:

@@ -174,6 +174,17 @@ def compute_losses(
         l_hud = F.mse_loss(model.predict_hud(out.z), hud)
         total = total + cfg.hud_coef * l_hud
 
+    state_metrics: dict = {}
+    if getattr(cfg, "state_coef", 0.0) > 0 and "state" in batch:
+        from .model.state_head import state_loss
+        st = batch["state"].to(device, non_blocking=True)   # [B, T, 2, C]
+        valid = batch.get("state_valid")
+        valid = valid.to(device, non_blocking=True) if valid is not None else None
+        l_state, state_metrics = state_loss(
+            model.predict_state(out.z), st, valid,
+            pos_weight=_state_pos_weight().to(out.z.device))
+        total = total + cfg.state_coef * l_state
+
     # Every entry below ends in .item(), which synchronises the GPU and drains
     # the pipeline, and effective_rank runs a CPU eigendecomposition on top.
     # Skipping it on non-logging steps is most of what `metrics_every` buys.
@@ -189,6 +200,7 @@ def compute_losses(
             "l_cf": float(l_cf.item()),
             "l_idm": float(l_idm.item()),
             **idm_metrics,
+            **state_metrics,
             "cf_acc": float(cf_acc.item()) if cfg.cf_coef > 0 else 0.0,
             "l_hud": float(l_hud.item()),
             "latent_var": float(flat.var(dim=0).mean().item()),
