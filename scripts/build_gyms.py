@@ -31,12 +31,30 @@ involved. Where the HUD cannot see something -- knockdown, projectiles, position
 -- there is no gym here, and inventing one from the probe would be worse than
 not having it.
 
-WHAT IS DELIBERATELY MISSING
------------------------------
-`knockdown` and `projectile_pressure`, the two situations most worth drilling
-after blocking. Neither is in the HUD. They need either a small pixel detector
-(the `banner` pattern: a few hundred labels went a long way) or game state
-logged at capture time.
+WHAT THE GAME STATE ADDED
+-------------------------
+The four gyms above are all the HUD can see, and this file used to say so:
+"`knockdown` and `projectile_pressure`, the two situations most worth drilling
+after blocking, are not in the HUD -- they need a pixel detector or game state
+logged at capture time." The state is logged now
+(`dll/include/sfe/player_state.hpp`, verified against the game over 66 380
+frames), so the mechanic gyms below select on what actually happened rather
+than on a proxy for it: blockstun beginning, a guard breaking, a body on the
+floor.
+
+Those gyms are keyed to the three mechanics the agent has to master, in the
+order they matter. Blocking first, because an agent that does not block loses
+in seconds rather than minutes.
+
+DODGING IS STILL NOT HERE, AND `hit_clean` IS NOT IT
+-----------------------------------------------------
+Nothing in the sidecar sees projectiles, so a gym claiming to drill dodging
+would be selecting on a guess. What the labels do support is the *outcome*
+dodging avoids: taking damage while not in blockstun -- a clean hit. Drilling
+that teaches avoidance in general (block, or move) rather than evasion
+specifically, and it is named for what it selects instead of what one might
+hope it teaches. Real projectile pressure needs a detector, and that is honest
+work still to do.
 """
 
 from __future__ import annotations
@@ -49,9 +67,18 @@ import numpy as np
 
 HP1, HP2, SPIRIT1, SPIRIT2, COMBO1, COMBO2 = range(6)
 
+# Columns of the state array, from sokubot/data/state.py::STATE_CHANNELS.
+DX, FACING, GUARDING, WRONGBLOCK, CRUSHED, KNOCKDOWN, AIRBORNE = range(7)
+# "Close" in game units on a stage about 1200 wide. Blocking is only a decision
+# at a range where the opponent can reach; at full screen the same frame is a
+# neutral one and drilling it as a blocking rep teaches nothing.
+NEAR = 250.0
+
 
 def build(Hd: np.ndarray, E: np.ndarray, horizon: int, history: int,
-          combo_min: float, low_hp: float) -> dict:
+          combo_min: float, low_hp: float,
+          S: np.ndarray | None = None, SV: np.ndarray | None = None,
+          span: float = 1200.0) -> dict:
     """-> {name: (starts [N], sides [N])}, sides being 0 for P1."""
     n = len(Hd)
     # A window must stay inside one replay, in both directions: `history-1`
@@ -90,6 +117,64 @@ def build(Hd: np.ndarray, E: np.ndarray, horizon: int, history: int,
         calm & (hp2 <= low_hp) & (hp2 < hp1))
     add("neutral", calm & (hp1 > low_hp) & (hp2 > low_hp),
         calm & (hp2 > low_hp) & (hp1 > low_hp))
+
+    if S is None:
+        return gyms
+
+    # ---- mechanic gyms, from the game's own state ------------------------
+    # Windows containing a padded label are dropped outright. `label_valid` is
+    # 0 on frames the re-capture did not cover, filled by repeating a neighbour;
+    # selecting a gym on an invented frame would drill a situation that never
+    # happened.
+    if SV is not None:
+        keep = np.ones(len(idx), dtype=bool)
+        for k in range(0, horizon + 1):
+            keep &= SV[idx + k]
+    else:
+        keep = np.ones(len(idx), dtype=bool)
+
+    def soon(col: int, side: int) -> np.ndarray:
+        """Does `col` turn on for `side` within the horizon, having been off?"""
+        now = S[idx, side, col] > 0.5
+        later = np.zeros(len(idx), dtype=bool)
+        for k in range(1, horizon + 1):
+            later |= S[idx + k, side, col] > 0.5
+        return (~now) & later & keep
+
+    near = np.abs(S[idx, 0, DX]) * span < NEAR
+
+    # BLOCKING. The rep is the frame *before* blockstun starts, because that is
+    # where holding away is still a decision -- once in blockstun the input is
+    # already committed. Restricted to close range for the same reason.
+    add("blocking",
+        (soon(GUARDING, 0) | soon(WRONGBLOCK, 0)) & near,
+        (soon(GUARDING, 1) | soon(WRONGBLOCK, 1)) & near)
+
+    # GUARD BREAK. Crushed is 0.04% of frames and the most punishing thing that
+    # happens to a defender, so it would never be sampled by accident.
+    add("guard_break", soon(CRUSHED, 0), soon(CRUSHED, 1))
+
+    # KNOCKDOWN, both chairs. On the floor is the situation the brief named
+    # explicitly; the same frame from the other seat is okizeme, which is where
+    # combos are extended.
+    down1 = (S[idx, 0, KNOCKDOWN] > 0.5) & keep
+    down2 = (S[idx, 1, KNOCKDOWN] > 0.5) & keep
+    add("knocked_down", down1, down2)
+    add("okizeme", down2 & near, down1 & near)
+
+    # A clean hit: damage arriving without blockstun. Named for what it
+    # selects; see the docstring on why this is not a dodging gym.
+    hurt1 = np.zeros(len(idx), dtype=bool)
+    hurt2 = np.zeros(len(idx), dtype=bool)
+    for k in range(1, horizon + 1):
+        hurt1 |= Hd[idx + k, COMBO1] >= combo_min
+        hurt2 |= Hd[idx + k, COMBO2] >= combo_min
+    blocked1 = np.zeros(len(idx), dtype=bool)
+    blocked2 = np.zeros(len(idx), dtype=bool)
+    for k in range(0, horizon + 1):
+        blocked1 |= S[idx + k, 0, GUARDING] > 0.5
+        blocked2 |= S[idx + k, 1, GUARDING] > 0.5
+    add("hit_clean", hurt1 & ~blocked1 & keep, hurt2 & ~blocked2 & keep)
     return gyms
 
 
@@ -110,7 +195,18 @@ def main() -> int:
     if "hud" not in b.files:
         raise SystemExit(f"{a.bank} has no `hud`; build it with build_hud_bank")
     Hd, E = b["hud"].astype(np.float32), b["ep"]
-    gyms = build(Hd, E, a.horizon, a.history, a.combo_min, a.low_hp)
+    # The state array is optional: a bank built before the corpus was
+    # re-captured has none, and the four HUD gyms are still worth having on
+    # their own. Saying which happened matters, though -- silently producing
+    # four gyms where nine were expected is the kind of thing that reads as
+    # "the mechanic gyms did not select anything".
+    S = b["state"].astype(np.float32) if "state" in b.files else None
+    SV = b["state_valid"] if "state_valid" in b.files else None
+    if S is None:
+        print("note: bank has no `state`; building the four HUD gyms only. "
+              "Rebuild with build_hud_bank once the corpus has state.csv.gz "
+              "for the mechanic gyms.\n")
+    gyms = build(Hd, E, a.horizon, a.history, a.combo_min, a.low_hp, S, SV)
 
     total = sum(len(v[0]) for v in gyms.values())
     print(f"bank {len(Hd)} steps, {int(E.max())+1} replays | horizon "
@@ -135,7 +231,7 @@ def main() -> int:
         {"bank": str(a.bank), "horizon": a.horizon, "gyms": meta}, indent=1))
 
     print(f"\n-> {a.out}")
-    up = meta["under_pressure"]
+    up = meta.get("blocking") or meta["under_pressure"]
     print(f"\nThe blocking gym has {up['pairs']} pairs across {up['replays']} "
           f"replays, at mean\nhealth {up['mean_hp_mine']:.2f} and mean red "
           f"{up['mean_red_mine']:.3f} on the agent's own bar.")

@@ -213,8 +213,10 @@ def main() -> int:
     ap.add_argument("--gym", default=None, metavar="NAME",
                     help="drill one situation instead of sampling the whole "
                          "bank. Needs --gyms; names come from "
-                         "scripts.build_gyms (under_pressure, pressuring, "
-                         "losing, neutral).\n"
+                         "scripts.build_gyms. From the HUD: under_pressure, "
+                         "pressuring, losing, neutral. From the game state, "
+                         "once the bank has it: blocking, guard_break, "
+                         "knocked_down, okizeme, hit_clean.\n"
                          "WARNING: a gym is only worth training on if the world "
                          "model can represent the mechanic it drills. "
                          "scripts/block_effect.py measured the JEPA model with "

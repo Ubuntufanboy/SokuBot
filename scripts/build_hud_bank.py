@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 from sokubot.config import Config
+from sokubot.data.state import STATE_CHANNELS, read_state
 from sokubot.model.augmented import HUD_CHANNELS
 from sokubot.model.world_model import LeWorldModel
 from scripts.eval_ckpt import predictor_skill
@@ -82,7 +83,8 @@ def main() -> int:
     rows = [json.loads(l) for l in manifest.read_text().splitlines() if l.strip()]
     np.random.default_rng(a.seed).shuffle(rows)
 
-    zs, acts, huds, ep, kept = [], [], [], [], 0
+    zs, acts, huds, sts, svs, ep, kept = [], [], [], [], [], [], 0
+    n_with_state = 0
     for r in rows:
         if kept >= a.replays:
             break
@@ -97,10 +99,36 @@ def main() -> int:
         D = min(len(obs), len(chunks), len(labels))
         if D < 64:
             continue
+        # Game state, if pipeline/align_sidecar.py has written it beside the
+        # video. Decision step d is source frame d*skip, the same mapping the
+        # loader uses -- state.csv is indexed by source frame, so this is a
+        # gather rather than a slice, and getting it wrong would shift every
+        # label by a factor of frame_skip while still producing a full array.
+        st = sv = None
+        state_path = next((c for c in (video.parent / "state.csv.gz",
+                                       video.parent / "state.csv")
+                           if c.exists()), None)
+        if state_path is not None:
+            try:
+                arr, valid = read_state(state_path)
+                rows_i = np.arange(D) * cfg.frame_skip
+                if rows_i[-1] < len(arr):
+                    st, sv = arr[rows_i], valid[rows_i]
+                    n_with_state += 1
+            except (ValueError, OSError) as exc:
+                print(f"  state skipped for {r.get('replay_id')}: {exc}",
+                      flush=True)
+
         z = encode_all(wm, obs[:D], a.device)
         zs.append(z.astype(np.float16))
         acts.append(chunks[:D].astype(np.uint8))
         huds.append(labels[:D].astype(np.float16))
+        # A replay without labels contributes zeros marked invalid rather than
+        # being dropped: the HUD gyms still want it, and `state_valid` is what
+        # keeps the mechanic gyms from selecting inside it.
+        sts.append(st.astype(np.float16) if st is not None
+                   else np.zeros((D, 2, len(STATE_CHANNELS)), np.float16))
+        svs.append(sv if sv is not None else np.zeros(D, bool))
         ep.append(np.full(D, kept, dtype=np.int32))
         kept += 1
         del obs, chunks, labels
@@ -120,7 +148,8 @@ def main() -> int:
         raise SystemExit(f"only {kept} replays usable")
     Z = np.concatenate(zs); A = np.concatenate(acts)
     Hd = np.concatenate(huds); E = np.concatenate(ep)
-    del zs, acts, huds, ep
+    St = np.concatenate(sts); Sv = np.concatenate(svs)
+    del zs, acts, huds, sts, svs, ep
 
     # HUD is a fraction of a gauge, so anything outside [0,1] is a reader bug
     # rather than a rare state, and it would be learned as a target.
@@ -130,7 +159,8 @@ def main() -> int:
     if not np.isfinite(Hd).all():
         raise SystemExit("hud contains non-finite values")
 
-    np.savez(a.out, z=Z, a=A, hud=Hd, ep=E, fingerprint=fp,
+    np.savez(a.out, z=Z, a=A, hud=Hd, ep=E, state=St,
+             state_valid=Sv, fingerprint=fp,
              encoder_fingerprint=encoder_fingerprint(wm),
              hud_channels=np.array(HUD_CHANNELS))
     # A receipt: the bank is only meaningful paired with the weights that encoded
