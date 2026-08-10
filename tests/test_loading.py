@@ -116,12 +116,43 @@ def test_a_checkpoint_with_an_idm_head_keeps_it(tmp_path):
     assert torch.allclose(wm.idm_head.net[0].weight, model.idm_head.net[0].weight)
 
 
+# Coefficients that weight a loss term without gating a module. These leave no
+# trace in the weights, so there is nothing for reconcile_config to restore.
+# Listing them explicitly is the point: a new *_coef is assumed to gate a
+# module until someone says otherwise, so forgetting fails the test.
+NON_GATING_COEFS = {
+    "cf_coef", "sigreg_coef", "pred_coef", "var_coef", "cov_coef",
+    "entropy_coef", "kl_coef", "value_coef", "aux_coef",
+}
+
+
 def test_every_config_gated_module_is_in_the_reconcile_table():
-    """A guard against the next one. Any Config field named *_coef that gates a
-    module must appear in reconcile_config, or checkpoints written before it
-    break on load with a confusing missing-key error."""
+    """A guard against the next one, and this time not one that must be
+    remembered.
+
+    The previous version listed ("hud_coef", "idm_coef") by hand, so adding a
+    third gating field and forgetting it passed cleanly -- which is exactly the
+    failure it was written to stop. `hud_coef` broke every earlier checkpoint
+    once, `idm_coef` did it again a day later, and both times the symptom was a
+    confusing "Missing key(s) in state_dict" on artifacts that loaded fine the
+    day before.
+
+    So the fields are discovered rather than listed, and anything ending in
+    _coef must either be reconciled or be declared non-gating above.
+    """
     import inspect
+    from dataclasses import fields
+    from sokubot.config import Config
     from sokubot.model import loading
+
     src = inspect.getsource(loading.reconcile_config)
-    for name in ("hud_coef", "idm_coef"):
-        assert name in src, f"{name} gates a head but is not reconciled"
+    coefs = {f.name for f in fields(Config) if f.name.endswith("_coef")}
+    assert coefs, "no *_coef fields found; has Config been renamed?"
+
+    missing = [c for c in sorted(coefs)
+               if c not in src and c not in NON_GATING_COEFS]
+    assert not missing, (
+        f"{missing} end in _coef but are neither reconciled in "
+        f"reconcile_config nor declared in NON_GATING_COEFS. If one gates a "
+        f"module, add it to the table; if it only weights a loss, add it to "
+        f"NON_GATING_COEFS.")

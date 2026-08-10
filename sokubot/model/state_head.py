@@ -1,0 +1,160 @@
+"""Predict the game's own state from the latent, to force the latent to keep it.
+
+WHY THIS HEAD EXISTS
+--------------------
+The encoder does not represent where the characters are. `spatial_probe.py`
+puts a linear probe at AUC 0.540 for "did the characters swap sides" against a
+0.956 ceiling for "did the HUD swap sides", and `block_effect.py` finds the
+predictor forecasting *less* damage when the defender holds no direction at
+all -- the sign of guarding, inverted. Blocking in Hisoutensoku is holding away
+from the opponent, so a model that cannot see which side they are on cannot
+represent the mechanic the matchup runs through.
+
+Two objectives failed to recover it from pixels alone at this scale: plain
+JEPA prediction, and JEPA plus inverse dynamics. Both improved the
+representation and neither flipped the sign:
+
+    objective          spatial AUC   inv_dyn_auc   guarding predicts less damage?
+    JEPA 225k              0.540        0.7347                 no
+    + IDM 1.0              0.651        0.7733                 no
+    + balanced 9.0         0.688        0.7898                 no
+
+Two independent levers moving the proxy and leaving the target untouched is
+the argument for stopping: "away" is a fact about relative position, and
+nothing in pixels-plus-inputs ever states it. So this stops asking the model
+to infer what the game can simply be asked.
+
+THE CONSTRAINT IS UNCHANGED
+---------------------------
+It was always about *inference*: the policy at play time consumes pixels and
+its own inputs, nothing else. These labels never reach it. They shape a world
+model, which is the same asymmetric arrangement `hud_coef` already uses -- the
+only difference being that the HUD is legible in pixels and position is not.
+
+WHY THE HEAD IS LINEAR
+----------------------
+Deliberately, and for the same reason `probe.py` keeps the reward probe linear:
+a head with enough capacity to recover position from a representation that
+does not hold it would let the encoder off the hook. A linear head can only
+succeed if the latent is linearly separable in the quantity, which is exactly
+the property the spatial probe measures and the property downstream needs.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from ..config import Config
+from ..data.state import STATE_CHANNELS
+
+N_PLAYERS = 2
+
+# The channels are not homogeneous and must not share a loss. `dx` is a signed
+# continuous separation and `facing` is +-1; the rest are indicator flags whose
+# base rates run from 5.5% (guarding) down to 0.04% (crushed), where a plain
+# mean-squared error is minimised by predicting "never".
+CONTINUOUS = tuple(i for i, c in enumerate(STATE_CHANNELS)
+                   if c in ("dx", "facing"))
+BINARY = tuple(i for i in range(len(STATE_CHANNELS)) if i not in CONTINUOUS)
+
+# Measured over the first 941 captures of the corpus re-run: guarding 5.5%,
+# knockdown 2.5%, wrongblock 1.1%, crushed 0.04%, airborne 45%. A single
+# pos_weight across such different rates would over-correct `airborne` while
+# barely touching `crushed`, so it is per channel and derived from the rate.
+DEFAULT_POS_RATE = {"guarding": 0.055, "wrongblock": 0.011, "crushed": 0.0004,
+                    "knockdown": 0.025, "airborne": 0.45}
+
+
+def default_pos_weight() -> torch.Tensor:
+    """(1 - p) / p per binary channel, clamped so `crushed` cannot dominate.
+
+    The uncorrected weight for crushed is 2500, which would make a channel
+    worth 0.04% of frames the largest term in the objective. 50 keeps it
+    present without letting it steer.
+    """
+    w = [min((1 - DEFAULT_POS_RATE[STATE_CHANNELS[i]])
+             / DEFAULT_POS_RATE[STATE_CHANNELS[i]], 50.0) for i in BINARY]
+    return torch.tensor(w, dtype=torch.float32)
+
+
+class StateHead(nn.Module):
+    """[..., latent] -> [..., 2, len(STATE_CHANNELS)], per player.
+
+    Continuous channels come out raw; binary channels come out as logits, so
+    the loss can apply BCE-with-logits and stay numerically sane.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.n_channels = len(STATE_CHANNELS)
+        self.net = nn.Linear(cfg.latent_dim, N_PLAYERS * self.n_channels)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).reshape(*z.shape[:-1], N_PLAYERS, self.n_channels)
+
+
+def state_loss(pred: torch.Tensor, target: torch.Tensor,
+               valid: torch.Tensor | None = None,
+               pos_weight: torch.Tensor | None = None
+               ) -> tuple[torch.Tensor, dict]:
+    """pred/target [..., 2, C]; `valid` [...] marks frames that are real labels.
+
+    `valid` is not optional in spirit. Frames the re-capture did not cover are
+    filled by repeating the nearest real row (`pipeline/align_sidecar.py`), and
+    training on them as if measured is exactly the quiet error the flag exists
+    to prevent. Passing None means "every frame is real", which is true only of
+    a capture that was never aligned.
+    """
+    if pred.shape != target.shape:
+        raise ValueError(f"pred {tuple(pred.shape)} != target "
+                         f"{tuple(target.shape)}")
+
+    if valid is None:
+        w = torch.ones(pred.shape[:-2], device=pred.device, dtype=pred.dtype)
+    else:
+        w = valid.to(pred.dtype)
+    denom = w.sum().clamp(min=1.0)
+    # [..., 1, 1] so it broadcasts over player and channel.
+    wb = w[..., None, None]
+
+    cont_idx = torch.tensor(CONTINUOUS, device=pred.device)
+    bin_idx = torch.tensor(BINARY, device=pred.device)
+
+    cont_err = (pred.index_select(-1, cont_idx)
+                - target.index_select(-1, cont_idx)) ** 2
+    l_cont = (cont_err * wb).sum() / (denom * N_PLAYERS * len(CONTINUOUS))
+
+    bin_logits = pred.index_select(-1, bin_idx)
+    bin_target = target.index_select(-1, bin_idx)
+    pw = pos_weight.to(pred.device) if pos_weight is not None else None
+    bce = F.binary_cross_entropy_with_logits(
+        bin_logits, bin_target, reduction="none", pos_weight=pw)
+    l_bin = (bce * wb).sum() / (denom * N_PLAYERS * len(BINARY))
+
+    loss = l_cont + l_bin
+    with torch.no_grad():
+        metrics = {"state_loss": float(loss.detach()),
+                   "state_cont_mse": float(l_cont.detach()),
+                   "state_bin_bce": float(l_bin.detach()),
+                   "state_frames": float(denom)}
+        # dx is the channel the whole exercise is about, so it is reported on
+        # its own and as a variance-explained figure rather than an error --
+        # an MSE tells you nothing without knowing the spread it is against.
+        dx = STATE_CHANNELS.index("dx")
+        t = target[..., dx][w.bool()] if valid is not None else target[..., dx]
+        p = pred[..., dx][w.bool()] if valid is not None else pred[..., dx]
+        if t.numel() > 1:
+            var = t.var()
+            metrics["state_dx_r2"] = float(
+                1.0 - ((p - t) ** 2).mean() / var.clamp(min=1e-8))
+        for k, i in enumerate(BINARY):
+            name = STATE_CHANNELS[i]
+            tt = target[..., i][w.bool()] if valid is not None else target[..., i]
+            pp = pred[..., i][w.bool()] if valid is not None else pred[..., i]
+            if tt.numel() == 0:
+                continue
+            hit = ((pp > 0).float() == tt).float().mean()
+            metrics[f"state_{name}_acc"] = float(hit)
+    return loss, metrics

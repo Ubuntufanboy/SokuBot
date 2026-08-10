@@ -136,6 +136,21 @@ class Config:
     # 0.117 against hud.py's 0.012, a 10x degradation of information that is
     # present in its input. 0 disables the head entirely.
     hud_coef: float = 0.25
+    # Weight on predicting the game's own state -- both players' separation,
+    # facing, guard, wrong-block, crush, knockdown and airborne -- from the
+    # encoder latent, with the gradient reaching the encoder.
+    #
+    # DEFAULTS TO 0, AND MUST. A gating field with a positive default rebuilds
+    # the architecture of every checkpoint written before it existed;
+    # `hud_coef` did that once and `idm_coef` did it again a day after the
+    # lesson was written down. 0 means old checkpoints are untouched, and
+    # `model/loading.py` restores the head for any checkpoint that has one.
+    #
+    # Labels come from `pipeline/align_sidecar.py` and never reach the policy:
+    # this shapes a world model, exactly as hud_coef does. See
+    # `model/state_head.py` for the three objectives that failed to recover
+    # position from pixels before this was reached for.
+    state_coef: float = 0.0
     # Weight on recovering both players' buttons from a latent transition, with
     # the gradient reaching the ENCODER. This is the term that decides what the
     # representation keeps.

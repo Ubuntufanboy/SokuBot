@@ -64,12 +64,27 @@ def reconcile_config(cfg: Config, state: Dict[str, Any]) -> List[str]:
     # `Config` that gates a module must be added to this list, and the failure
     # if it is not is a confusing "Missing key(s) in state_dict" on artifacts
     # that were fine the day before.
-    for coef_name, weight_key in (("hud_coef", "hud_head.weight"),
-                                  ("idm_coef", "idm_head.net.0.weight")):
+    # The third element is the value to use when the checkpoint HAS the head
+    # but the config disabled it. It cannot just be the class default any more:
+    # the lesson from those two breakages is that a gating field should default
+    # to 0, and "restoring" a 0 default leaves the head unbuilt -- turning this
+    # repair into the very missing-key error it exists to prevent. None means
+    # "the class default is positive, use it".
+    for coef_name, weight_key, rebuild_with in (
+            ("hud_coef", "hud_head.weight", None),
+            ("idm_coef", "idm_head.net.0.weight", None),
+            ("state_coef", "state_head.net.weight", 1.0)):
         present = weight_key in state
         value = getattr(cfg, coef_name, 0.0)
         if present and value <= 0:
-            setattr(cfg, coef_name, getattr(Config, coef_name))
+            fallback = getattr(Config, coef_name) if rebuild_with is None \
+                else rebuild_with
+            if fallback <= 0:
+                raise ValueError(
+                    f"{coef_name} would be rebuilt with {fallback:g}, which "
+                    f"leaves the head unbuilt and the load failing on a "
+                    f"missing key; give it an explicit rebuild_with here")
+            setattr(cfg, coef_name, fallback)
             notes.append(
                 f"checkpoint has {weight_key.split('.')[0]} but cfg.{coef_name} "
                 f"was 0; set to {getattr(cfg, coef_name):g} so the head is built")

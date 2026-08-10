@@ -27,6 +27,7 @@ from .action_encoder import ActionEncoder
 from .encoder import ViTEncoder
 from .predictor import LatentPredictor
 from .inverse_dynamics import InverseDynamicsHead
+from .state_head import StateHead
 
 
 N_HUD = len(FRAME_HUD_CHANNELS)
@@ -68,6 +69,12 @@ class LeWorldModel(nn.Module):
         # encoder when the counterfactual loss's deliberately is not.
         self.idm_head = (InverseDynamicsHead(cfg, cfg.idm_width)
                          if getattr(cfg, "idm_coef", 0.0) > 0 else None)
+        # Supervised game state -- separation, facing, guard, knockdown. Read
+        # out of the game's memory at capture time and never available at
+        # inference; see model/state_head.py for why the model is told this
+        # rather than asked to infer it.
+        self.state_head = (StateHead(cfg)
+                           if getattr(cfg, "state_coef", 0.0) > 0 else None)
 
     # ---------------- training ----------------
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> ForwardOut:
@@ -85,6 +92,19 @@ class LeWorldModel(nn.Module):
             raise RuntimeError(
                 "this model was built with hud_coef = 0, so it has no HUD head")
         return torch.sigmoid(self.hud_head(z))
+
+    def predict_state(self, z: torch.Tensor) -> torch.Tensor:
+        """[..., latent] -> [..., 2, len(STATE_CHANNELS)]. Needs state_coef > 0.
+
+        Continuous channels are raw and binary channels are LOGITS, because
+        `state_head.state_loss` applies BCE-with-logits. Anything reading these
+        for display has to apply its own sigmoid.
+        """
+        if self.state_head is None:
+            raise RuntimeError(
+                "this model was built with state_coef = 0, so it has no state "
+                "head")
+        return self.state_head(z)
 
     # ---------------- planning ----------------
     def rollout(
