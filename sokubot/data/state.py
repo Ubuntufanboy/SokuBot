@@ -89,8 +89,31 @@ def has_state_columns(path: Path) -> bool:
     return all(f"p{i}_{c}" in cols for i in (1, 2) for c in _PER_PLAYER)
 
 
-def read_state(path: Path) -> np.ndarray:
-    """inputs.csv -> float32 [N, 2, len(STATE_CHANNELS)], indexed [frame, player].
+LABEL_VALID = "label_valid"
+
+
+def read_state(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """state csv -> (float32 [N, 2, len(STATE_CHANNELS)], bool [N]).
+
+    THE SECOND RETURN IS NOT OPTIONAL, ON PURPOSE
+    ---------------------------------------------
+    Labels produced by `pipeline/align_sidecar.py` are a *re-capture* of the
+    replay attached to the video already on disk, and the two captures do not
+    begin on exactly the same engine tick. Frames at the very start or end that
+    the re-capture did not cover are filled by repeating the nearest real row
+    and marked `label_valid = 0`, so that row i stays video frame i. Measured
+    over 941 real pairs that is 420 frames in total, worst case 8 -- 0.004% --
+    but they are invented and must not be trained on as if measured.
+
+    This returns a tuple rather than an array with an optional flag because a
+    mask that must be remembered will eventually not be (docs/BUGS.md 8). A
+    caller that ignores it has to write `state, _ = read_state(...)`, which is
+    a decision; `state = read_state(...)` no longer type-checks or unpacks into
+    an array of the right shape.
+
+    Captures with no `label_valid` column -- anything taken directly rather
+    than aligned -- report every frame valid, which is correct: nothing was
+    filled in.
 
     Player-major rather than one flat row, because every consumer wants "my
     state" and "their state" chosen by `side`, exactly as `rl/reward.py::_sides`
@@ -108,7 +131,9 @@ def read_state(path: Path) -> np.ndarray:
                     f"This capture predates game-state logging; use "
                     f"has_state_columns() to skip it.")
 
+        has_valid = LABEL_VALID in cols
         rows: List[np.ndarray] = []
+        valid: List[bool] = []
         for n, row in enumerate(reader):
             # A truncated final row is a real thing: the extractor is killed at
             # MAX_FRAMES and on scene changes, so the last line can be a partial
@@ -139,10 +164,13 @@ def read_state(path: Path) -> np.ndarray:
                 out[me, 5] = float(row[f"p{me+1}_knockdown"])
                 out[me, 6] = 1.0 if y[me] > FLOOR_EPS else 0.0
             rows.append(out)
+            valid.append(bool(int(float(row[LABEL_VALID]))) if has_valid
+                         else True)
 
     if not rows:
         raise ValueError(f"{path}: no rows")
     arr = np.stack(rows)
+    mask = np.array(valid, dtype=bool)
     # `dx` is the only unbounded channel and the only one that can reveal a
     # wrong offset. A stage is about 1200 units across, so anything far outside
     # that means the read is not a position at all -- which is the failure mode
@@ -153,4 +181,4 @@ def read_state(path: Path) -> np.ndarray:
             f"{path}: dx spans [{lo:.2f}, {hi:.2f}] in stage widths, which is "
             f"not a position. Check CHAR_POSITION_X_OFFSET against the game "
             f"build before trusting any of these labels.")
-    return arr
+    return arr, mask
