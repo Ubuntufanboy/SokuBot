@@ -223,6 +223,15 @@ def main() -> int:
                          "the sign of guarding INVERTED, so training "
                          "under_pressure on that model teaches the agent not to "
                          "block, efficiently. Check block_effect first.")
+    ap.add_argument("--damage-dealt", type=float, default=1.0,
+                    help="weight on damage the agent deals. Lower it for a "
+                         "defensive drill; 0 pays purely for not being hit.")
+    ap.add_argument("--combo", type=float, default=0.10,
+                    help="weight on extending a combo (offensive)")
+    ap.add_argument("--idle", type=float, default=-0.020,
+                    help="per-step penalty for standing still. Blocking LOOKS "
+                         "like standing still, so a defensive drill wants this "
+                         "at or near 0.")
     ap.add_argument("--gyms", type=Path, default=None,
                     help="the npz written by scripts.build_gyms")
     ap.add_argument("--seed", type=int, default=0)
@@ -271,8 +280,21 @@ def main() -> int:
     # causality is backwards. At 0.010/step the penalty over a 16-step rollout is
     # 0.16, barely covering that; at 0.020 it is 0.32, so standing still is
     # clearly unprofitable even when the model is wrong about why.
-    rcfg = RewardConfig(combo=0.10, crush=0.0, whiff=-0.25, spell_cost_min=1e9,
-                        flying=0.0015, idle=-0.020, ko_source=a.ko_source)
+    rcfg = RewardConfig(combo=a.combo, crush=0.0, whiff=-0.25,
+                        spell_cost_min=1e9, flying=0.0015, idle=a.idle,
+                        ko_source=a.ko_source)
+    rcfg.damage_dealt = a.damage_dealt
+    # A DEFENCE-WEIGHTED reward, for the gyms that drill not being hit.
+    #
+    # Measured on the blocking gym with the default weights: rollouts that hold
+    # AWAY from the opponent score -0.222 and rollouts that hold TOWARD score
+    # -0.111, so the reward penalised blocking by 0.112 and GRPO correctly
+    # learned not to do it. Three separate terms push that way -- damage_dealt
+    # at 1.0 pays for offence, `combo` pays for extending one, and `idle`
+    # penalises exactly the stillness a block is made of.
+    #
+    # The gym cannot fix this: it chooses WHERE the agent starts, not what it
+    # is paid for. A drill for not being hit has to be paid for not being hit.
     if a.win_magnitude is not None:
         rcfg.win, rcfg.lose = a.win_magnitude, -a.win_magnitude
     if a.ko_source == "banner" and "ko_banner" not in probe.names:

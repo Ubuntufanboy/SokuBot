@@ -115,3 +115,67 @@ The button trace was NOT captured: results/match_vscom.json records scheduling
 only, so "does it hold back for seconds" is unanswered. The extractor DLL would
 answer it directly from game memory but cannot load on this laptop
 (new-WoW64); that measurement needs the .130 sandbox.
+
+---
+
+# Why GRPO could not learn, and a correction to the gate above
+
+The 20 000-step coin flip is not a training bug. The plumbing is healthy --
+measured on a real batch: within-group return spread 0.419, actions differing
+on 99.8% of entries, advantage std 0.9996, gradient norm 1.108 reaching 9 of 9
+tensors. Nothing is dead, stale or detached.
+
+The objective is FLAT in the dimension the mechanic lives in. Forcing the
+defender to hold one direction for a whole rollout, on 4096 paired starts with
+the same opponent:
+
+    away    reward -0.00125
+    toward  reward -0.00100
+    none    reward -0.05713
+
+    away - toward = -0.00025 +- 0.00761   (zero)
+    away - none   = +0.05588              (7 sem)
+
+Holding ANY direction is worth +0.056. Holding the RIGHT one is worth nothing.
+A blocking gym cannot teach blocking through a reward that cannot tell away
+from toward, and GRPO correctly reported that there was nothing to learn.
+
+## The gate above is weaker than it was written
+
+`block_effect` reports two contrasts and I quoted one:
+
+| checkpoint | direction vs none | mirror (left<->right) |
+|---|---|---|
+| baseline | -0.00028 | +0.000014 |
+| step 12000 | **+0.01712** | **-0.000221** |
+| step 32000 | **+0.01916** | -0.000093 |
+
+The state supervision taught the model that *a direction is being held*. It did
+not teach it *which*. The mirror contrast -- swap left and right and see if the
+prediction moves -- is flat at every checkpoint, before and after, and that is
+the contrast the mechanic actually needs. I reported "the block gate passes"
+on the first column without weighting the second, which was in the same JSON I
+printed.
+
+This is consistent with the spatial probe, which only moved 0.559 -> 0.620
+against a 0.958 ceiling: the model still barely knows which side the opponent
+is on. It is the same finding as
+memory/position-is-absent-from-the-cls-latent, and the fix is the one already
+filed: an encoder that cannot discard position, not another loss term and not
+another gym.
+
+## Also corrected: a bug I diagnosed that was not there
+
+An earlier run of the diagnostic showed rollouts holding away scoring 0.112
+WORSE than rollouts holding toward, and I called it the bug -- the reward
+penalising blocking. Repeating it across six seeds:
+
+    default          -0.042 +- 0.096
+    defence-weighted -0.040 +- 0.123
+
+Both indistinguishable from zero, and the single -0.112 was noise from an
+unseeded randomly-initialised policy at n~165. I nearly spent an hour of rented
+GPU fixing it. The `--damage-dealt`, `--combo` and `--idle` flags added for that
+fix are kept, because a defensive weighting is still the right thing for a
+defensive drill -- but they are not the bug and they do not change the away vs
+toward result (+0.00027 +- 0.00764).
