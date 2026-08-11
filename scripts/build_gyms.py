@@ -238,9 +238,15 @@ def main() -> int:
     print("Every pair carries its side: 'under_pressure' means the agent sits in "
           "the chair\nbeing hit. Sampling a side at random would put it in the "
           "attacker's seat half\nthe time and drill the opposite mechanic.")
-    print("\nNOT built, because the HUD cannot see them: knockdown, projectile "
-          "pressure,\nand anything positional. Those need a pixel detector or "
-          "state logged at capture.")
+    if any(k in gyms for k in ("blocking", "knocked_down")):
+        print("\nStill NOT built: projectile pressure, and so no dodging gym. "
+              "Nothing in\nthe sidecar sees projectiles, and `hit_clean` "
+              "selects the outcome dodging\navoids rather than the mechanic. "
+              "That one needs a pixel detector.")
+    else:
+        print("\nNOT built, because the HUD cannot see them: knockdown, "
+              "projectile pressure,\nand anything positional. Those need a "
+              "pixel detector or state logged at capture.")
     return 0
 
 
