@@ -179,3 +179,32 @@ GPU fixing it. The `--damage-dealt`, `--combo` and `--idle` flags added for that
 fix are kept, because a defensive weighting is still the right thing for a
 defensive drill -- but they are not the bug and they do not change the away vs
 toward result (+0.00027 +- 0.00764).
+
+---
+
+# Removing the HUD shortcut did not work either
+
+2400 steps of play-area-mirror augmentation (`state_coef 0.05`,
+`mirror_coef 0.20`) from the state-supervised checkpoint:
+
+| checkpoint | play | full (control) | identity |
+|---|---|---|---|
+| state-supervised | 0.6205 | 0.958 | 0.463 |
+| + play-mirror | **0.6047** | 0.950 | 0.479 |
+
+Flat, slightly down. The in-training metric moved a little in the right
+direction (`mirror_play` 0.185 -> 0.214 over the run) and skill was barely
+touched (0.605 -> 0.586), but the probe did not follow.
+
+The reasoning was sound and the result is still negative: making the HUD
+uninformative does not make the encoder pick up the characters. It has now
+survived JEPA, inverse dynamics, class-balanced IDM, direct per-frame dx
+supervision on 2003 replays, and an augmentation designed specifically to
+forbid the shortcut.
+
+That is five objectives against one representation, which is the argument for
+changing the representation. ViT-Tiny -> single CLS token -> BatchNorm
+projector pools the play area into one 192-d vector, and the fighters are small
+and fast where the HUD is large and slow. `full` mirroring reads 0.958, so the
+encoder can do horizontal discrimination when the evidence is big; it is the
+*characters* it will not keep.
