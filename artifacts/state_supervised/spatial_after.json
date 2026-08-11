@@ -1,0 +1,10 @@
+{
+ "wm": "/root/ckpt_state/best.pt",
+ "n": 1800,
+ "captures": 6,
+ "auc": {
+  "play": 0.6204777777777778,
+  "full": 0.957825,
+  "identity": 0.4632352941176471
+ }
+}
