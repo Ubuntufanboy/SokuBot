@@ -202,6 +202,26 @@ def compute_losses(
             pos_weight=_state_pos_weight().to(out.z.device))
         total = total + cfg.state_coef * l_state
 
+        # The same frames with ONLY the play area mirrored, labelled with the
+        # sign of dx and facing flipped. The HUD is byte-identical between the
+        # pair, so it carries no information about the answer and the encoder
+        # cannot use it -- which is the point, because it currently does:
+        # mirroring the whole frame is detectable at AUC 0.958 and mirroring
+        # just the play area at 0.620.
+        if getattr(cfg, "mirror_coef", 0.0) > 0:
+            from .model.state_head import mirror_play, mirror_targets
+            obs_m = mirror_play(batch["obs"].to(device, non_blocking=True))
+            zm = model.encode(obs_m.reshape(-1, *obs_m.shape[-3:]).float() / 255.0
+                              if obs_m.dtype == torch.uint8 else
+                              obs_m.reshape(-1, *obs_m.shape[-3:]))
+            zm = zm.reshape(*obs_m.shape[:2], -1)
+            l_mirror, mirror_metrics = state_loss(
+                model.predict_state(zm), mirror_targets(st), valid,
+                pos_weight=_state_pos_weight().to(zm.device))
+            total = total + cfg.mirror_coef * l_mirror
+            state_metrics["mirror_loss"] = mirror_metrics["state_loss"]
+            state_metrics["mirror_dx_r2"] = mirror_metrics.get("state_dx_r2", 0.0)
+
     # Every entry below ends in .item(), which synchronises the GPU and drains
     # the pipeline, and effective_rank runs a CPU eigendecomposition on top.
     # Skipping it on non-logging steps is most of what `metrics_every` buys.

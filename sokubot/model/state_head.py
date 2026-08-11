@@ -183,3 +183,50 @@ def state_loss(pred: torch.Tensor, target: torch.Tensor,
             hit = ((pp > 0).float() == tt).float().mean()
             metrics[f"state_{name}_acc"] = float(hit)
     return loss, metrics
+
+
+# Display-orientation rows of the play area; health/names sit at 34-74 and
+# spirit/cards at 428-470 (data/hud.py). Frames are stored vertically flipped,
+# so these convert to stored rows below. Kept identical to
+# scripts/spatial_probe.py, which measures exactly this transform -- if the two
+# ever disagree the training signal and the metric stop being the same question.
+DISP_PLAY_Y = (80, 420)
+FRAME = 480
+
+
+def mirror_play(obs: torch.Tensor) -> torch.Tensor:
+    """Mirror ONLY the play area of [..., C, H, W] frames, HUD untouched.
+
+    This is the whole trick. The encoder currently reads which way round the
+    fight is off the HUD: mirroring the entire frame is detectable at AUC 0.958
+    while mirroring only the play area sits at 0.620, barely above chance. The
+    HUD is in every frame and trivially legible, so it is the shortcut any
+    objective will take -- including 2003 replays of direct dx supervision,
+    which did not dislodge it.
+
+    Mirroring the characters while leaving the HUD *identical* removes the
+    shortcut by construction: the two views differ only in where the fighters
+    are, so a latent that ignores them cannot tell the pair apart, and a label
+    that flips sign between them is unlearnable without looking.
+    """
+    out = obs.clone()
+    lo, hi = FRAME - DISP_PLAY_Y[1], FRAME - DISP_PLAY_Y[0]
+    h = obs.shape[-2]
+    if h != FRAME:                       # 224 px training frames, say
+        lo, hi = int(lo * h / FRAME), int(hi * h / FRAME)
+    out[..., lo:hi, :] = torch.flip(out[..., lo:hi, :], dims=(-1,))
+    return out
+
+
+def mirror_targets(state: torch.Tensor) -> torch.Tensor:
+    """The same labels as seen from the mirrored world.
+
+    `dx` is a signed separation and `facing` a signed direction, so both negate.
+    Guard, knockdown and airborne are properties of a player, not of a side, so
+    they are untouched -- and swapping them would teach the opposite of the
+    truth.
+    """
+    out = state.clone()
+    out[..., CONTINUOUS[0]] = -out[..., CONTINUOUS[0]]     # dx
+    out[..., CONTINUOUS[1]] = -out[..., CONTINUOUS[1]]     # facing
+    return out

@@ -155,6 +155,11 @@ class Config:
     # it was until a linear head proved unable to fit dx and therefore
     # unable to teach it. See model/state_head.py.
     state_width: int = 512
+    # Weight on the play-area-mirrored copy of each batch, labelled with dx and
+    # facing negated. 0 disables it. See model/state_head.py::mirror_play for
+    # why this and not more data: the encoder reads left/right off the HUD, and
+    # only a pair whose HUD is identical can take that shortcut away.
+    mirror_coef: float = 0.0
     # Weight on recovering both players' buttons from a latent transition, with
     # the gradient reaching the ENCODER. This is the term that decides what the
     # representation keeps.

@@ -231,6 +231,9 @@ def main() -> None:
                          "it was; a positive value builds the head, which is "
                          "freshly initialised when warm-starting from weights "
                          "that predate it. See model/state_head.py.")
+    ap.add_argument("--mirror-coef", type=float, default=Config.mirror_coef,
+                    help="weight on the play-area-mirrored view with sign-"
+                         "flipped dx/facing. Needs --state-coef > 0.")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="continue from these weights instead of random init. "
                          "Optimiser state and LR schedule restart.")
@@ -250,6 +253,7 @@ def main() -> None:
                warmup_steps=args.warmup, lr=args.lr, seed=args.seed,
                cf_coef=args.cf_coef, hud_coef=args.hud_coef,
                state_coef=args.state_coef,
+               mirror_coef=args.mirror_coef,
                idm_coef=args.idm_coef,
                idm_pos_weight=args.idm_pos_weight,
                compile=not args.no_compile)

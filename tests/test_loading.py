@@ -122,6 +122,9 @@ def test_a_checkpoint_with_an_idm_head_keeps_it(tmp_path):
 # module until someone says otherwise, so forgetting fails the test.
 NON_GATING_COEFS = {
     "cf_coef", "sigreg_coef", "pred_coef", "var_coef", "cov_coef",
+    # weights the play-area-mirrored view of the SAME state head;
+    # builds no module of its own, so there is nothing to reconcile
+    "mirror_coef",
     "entropy_coef", "kl_coef", "value_coef", "aux_coef",
 }
 
