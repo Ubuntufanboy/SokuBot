@@ -59,3 +59,59 @@ said position was barely moving and I wrote that the architecture was
 implicated and that direct supervision was losing to the unsupervised IDM run
 (spatial AUC 0.688). On the actual gate it wins. The proxy disagreed with the
 instrument that decides, and the instrument was right.
+
+---
+
+# GRPO on the blocking gym: no signal
+
+`policy_blocking_final.pt` — 20 000 steps, blocking gym (5599 start/side pairs),
+warm-started from the corpus action prior, against the gate-passing world model.
+
+Across **201 evaluations**:
+
+    net vs frozen init   mean -0.00203   std 0.02152
+                         min  -0.06196   max +0.06749
+                         above zero on 49.3% of evals
+
+A coin flip. The policy did not beat its own initialisation on the gym it was
+trained on. `policy_best.pt` is therefore **selected on noise** -- it is
+whichever eval spiked highest (+0.067), not a better policy, and that is the
+checkpoint that went into the live test.
+
+## Live test, agent vs the in-game COM
+
+Agent on P1 (profile `sokubot`), COM on P2, verified by P1 losing health before
+the agent was armed.
+
+| round | agent (P1) | COM (P2) |
+|---|---|---|
+| 1 | 0.87 -> 0.12 | 1.00 -> 0.71 |
+| 2 | 0.84 -> 0.51 | 1.00 -> 0.70 |
+
+Round 1 it lost badly, round 2 was roughly even. Input hold rate 8.5-10.4%. Two
+rounds against an unknown COM difficulty is a sample of two; round 2 could be
+learning, noise, or the COM's script.
+
+**A first attempt at this test was invalid and is recorded because it was
+nearly believed.** In Vs Com the computer takes P2, which is where the agent
+was, so P1 had nobody at the keyboard and the agent was beating a stationary
+character 0.97 to 0.29. The health bar was real; what it described was not what
+was claimed.
+
+## What this does and does not say
+
+The world model represents guarding now -- block_effect passes on two
+checkpoints with independently rebuilt banks and probes. That was the blocker
+and it is cleared. The policy has not learned to use it, and the training
+signal says it never started to.
+
+The obvious next question is whether GRPO can move at all on this gym: 5599
+pairs from 60 replays is a narrow distribution, and the reward is a probe whose
+spirit R2 is 0.26 and combo R2 0.46, read through 4 imagined steps. Before more
+GRPO, measure whether the reward can even distinguish blocking from not
+blocking on those starts.
+
+The button trace was NOT captured: results/match_vscom.json records scheduling
+only, so "does it hold back for seconds" is unanswered. The extractor DLL would
+answer it directly from game memory but cannot load on this laptop
+(new-WoW64); that measurement needs the .130 sandbox.
