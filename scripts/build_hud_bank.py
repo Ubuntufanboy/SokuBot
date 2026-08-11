@@ -116,7 +116,11 @@ def main() -> int:
                            if c.exists()), None)
         if state_path is not None:
             try:
-                arr, valid = read_state(state_path)
+                # Projectiles and the action ids are read but not banked here:
+                # this bank's `state` array is [N, 2, C] and its consumers
+                # index it that way. `scripts/build_gyms.py` reads the sidecars
+                # directly and keeps the projectile set intact.
+                arr, _proj, _action, valid = read_state(state_path)
                 rows_i = np.arange(D) * cfg.frame_skip
                 if rows_i[-1] < len(arr):
                     st, sv = arr[rows_i], valid[rows_i]
