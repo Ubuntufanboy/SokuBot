@@ -113,11 +113,19 @@ LOW_SPIRIT = 0.35
 
 
 def _episode_ok(ep: np.ndarray, horizon: int, history: int) -> np.ndarray:
-    """Frames whose whole window stays inside one replay."""
+    """Frames whose whole window stays inside one replay.
+
+    The window reads `idx + k` for k up to `horizon`, so the last usable start
+    is `n - 1 - horizon` and the trim begins at `n - horizon`. It used to begin
+    at `n - horizon - 1`, throwing away one perfectly good frame -- harmless in
+    a concatenated bank where it happens once, but the streaming build applies
+    the trim per replay, so the same off-by-one silently discarded a frame from
+    every one of 1982 replays and made the two builds disagree.
+    """
     n = len(ep)
     ok = np.ones(n, dtype=bool)
     ok[: history - 1] = False
-    ok[n - horizon - 1:] = False
+    ok[n - horizon:] = False
     for k in range(1, horizon + 1):
         ok[: n - k] &= (ep[k:] == ep[: n - k])
     for k in range(1, history):
@@ -310,9 +318,8 @@ def build(S: np.ndarray, P: np.ndarray, V: np.ndarray, ep: np.ndarray,
     return gyms
 
 
-def load_bank(dirs: list[Path], limit: int = 0,
-              name: str = "") -> tuple[np.ndarray, ...]:
-    """Concatenate per-replay sidecars into one bank with an episode column."""
+def find_sidecars(dirs: list[Path], limit: int = 0, name: str = "") -> list[Path]:
+    """Every readable sidecar under the given roots, in a stable order."""
     paths: list[Path] = []
     for root in dirs:
         root = root.expanduser()
@@ -332,10 +339,36 @@ def load_bank(dirs: list[Path], limit: int = 0,
         paths = paths[:limit]
     if not paths:
         raise SystemExit(f"no sidecars found under {[str(d) for d in dirs]}")
+    return paths
 
-    S, P, V, E = [], [], [], []
-    skipped = 0
-    for e, p in enumerate(paths):
+
+def build_streaming(paths: list[Path], horizon: int, history: int,
+                    quiet: bool = False):
+    """Select over the whole corpus without ever holding it in memory.
+
+    ONE REPLAY AT A TIME, AND WHY THAT IS NOT AN APPROXIMATION
+    ----------------------------------------------------------
+    The corpus does not fit: 1982 replays is about 22M frames, and the
+    projectile array alone would be 27.5 GB (24 slots x 7 features x 2 players
+    x 4 bytes). The state array is another 5.4 GB.
+
+    Streaming costs nothing in fidelity because a gym window may never cross a
+    replay boundary anyway -- `_episode_ok` already drops those, so a per-replay
+    call sees exactly the windows a concatenated call would. The frame indices
+    are then shifted by a running offset so the saved starts still index the
+    corpus as one sequence, which is what the trainer wants.
+
+    Returns (gyms, n_frames, n_replays, per-replay frame counts).
+    """
+    acc: dict[str, tuple[list, list]] = {}
+    offset = 0
+    kept = skipped = 0
+    lengths: list[int] = []
+    hp_sum: dict[str, float] = {}
+    dx_sum: dict[str, float] = {}
+    reps: dict[str, int] = {}
+
+    for n_done, p in enumerate(paths):
         try:
             if not has_state_columns(p):
                 skipped += 1
@@ -347,16 +380,36 @@ def load_bank(dirs: list[Path], limit: int = 0,
             print(f"  skip {p.parent.name}: {exc}")
             skipped += 1
             continue
-        S.append(s)
-        P.append(pr)
-        V.append(v)
-        E.append(np.full(len(s), e, dtype=np.int32))
-    if not S:
+
+        ep = np.zeros(len(s), dtype=np.int32)      # one replay, one episode
+        g = build(s, pr, v, ep, horizon, history)
+        for name, (st, sd) in g.items():
+            a, b = acc.setdefault(name, ([], []))
+            if len(st):
+                a.append(st.astype(np.int64) + offset)
+                b.append(sd)
+                # Summaries accumulated here, while the arrays are still in
+                # scope -- the whole point is not to keep them.
+                hp_sum[name] = hp_sum.get(name, 0.0) + float(s[st, sd, CH["hp"]].sum())
+                dx_sum[name] = dx_sum.get(name, 0.0) + float(
+                    np.abs(s[st, sd, CH["dx"]]).sum())
+                reps[name] = reps.get(name, 0) + 1
+        offset += len(s)
+        lengths.append(len(s))
+        kept += 1
+        if not quiet and (n_done + 1) % 200 == 0:
+            print(f"  {n_done + 1}/{len(paths)} sidecars, {offset} frames",
+                  flush=True)
+
+    if not kept:
         raise SystemExit("every sidecar was skipped; none carry full state")
     if skipped:
         print(f"  ({skipped} of {len(paths)} sidecars skipped)")
-    return (np.concatenate(S), np.concatenate(P), np.concatenate(V),
-            np.concatenate(E))
+
+    gyms = {name: (np.concatenate(a) if a else np.zeros(0, np.int64),
+                   np.concatenate(b) if b else np.zeros(0, np.int64))
+            for name, (a, b) in acc.items()}
+    return gyms, offset, kept, hp_sum, dx_sum, reps
 
 
 def main() -> int:
@@ -372,16 +425,14 @@ def main() -> int:
     ap.add_argument("--history", type=int, default=3)
     a = ap.parse_args()
 
-    print(f"loading sidecars from {[str(d) for d in a.sidecars]} ...")
-    S, P, V, E = load_bank(a.sidecars, a.limit, a.name)
-    n_reps = int(E.max()) + 1
-    print(f"bank {len(S)} frames, {n_reps} replays, {P.shape[2]} projectile "
-          f"slots\n")
-
-    gyms = build(S, P, V, E, a.horizon, a.history)
+    paths = find_sidecars(a.sidecars, a.limit, a.name)
+    print(f"{len(paths)} sidecars under {[str(d) for d in a.sidecars]}")
+    gyms, n_frames, n_reps, hp_sum, dx_sum, reps_seen = build_streaming(
+        paths, a.horizon, a.history)
     total = sum(len(v[0]) for v in gyms.values())
+    print(f"\nbank {n_frames} frames over {n_reps} replays | horizon "
+          f"{a.horizon}, history {a.history}\n")
 
-    print(f"horizon {a.horizon}, history {a.history}\n")
     print("  gym                 pairs    per-1k   replays   mean hp(me)  "
           "mean dx")
     meta = {}
@@ -390,25 +441,29 @@ def main() -> int:
             print(f"  {name:<18} {0:7d}   SELECTS NOTHING")
             meta[name] = {"pairs": 0}
             continue
-        mine_hp = S[st, sd, CH["hp"]]
-        dx = np.abs(S[st, sd, CH["dx"]])
-        reps = len(np.unique(E[st]))
-        meta[name] = {"pairs": int(len(st)), "replays": int(reps),
-                      "per_1k_frames": round(1000 * len(st) / len(S), 2),
-                      "mean_hp_mine": float(mine_hp.mean()),
-                      "mean_abs_dx": float(dx.mean())}
-        print(f"  {name:<18} {len(st):7d}  {1000*len(st)/len(S):7.1f}  "
-              f"{reps:7d}   {mine_hp.mean():10.3f}  {dx.mean():8.3f}")
+        # Means come from the running sums, not from re-indexing the corpus --
+        # the arrays they were computed from are long gone by design.
+        hp = hp_sum[name] / len(st)
+        dx = dx_sum[name] / len(st)
+        meta[name] = {"pairs": int(len(st)), "replays": int(reps_seen[name]),
+                      "per_1k_frames": round(1000 * len(st) / n_frames, 2),
+                      "mean_hp_mine": hp, "mean_abs_dx": dx}
+        print(f"  {name:<18} {len(st):7d}  {1000*len(st)/n_frames:7.1f}  "
+              f"{reps_seen[name]:7d}   {hp:10.3f}  {dx:8.3f}")
     print(f"  {'(total)':<18} {total:7d}")
 
     np.savez(a.out.expanduser(),
              **{f"{k}_starts": v[0] for k, v in gyms.items()},
              **{f"{k}_sides": v[1] for k, v in gyms.items()},
              names=np.array(list(gyms)), horizon=a.horizon,
-             history=a.history, frames=len(S), replays=n_reps)
+             history=a.history, frames=n_frames, replays=n_reps,
+             # The order the frame offsets were assigned in. Without it the
+             # saved indices cannot be mapped back to a replay, and a gym file
+             # that cannot say which replay a start came from is unauditable.
+             sidecars=np.array([str(p) for p in paths]))
     Path(str(a.out.expanduser()) + ".json").write_text(json.dumps(
         {"sidecars": [str(d) for d in a.sidecars], "horizon": a.horizon,
-         "frames": int(len(S)), "replays": n_reps, "gyms": meta}, indent=1))
+         "frames": int(n_frames), "replays": n_reps, "gyms": meta}, indent=1))
     print(f"\n-> {a.out}")
 
     empty = [k for k, v in meta.items() if v["pairs"] == 0]
