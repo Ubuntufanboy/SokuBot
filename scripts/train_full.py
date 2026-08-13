@@ -131,7 +131,56 @@ def mirror_sensitivity(model: LeWorldModel, cache: dict, cfg: Config,
     # probe it cannot be inflated by memorising the val cache.
     d = zp - z0
     out["mirror_align"] = float(d.mean(0).norm() / (d.norm(dim=-1).mean() + 1e-9))
+
+    # THE ACTUAL GATE, computed here rather than deferred to a separate script.
+    #
+    # `mirror_align` was adopted as a proxy for linear decodability on the
+    # argument above, and it is NOT one. Over a 62 000-step run it went 0.21 ->
+    # 0.60 while the real probe sat at 0.553 against 0.500 chance: the proxy
+    # said the representation had improved threefold and the probe said it had
+    # not moved at all. Displacement is not separability and neither is
+    # direction-consistency, and separability is the only one the policy needs.
+    #
+    # So the probe is fit here, on latents this function has already encoded,
+    # and reported every eval. It costs one logistic regression on a few
+    # thousand rows against an encode that just happened -- and it is the
+    # difference between seeing a failed gate at step 10 000 and discovering it
+    # after the machine has been deleted.
+    out.update(_mirror_probe_auc(z0, zp, zf))
     return out
+
+
+def _mirror_probe_auc(z0, zp, zf) -> dict:
+    """Held-out AUC for "was this frame mirrored", fit on the eval latents.
+
+    `probe_identity` is the control: the same classifier asked to separate a
+    set from a random split of itself. It must sit at 0.5. If it does not, the
+    split leaked and the other two numbers mean nothing.
+    """
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+    except ImportError:
+        return {}
+    import numpy as np
+
+    a = z0.detach().cpu().numpy()
+
+    def auc(x, y) -> float:
+        Z = np.concatenate([x, y])
+        lab = np.concatenate([np.zeros(len(x)), np.ones(len(y))])
+        idx = np.random.default_rng(0).permutation(len(Z))
+        cut = len(Z) // 2
+        tr, te = idx[:cut], idx[cut:]
+        if len(np.unique(lab[tr])) < 2 or len(np.unique(lab[te])) < 2:
+            return float("nan")
+        m = LogisticRegression(max_iter=1000).fit(Z[tr], lab[tr])
+        return float(roc_auc_score(lab[te], m.decision_function(Z[te])))
+
+    half = len(a) // 2
+    return {"probe_play": auc(a, zp.detach().cpu().numpy()),
+            "probe_full": auc(a, zf.detach().cpu().numpy()),
+            "probe_identity": auc(a[:half], a[half:2 * half])}
 
 
 @torch.no_grad()
@@ -234,6 +283,12 @@ def main() -> None:
     ap.add_argument("--mirror-coef", type=float, default=Config.mirror_coef,
                     help="weight on the play-area-mirrored view with sign-"
                          "flipped dx/facing. Needs --state-coef > 0.")
+    ap.add_argument("--proj-coef", type=float, default=Config.proj_coef,
+                    help="weight on predicting each player's projectiles. "
+                         "Needs --state-coef > 0 and a sidecar with the "
+                         "24-slot capture. See model/state_head.py.")
+    ap.add_argument("--proj-slots", type=int, default=Config.proj_slots,
+                    help="how many slots the head predicts, danger-first")
     ap.add_argument("--init-from", type=Path, default=None,
                     help="continue from these weights instead of random init. "
                          "Optimiser state and LR schedule restart.")
@@ -254,6 +309,8 @@ def main() -> None:
                cf_coef=args.cf_coef, hud_coef=args.hud_coef,
                state_coef=args.state_coef,
                mirror_coef=args.mirror_coef,
+               proj_coef=args.proj_coef,
+               proj_slots=args.proj_slots,
                idm_coef=args.idm_coef,
                idm_pos_weight=args.idm_pos_weight,
                compile=not args.no_compile)
@@ -418,7 +475,10 @@ def main() -> None:
                   f"{ev['mirror_align']:.3f} at step {step})", flush=True)
         print(f"  [eval] step {step:6d} | train {ev['train_pred']:.4f} "
               f"| val {ev['val_pred']:.4f} | identity {ev['identity']:.4f} "
-              f"| skill {ev['skill']:+.4f} | AUC {ev['inv_dyn_auc']:.4f} "
+              f"| skill {ev['skill']:+.4f} | idmAUC {ev['inv_dyn_auc']:.4f} "
+              f"| PROBE play {ev.get('probe_play', float('nan')):.4f} "
+              f"full {ev.get('probe_full', float('nan')):.4f} "
+              f"id {ev.get('probe_identity', float('nan')):.4f} "
               f"| mirror {ev['mirror_play']:.2f}/{ev['mirror_full']:.2f} "
               f"align {ev['mirror_align']:.3f} "
               f"| var {ev['latent_var']:.3f} | {ev['elapsed_h']:.2f}h elapsed, "

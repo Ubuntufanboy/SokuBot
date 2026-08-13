@@ -306,11 +306,15 @@ def main() -> int:
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
 
-    blob = torch.load(a.ckpt, map_location=a.device, weights_only=False)
-    cfg: Config = blob["cfg"]
-    cfg.device = a.device
-    model = LeWorldModel(cfg).to(a.device)
-    model.load_state_dict(blob["model"])
+    # Through load_world_model, not LeWorldModel(cfg) + a strict load. The cfg
+    # in a checkpoint is a PICKLED dataclass, so any field added since it was
+    # written falls through to today's class default -- and the fields that
+    # gate a head thereby invent heads the weights have no entries for.
+    # Building by hand here died with "Missing key(s): hud_head.weight,
+    # idm_head..." on a checkpoint that predates both, which is exactly the
+    # failure docs/BUGS.md 8 describes and load_world_model exists to prevent.
+    from sokubot.model.loading import load_world_model
+    model, cfg, blob = load_world_model(a.ckpt, device=a.device)
     model.eval()
     H, P, skip = cfg.history, a.horizon, cfg.frame_skip
     print(f"world model step {blob.get('step','?')} | history {H} | frame_skip {skip} "

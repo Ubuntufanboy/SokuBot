@@ -73,7 +73,12 @@ def reconcile_config(cfg: Config, state: Dict[str, Any]) -> List[str]:
     for coef_name, weight_key, rebuild_with in (
             ("hud_coef", "hud_head.weight", None),
             ("idm_coef", "idm_head.net.0.weight", None),
-            ("state_coef", "state_head.net.0.weight", 1.0)):
+            ("state_coef", "state_head.net.0.weight", 1.0),
+            # Like state_coef, the class default is 0 -- projectiles are only
+            # supervised when a corpus carries the 24-slot capture -- so
+            # restoring the default would leave the head unbuilt and reproduce
+            # the missing-key error this table exists to prevent.
+            ("proj_coef", "proj_head.net.0.weight", 0.5)):
         present = weight_key in state
         value = getattr(cfg, coef_name, 0.0)
         if present and value <= 0:
@@ -145,7 +150,36 @@ def load_world_model(path: Path | str, device: str = "cpu", *,
             print(f"  cfg reconciled: {n}", flush=True)
     cfg.device = device
     wm = LeWorldModel(cfg).to(device)
-    wm.load_state_dict(blob["model"])
+
+    # A supervised head whose OUTPUT WIDTH changed is a different question,
+    # not a corrupted checkpoint. STATE_CHANNELS went from 7 to 33 when the
+    # sidecar grew, which makes every state head trained before that 14 wide
+    # against today's 66 -- and those checkpoints are still perfectly good
+    # ENCODERS, which is all that RL, the reward probe and the banks ever use
+    # them for. Failing the load would strand every artifact ever trained.
+    #
+    # So a head that no longer fits is dropped with a note. Encoder and
+    # predictor mismatches are deliberately NOT swallowed: those would mean the
+    # wrong model, which is the failure this loader exists to catch.
+    HEADS = ("state_head", "proj_head", "hud_head", "idm_head")
+    want, got = wm.state_dict(), dict(blob["model"])
+    for k in list(got):
+        if k in want and got[k].shape != want[k].shape:
+            if k.split(".", 1)[0] in HEADS:
+                notes.append(f"dropped {k}: checkpoint {tuple(got[k].shape)} "
+                             f"vs model {tuple(want[k].shape)}")
+                got.pop(k)
+    missing, unexpected = wm.load_state_dict(got, strict=False)
+    stray = [k for k in missing if k.split(".", 1)[0] not in HEADS]
+    if stray or unexpected:
+        raise RuntimeError(
+            f"{path}: state dict mismatches outside the supervised heads -- "
+            f"missing {stray[:4]}, unexpected {list(unexpected)[:4]}. That is a "
+            f"different model, not an outdated head.")
+    if verbose:
+        for n in notes:
+            if n.startswith("dropped"):
+                print(f"  {n}", flush=True)
     wm.eval()
     if freeze:
         for p in wm.parameters():

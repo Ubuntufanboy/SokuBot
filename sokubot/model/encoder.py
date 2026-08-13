@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ..config import Config
 from .layers import Block, Projector, init_vit_weights
@@ -20,11 +21,86 @@ from .layers import Block, Projector, init_vit_weights
 class PatchEmbed(nn.Module):
     def __init__(self, image_size: int, patch: int, in_chans: int, dim: int):
         super().__init__()
-        self.n = (image_size // patch) ** 2
+        self.grid = image_size // patch
+        self.n = self.grid ** 2
         self.proj = nn.Conv2d(in_chans, dim, kernel_size=patch, stride=patch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(x).flatten(2).transpose(1, 2)   # [B, n, dim]
+
+
+class SpatialPool(nn.Module):
+    """Patch tokens -> a latent whose LAYOUT is the image's layout.
+
+    WHY THIS EXISTS
+    ---------------
+    Six objectives failed to make a [CLS]-pooled encoder represent where the
+    fighters are: JEPA (spatial AUC 0.540), +IDM (0.651), +class-balanced IDM
+    (0.688), direct dx supervision over 2003 replays (0.620), a play-area
+    mirror built to forbid the HUD shortcut (0.605), and twelve hours of dx +
+    projectile supervision at 448 px (0.553, against 0.500 chance and a 0.958
+    ceiling). The one with the most supervision and the highest resolution did
+    worst. That is not a loss function that needs another term.
+
+    A [CLS] token is a learned global query: it is free to summarise the frame
+    however it likes, and nothing in "predict the next latent" requires that
+    summary to retain WHERE anything was. Mean pooling is worse -- it is
+    permutation-invariant over patches, so position is destroyed by definition
+    rather than merely discarded.
+
+    HOW THIS IS DIFFERENT IN KIND
+    -----------------------------
+    Here the latent is a grid. Cell (r, c) of the image owns a fixed slice of
+    the output vector, so "the fighter is on the left" and "the fighter is on
+    the right" are different COORDINATES, not different values of one summary.
+    Mirroring the play area permutes the grid columns, which permutes the
+    latent's dimensions -- a fixed linear map. A linear probe reads that by
+    construction, and the encoder cannot discard it without discarding the
+    features themselves.
+
+    The cost is that each cell gets latent_dim / (grid * grid) channels -- 12
+    at the default 192 and 4x4 -- so per-cell semantics are thin. That is the
+    intended trade: the previous design had 192 channels of semantics and no
+    position at all.
+    """
+
+    def __init__(self, enc_dim: int, latent_dim: int, grid: int):
+        super().__init__()
+        if latent_dim % (grid * grid):
+            raise ValueError(
+                f"latent_dim {latent_dim} must divide by grid^2 {grid*grid}; "
+                f"every cell owns an equal slice and a ragged split would make "
+                f"the mirror permutation non-linear")
+        self.grid = grid
+        self.cells = grid * grid
+        self.per_cell = latent_dim // self.cells
+        # One projection PER CELL, not one shared projection. Written as an
+        # explicit [cells, enc_dim, per_cell] weight rather than a grouped conv
+        # because the thing that has to be true -- cell k writes latent slice
+        # k*per_cell : (k+1)*per_cell and nothing else -- is then visible in the
+        # einsum instead of implied by a reshape order that is easy to get
+        # silently wrong.
+        self.weight = nn.Parameter(torch.empty(self.cells, enc_dim, self.per_cell))
+        self.bias = nn.Parameter(torch.zeros(self.cells, self.per_cell))
+        nn.init.trunc_normal_(self.weight, std=0.02)
+        # Same contract as Projector: a non-affine BatchNorm so SIGReg still
+        # sees zero mean and unit variance per dimension, and the trivial
+        # minimiser (shrink every latent to 0) stays unavailable.
+        self.bn = nn.BatchNorm1d(latent_dim, affine=False)
+
+    def forward(self, tok: torch.Tensor, gh: int, gw: int) -> torch.Tensor:
+        """tok: [B, gh*gw, enc_dim] patch tokens (no [CLS]) -> [B, latent_dim]."""
+        B, _, d = tok.shape
+        x = tok.transpose(1, 2).reshape(B, d, gh, gw)
+        # Average within each cell. Adaptive so the patch grid need not divide
+        # the cell grid -- 16x16 patches at 224 px and 32x32 at 448 px both
+        # reduce to the same 4x4 latent layout, which is what lets a 224 px run
+        # and a 448 px one produce comparable latents.
+        x = F.adaptive_avg_pool2d(x, (self.grid, self.grid))      # [B, d, G, G]
+        x = x.flatten(2).transpose(1, 2)                          # [B, cells, d]
+        # b=batch, k=cell, d=enc_dim, p=per_cell. Cell k uses ONLY weight[k].
+        x = torch.einsum("bkd,kdp->bkp", x, self.weight) + self.bias
+        return self.bn(x.reshape(B, -1))       # row-major: cell k -> slice k
 
 
 class ViTEncoder(nn.Module):
@@ -39,7 +115,17 @@ class ViTEncoder(nn.Module):
             Block(d, cfg.enc_heads, cfg.enc_mlp_ratio) for _ in range(cfg.enc_depth)
         )
         self.norm = nn.LayerNorm(d)
-        self.projector = Projector(d, cfg.latent_dim)
+        # `cls` is the original and stays the default, so every checkpoint ever
+        # trained still loads. `spatial` is the change of kind described in
+        # SpatialPool -- selected by config, not by editing this file, so the
+        # two can be run as arms of the same experiment.
+        self.pool = getattr(cfg, "encoder_pool", "cls")
+        if self.pool == "spatial":
+            self.spatial_pool = SpatialPool(d, cfg.latent_dim,
+                                            getattr(cfg, "pool_grid", 4))
+            self.projector = None
+        else:
+            self.projector = Projector(d, cfg.latent_dim)
 
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -72,7 +158,11 @@ class ViTEncoder(nn.Module):
             tok = blk(tok)
         tok = self.norm(tok)
 
-        z = self.projector(tok[:, 0])            # [CLS] -> MLP + BatchNorm
+        if self.pool == "spatial":
+            g = self.patch_embed.grid
+            z = self.spatial_pool(tok[:, 1:], g, g)   # patches -> grid latent
+        else:
+            z = self.projector(tok[:, 0])        # [CLS] -> MLP + BatchNorm
         return z.reshape(*lead, self.cfg.latent_dim)
 
 

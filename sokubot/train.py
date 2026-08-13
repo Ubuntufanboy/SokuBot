@@ -209,18 +209,47 @@ def compute_losses(
         # mirroring the whole frame is detectable at AUC 0.958 and mirroring
         # just the play area at 0.620.
         if getattr(cfg, "mirror_coef", 0.0) > 0:
-            from .model.state_head import mirror_play, mirror_targets
+            from .model.state_head import (mirror_play, mirror_projectiles,
+                                           mirror_targets)
             obs_m = mirror_play(batch["obs"].to(device, non_blocking=True))
             zm = model.encode(obs_m.reshape(-1, *obs_m.shape[-3:]).float() / 255.0
                               if obs_m.dtype == torch.uint8 else
                               obs_m.reshape(-1, *obs_m.shape[-3:]))
             zm = zm.reshape(*obs_m.shape[:2], -1)
+            # `mirror_targets` returns a channel MASK as well as the flipped
+            # labels, and the mask is not optional. Absolute `x` has no correct
+            # value under an image mirror -- the reflection is about the camera
+            # centre and the camera pans with the action -- so training it here
+            # would teach a false relationship on every off-centre frame.
+            st_m, ch_mask = mirror_targets(st)
             l_mirror, mirror_metrics = state_loss(
-                model.predict_state(zm), mirror_targets(st), valid,
-                pos_weight=_state_pos_weight().to(zm.device))
+                model.predict_state(zm), st_m, valid,
+                pos_weight=_state_pos_weight().to(zm.device),
+                channel_mask=ch_mask.to(zm.device))
             total = total + cfg.mirror_coef * l_mirror
             state_metrics["mirror_loss"] = mirror_metrics["state_loss"]
             state_metrics["mirror_dx_r2"] = mirror_metrics.get("state_dx_r2", 0.0)
+
+            if getattr(cfg, "proj_coef", 0.0) > 0 and "proj" in batch:
+                from .model.state_head import projectile_loss
+                pj_m = mirror_projectiles(
+                    batch["proj"].to(device, non_blocking=True))
+                l_pm, _ = projectile_loss(model.predict_projectiles(zm), pj_m,
+                                          valid)
+                total = total + cfg.mirror_coef * cfg.proj_coef * l_pm
+
+    # Projectiles. Outside the state block because it is a separate label with
+    # its own presence masking, and a corpus can carry one without the other.
+    if getattr(cfg, "proj_coef", 0.0) > 0 and "proj" in batch:
+        from .model.state_head import projectile_loss
+        pj = batch["proj"].to(device, non_blocking=True)     # [B,T,2,slots,F]
+        pvalid = batch.get("state_valid")
+        pvalid = (pvalid.to(device, non_blocking=True)
+                  if pvalid is not None else None)
+        l_proj, proj_metrics = projectile_loss(
+            model.predict_projectiles(out.z), pj, pvalid)
+        total = total + cfg.proj_coef * l_proj
+        state_metrics.update(proj_metrics)
 
     # Every entry below ends in .item(), which synchronises the GPU and drains
     # the pipeline, and effective_rank runs a CPU eigendecomposition on top.

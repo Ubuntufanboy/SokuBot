@@ -147,7 +147,12 @@ _PER_PLAYER = (
     "correction", "combo_rate", "combo_hits", "combo_damage", "combo_limit",
     "guarding", "wrongblock", "crushed", "knockdown",
 )
-_PROJ_COUNTS = ("proj_n", "proj_hb", "proj_raw")
+# `proj_n` and `proj_hb` are read; `proj_raw` is a capture-side diagnostic (the
+# list length the game reported, so a refused walk is visible) that nothing
+# here consumes. It is therefore NOT required -- a sidecar staged over a slow
+# link may legitimately drop it, and failing on a column no code reads would
+# reject the whole corpus for nothing.
+_PROJ_COUNTS = ("proj_n", "proj_hb")
 _PROJ_FIELDS = ("x", "y", "vx", "vy", "dir", "act", "hb")
 
 LABEL_VALID = "label_valid"

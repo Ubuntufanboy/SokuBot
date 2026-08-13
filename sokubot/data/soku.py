@@ -95,7 +95,13 @@ def discover_captures(roots: Sequence[Path | str]) -> List[Capture]:
                 inputs = video.parent / "inputs.csv"
                 # gz first: align_sidecar writes that by default, and a
                 # plain .csv beside it would be a stale full-column leftover.
-                state = next((c for c in (video.parent / "state.csv.gz",
+                # state_s<N>.csv first: it is the pre-strided form, already at
+                # decision-step rate, and is what a corpus staged over a slow
+                # link carries. gz next: align_sidecar writes that by default,
+                # and a plain state.csv beside it would be a stale full-column
+                # leftover.
+                state = next((c for c in (video.parent / "state_s5.csv",
+                                          video.parent / "state.csv.gz",
                                           video.parent / "state.csv")
                               if c.exists()), None)
                 if not (video.exists() and inputs.exists()):
@@ -322,14 +328,32 @@ class SokuWindowDataset(IterableDataset):
         # channel missing: a batch where only some samples carry supervision
         # would train the head on an unrepresentative subset without saying so.
         want_state = getattr(cfg, "state_coef", 0.0) > 0
-        state_arr = state_valid = None
+        want_proj = getattr(cfg, "proj_coef", 0.0) > 0
+        n_slot = getattr(cfg, "proj_slots", 8)
+        state_arr = state_valid = proj_arr = None
+        state_strided = False
         if want_state:
+            # The None check comes FIRST. 21 of the corpus's 2003 captures have
+            # no labels -- alignment refused them -- and reading `cap.state.name`
+            # before this killed a dataloader worker on every one of them, which
+            # surfaces as an AttributeError inside a worker process rather than
+            # as anything to do with missing labels.
             if cap.state is None:
                 return
+            # A pre-strided sidecar is already at decision-step rate, so its row
+            # d IS source frame d*skip and the gather below becomes a direct
+            # index. Getting this backwards would read every fifth decision step
+            # as if it were consecutive: a factor-of-five error that produces a
+            # perfectly full array and no complaint at all.
+            state_strided = cap.state.name.startswith("state_s")
             try:
-                state_arr, state_valid = read_state(cap.state)
+                state_arr, proj_arr, _act_ids, state_valid = read_state(cap.state)
             except (ValueError, OSError) as exc:
                 print(f"[soku] skipping {cap.replay_id}: {exc}")
+                return
+            if want_proj and proj_arr.shape[2] < n_slot:
+                print(f"[soku] skipping {cap.replay_id}: sidecar has "
+                      f"{proj_arr.shape[2]} projectile slots, cfg wants {n_slot}")
                 return
         stream = (decode_frames_hud(cap.video, cfg.image_size, skip) if want_hud
                   else ((f, None) for f in
@@ -365,15 +389,20 @@ class SokuWindowDataset(IterableDataset):
             if want_hud:
                 sample["hud"] = torch.from_numpy(np.stack(hud_buf)).float()
             if want_state:
-                # Decision step d is source frame d*skip, and state.csv is
-                # indexed by source frame, so the labels are gathered rather
-                # than streamed alongside the decode.
-                rows = [(start + k) * skip for k in range(T)]
+                # Decision step d is source frame d*skip. A full-rate sidecar
+                # is indexed by source frame so the labels are gathered; a
+                # pre-strided one is already indexed by decision step, so the
+                # rows are the decision indices themselves.
+                rows = ([start + k for k in range(T)] if state_strided
+                        else [(start + k) * skip for k in range(T)])
                 if rows[-1] >= len(state_arr):
                     break          # labels end before the video does
                 sample["state"] = torch.from_numpy(state_arr[rows]).float()
                 sample["state_valid"] = torch.from_numpy(
                     state_valid[rows].copy())
+                if want_proj:
+                    sample["proj"] = torch.from_numpy(
+                        proj_arr[rows][:, :, :n_slot].copy()).float()
             yield sample
 
     def __iter__(self) -> Iterator[dict]:

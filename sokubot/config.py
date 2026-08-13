@@ -59,6 +59,22 @@ class Config:
     enc_heads: int = 3
     enc_mlp_ratio: float = 4.0
     latent_dim: int = 192
+    # How the encoder turns patch tokens into the latent.
+    #
+    #   "cls"     the LeWM original: the [CLS] token through an MLP+BatchNorm.
+    #   "spatial" a grid latent, where image cell (r,c) owns a fixed slice of
+    #             the vector. See model/encoder.py::SpatialPool.
+    #
+    # `cls` remains the default so every checkpoint ever trained still loads
+    # and the two can be run as arms of one experiment rather than a rewrite.
+    # The measurement that motivated `spatial`: six objectives left the spatial
+    # probe between 0.540 and 0.688 against a 0.958 ceiling, and the best-
+    # supervised of them scored 0.553.
+    encoder_pool: str = "cls"
+    # Cells per side. latent_dim must divide by pool_grid^2: at 192 and 4 that
+    # is 12 channels a cell. Larger grids buy finer position and thinner
+    # per-cell semantics.
+    pool_grid: int = 4
 
     # ---------------- predictor (~9.9M) ----------------
     pred_dim: int = 384
@@ -160,6 +176,15 @@ class Config:
     # why this and not more data: the encoder reads left/right off the HUD, and
     # only a pair whose HUD is identical can take that shortcut away.
     mirror_coef: float = 0.0
+    # Weight on predicting the projectiles each player has in the air. Separate
+    # from state_coef because it is a different kind of target -- a variable
+    # set rather than a fixed vector -- and because it is the one the corpus
+    # only started carrying with the 24-slot capture. See
+    # `model/state_head.py::ProjectileHead`; half the cast fights at range, so
+    # what is in the air is most of what a defender is reacting to.
+    proj_coef: float = 0.0
+    # How many of the sidecar's 24 slots the head predicts, danger-first.
+    proj_slots: int = 8
     # Weight on recovering both players' buttons from a latent transition, with
     # the gradient reaching the ENCODER. This is the term that decides what the
     # representation keeps.

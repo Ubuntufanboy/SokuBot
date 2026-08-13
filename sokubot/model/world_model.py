@@ -27,7 +27,7 @@ from .action_encoder import ActionEncoder
 from .encoder import ViTEncoder
 from .predictor import LatentPredictor
 from .inverse_dynamics import InverseDynamicsHead
-from .state_head import StateHead
+from .state_head import ProjectileHead, StateHead
 
 
 N_HUD = len(FRAME_HUD_CHANNELS)
@@ -75,6 +75,13 @@ class LeWorldModel(nn.Module):
         # rather than asked to infer it.
         self.state_head = (StateHead(cfg)
                            if getattr(cfg, "state_coef", 0.0) > 0 else None)
+        # What each player has in the air. A separate head rather than more
+        # channels on the state head, because the target is a different kind of
+        # thing: a variable-length set whose continuous terms are only defined
+        # where an object exists. Optional because a corpus captured before the
+        # 24-slot walk carries no such labels at all.
+        self.proj_head = (ProjectileHead(cfg, getattr(cfg, "proj_slots", 8))
+                          if getattr(cfg, "proj_coef", 0.0) > 0 else None)
 
     # ---------------- training ----------------
     def forward(self, obs: torch.Tensor, actions: torch.Tensor) -> ForwardOut:
@@ -105,6 +112,18 @@ class LeWorldModel(nn.Module):
                 "this model was built with state_coef = 0, so it has no state "
                 "head")
         return self.state_head(z)
+
+    def predict_projectiles(self, z: torch.Tensor) -> torch.Tensor:
+        """[..., latent] -> [..., 2, slots, len(PROJ_FEATURES)].
+
+        `present` and `hb` are LOGITS; the rest are raw. Index 1 is the OWNER,
+        so what threatens player p is `out[:, 1 - p]`.
+        """
+        if self.proj_head is None:
+            raise RuntimeError(
+                "this model was built with proj_coef = 0, so it has no "
+                "projectile head")
+        return self.proj_head(z)
 
     # ---------------- planning ----------------
     def rollout(

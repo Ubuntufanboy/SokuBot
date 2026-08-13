@@ -38,7 +38,7 @@ import numpy as np
 import torch
 
 from sokubot.config import Config
-from sokubot.data.state import STATE_CHANNELS, read_state
+from sokubot.data.state import PROJ_FEATURES, STATE_CHANNELS, read_state
 from sokubot.model.augmented import HUD_CHANNELS
 from sokubot.model.loading import load_world_model
 from sokubot.model.world_model import LeWorldModel
@@ -89,7 +89,7 @@ def main() -> int:
     rows = [json.loads(l) for l in manifest.read_text().splitlines() if l.strip()]
     np.random.default_rng(a.seed).shuffle(rows)
 
-    zs, acts, huds, sts, svs, ep, kept = [], [], [], [], [], [], 0
+    zs, acts, huds, sts, svs, pjs, ep, kept = [], [], [], [], [], [], [], 0
     n_with_state = 0
     for r in rows:
         if kept >= a.replays:
@@ -110,21 +110,33 @@ def main() -> int:
         # loader uses -- state.csv is indexed by source frame, so this is a
         # gather rather than a slice, and getting it wrong would shift every
         # label by a factor of frame_skip while still producing a full array.
-        st = sv = None
-        state_path = next((c for c in (video.parent / "state.csv.gz",
+        st = sv = pj = None
+        # `state_s5.csv` is the pre-strided form: every fifth source row, which
+        # is exactly the set any consumer reads. It exists because shipping the
+        # full-rate labels over a 0.58 Mbit uplink is five times the bytes for
+        # no extra information. The stride is IN THE NAME on purpose -- a
+        # consumer that assumed consecutive frames would be silently wrong by a
+        # factor of five, which is precisely the class of error the gather
+        # below was written to avoid.
+        strided = (video.parent / f"state_s{cfg.frame_skip}.csv")
+        state_path = next((c for c in (strided,
+                                       video.parent / "state.csv.gz",
                                        video.parent / "state.csv")
                            if c.exists()), None)
         if state_path is not None:
             try:
-                # Projectiles and the action ids are read but not banked here:
-                # this bank's `state` array is [N, 2, C] and its consumers
-                # index it that way. `scripts/build_gyms.py` reads the sidecars
-                # directly and keeps the projectile set intact.
-                arr, _proj, _action, valid = read_state(state_path)
-                rows_i = np.arange(D) * cfg.frame_skip
-                if rows_i[-1] < len(arr):
-                    st, sv = arr[rows_i], valid[rows_i]
-                    n_with_state += 1
+                arr, proj, _action, valid = read_state(state_path)
+                if state_path == strided:
+                    # Already at decision-step rate: row d IS source frame
+                    # d*frame_skip, so this is a slice, not a gather.
+                    if len(arr) >= D:
+                        st, sv, pj = arr[:D], valid[:D], proj[:D]
+                        n_with_state += 1
+                else:
+                    rows_i = np.arange(D) * cfg.frame_skip
+                    if rows_i[-1] < len(arr):
+                        st, sv, pj = arr[rows_i], valid[rows_i], proj[rows_i]
+                        n_with_state += 1
             except (ValueError, OSError) as exc:
                 print(f"  state skipped for {r.get('replay_id')}: {exc}",
                       flush=True)
@@ -139,6 +151,15 @@ def main() -> int:
         sts.append(st.astype(np.float16) if st is not None
                    else np.zeros((D, 2, len(STATE_CHANNELS)), np.float16))
         svs.append(sv if sv is not None else np.zeros(D, bool))
+        # Projectiles, at the head's slot count. The sidecar may carry more
+        # slots than the head predicts (24 captured, 8 predicted), so this
+        # truncates -- danger-first ordering means the dropped ones are the
+        # least threatening, and the exact counts live in the state channels.
+        n_slot = getattr(cfg, "proj_slots", 8)
+        if pj is not None:
+            pjs.append(pj[:, :, :n_slot].astype(np.float16))
+        else:
+            pjs.append(np.zeros((D, 2, n_slot, len(PROJ_FEATURES)), np.float16))
         ep.append(np.full(D, kept, dtype=np.int32))
         kept += 1
         del obs, chunks, labels
@@ -159,7 +180,8 @@ def main() -> int:
     Z = np.concatenate(zs); A = np.concatenate(acts)
     Hd = np.concatenate(huds); E = np.concatenate(ep)
     St = np.concatenate(sts); Sv = np.concatenate(svs)
-    del zs, acts, huds, sts, svs, ep
+    Pj = np.concatenate(pjs)
+    del zs, acts, huds, sts, svs, pjs, ep
 
     # HUD is a fraction of a gauge, so anything outside [0,1] is a reader bug
     # rather than a rare state, and it would be learned as a target.
@@ -169,7 +191,7 @@ def main() -> int:
     if not np.isfinite(Hd).all():
         raise SystemExit("hud contains non-finite values")
 
-    np.savez(a.out, z=Z, a=A, hud=Hd, ep=E, state=St,
+    np.savez(a.out, z=Z, a=A, hud=Hd, ep=E, state=St, proj=Pj,
              state_valid=Sv, fingerprint=fp,
              encoder_fingerprint=encoder_fingerprint(wm),
              hud_channels=np.array(HUD_CHANNELS))

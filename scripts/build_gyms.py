@@ -414,8 +414,16 @@ def build_streaming(paths: list[Path], horizon: int, history: int,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--sidecars", type=Path, nargs="+", required=True,
+    ap.add_argument("--sidecars", type=Path, nargs="+", default=None,
                     help="capture roots (dirs of per-replay dirs), or files")
+    # A bank and a sidecar tree are not interchangeable and the difference
+    # matters: a gym start index only means something against the array the
+    # trainer samples from. `--sidecars` surveys the whole corpus (what is
+    # there, at what rate); `--bank` produces the file train_grpo can actually
+    # consume, because its indices land in the bank's own frames.
+    ap.add_argument("--bank", type=Path, default=None,
+                    help="a bank npz from build_hud_bank, carrying state/proj/"
+                         "state_valid/ep. Produces gyms train_grpo can index.")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--name", default="",
                     help="sidecar filename inside each replay dir "
@@ -425,10 +433,38 @@ def main() -> int:
     ap.add_argument("--history", type=int, default=3)
     a = ap.parse_args()
 
-    paths = find_sidecars(a.sidecars, a.limit, a.name)
-    print(f"{len(paths)} sidecars under {[str(d) for d in a.sidecars]}")
-    gyms, n_frames, n_reps, hp_sum, dx_sum, reps_seen = build_streaming(
-        paths, a.horizon, a.history)
+    if not a.bank and not a.sidecars:
+        raise SystemExit("give --bank (for training) or --sidecars (to survey)")
+
+    if a.bank:
+        b = np.load(a.bank.expanduser(), allow_pickle=True)
+        need = [k for k in ("state", "proj", "state_valid", "ep")
+                if k not in b.files]
+        if need:
+            raise SystemExit(
+                f"{a.bank} has {sorted(b.files)}; missing {need}. Rebuild it "
+                f"with a build_hud_bank that banks projectiles -- a gym file "
+                f"whose indices came from a different array is worse than none.")
+        S = b["state"].astype(np.float32)
+        P = b["proj"].astype(np.float32)
+        V = b["state_valid"].astype(bool)
+        E = b["ep"]
+        print(f"bank {a.bank}: {len(S)} frames, {int(E.max())+1} replays, "
+              f"{P.shape[2]} projectile slots")
+        gyms = build(S, P, V, E, a.horizon, a.history)
+        n_frames, n_reps = len(S), int(E.max()) + 1
+        hp_sum, dx_sum, reps_seen = {}, {}, {}
+        for k, (st, sd) in gyms.items():
+            if len(st):
+                hp_sum[k] = float(S[st, sd, CH["hp"]].sum())
+                dx_sum[k] = float(np.abs(S[st, sd, CH["dx"]]).sum())
+                reps_seen[k] = len(np.unique(E[st]))
+        paths = []
+    else:
+        paths = find_sidecars(a.sidecars, a.limit, a.name)
+        print(f"{len(paths)} sidecars under {[str(d) for d in a.sidecars]}")
+        gyms, n_frames, n_reps, hp_sum, dx_sum, reps_seen = build_streaming(
+            paths, a.horizon, a.history)
     total = sum(len(v[0]) for v in gyms.values())
     print(f"\nbank {n_frames} frames over {n_reps} replays | horizon "
           f"{a.horizon}, history {a.history}\n")
@@ -462,7 +498,7 @@ def main() -> int:
              # that cannot say which replay a start came from is unauditable.
              sidecars=np.array([str(p) for p in paths]))
     Path(str(a.out.expanduser()) + ".json").write_text(json.dumps(
-        {"sidecars": [str(d) for d in a.sidecars], "horizon": a.horizon,
+        {"sidecars": [str(d) for d in (a.sidecars or [])], "horizon": a.horizon,
          "frames": int(n_frames), "replays": n_reps, "gyms": meta}, indent=1))
     print(f"\n-> {a.out}")
 
