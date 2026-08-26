@@ -581,6 +581,12 @@ def main() -> int:
     ap.add_argument("--horizon-weights", action="store_true",
                     help="one unroll loss per horizon with learned "
                          "uncertainty weighting instead of one pooled term")
+    ap.add_argument("--action-skip", action="store_true",
+                    help="a direct zero-initialised path from the buttons to "
+                         "the output head. The action otherwise reaches the "
+                         "prediction only through six transformer blocks, and "
+                         "reweighting the loss where it matters was a null, "
+                         "which points at the path rather than the objective.")
     ap.add_argument("--arrival-weight", type=float, default=0.0,
                     help="extra weight on the binary loss at the STEP an "
                          "attack goes live. Unlike --guard-frac this keeps "
@@ -641,7 +647,8 @@ def main() -> int:
                           proj_feedback=a.proj_feedback,
                           n_moves=n_moves, move_dim=a.move_dim,
                           idm=a.idm > 0,
-                          state_history=a.state_history).to(a.device)
+                          state_history=a.state_history,
+                          act_skip=a.action_skip).to(a.device)
     # One log-variance per unrolled horizon, trained alongside the weights.
     horizon_w = None
     if a.horizon_weights and a.unroll > 0:
@@ -756,7 +763,11 @@ def main() -> int:
                             "proj_feedback": a.proj_feedback,
                             "n_moves": n_moves, "move_dim": a.move_dim,
                             "move_vocab": vocab, "idm": a.idm > 0,
-                            "state_history": a.state_history},
+                            "state_history": a.state_history,
+                            # Architecture, not bookkeeping: load_sim rebuilds
+                            # from these keys, and an absent act_skip silently
+                            # reconstructs a DIFFERENT model than was trained.
+                            "act_skip": a.action_skip},
                            a.out / "best_h1.pt")
             # `ticks` goes into sim.pt too. Leaving it out was survivable
             # only because every run so far used the config default; a run
@@ -772,6 +783,7 @@ def main() -> int:
                         "flag_entropy_weight": a.flag_entropy_weight,
                         "ct_weight": a.ct_weight,
                         "arrival_weight": a.arrival_weight,
+                        "act_skip": a.action_skip,
                         "horizon_weights": a.horizon_weights},
                        a.out / "sim.pt")
     print(f"\n-> {a.out}/sim.pt")
