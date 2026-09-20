@@ -157,30 +157,71 @@ def _mirror_probe_auc(z0, zp, zf) -> dict:
     set from a random split of itself. It must sit at 0.5. If it does not, the
     split leaked and the other two numbers mean nothing.
     """
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.metrics import roc_auc_score
-    except ImportError:
-        return {}
+    # NumPy only, deliberately. The first version imported sklearn behind a
+    # `try/except ImportError: return {}`, and on a box without it the gate
+    # silently reported nothing -- the exact shape of failure this metric was
+    # added to prevent. A regularised LDA direction is closed form, has no
+    # iteration count to tune, and is a linear probe by construction, which is
+    # the only property the number needs.
     import numpy as np
 
     a = z0.detach().cpu().numpy()
 
     def auc(x, y) -> float:
-        Z = np.concatenate([x, y])
-        lab = np.concatenate([np.zeros(len(x)), np.ones(len(y))])
-        idx = np.random.default_rng(0).permutation(len(Z))
-        cut = len(Z) // 2
-        tr, te = idx[:cut], idx[cut:]
-        if len(np.unique(lab[tr])) < 2 or len(np.unique(lab[te])) < 2:
-            return float("nan")
-        m = LogisticRegression(max_iter=1000).fit(Z[tr], lab[tr])
-        return float(roc_auc_score(lab[te], m.decision_function(Z[te])))
+        """x and y are PAIRED: row i of each is the same frame, mirrored or not.
 
-    half = len(a) // 2
+        The split is over FRAME INDEX, so both copies of a frame land on the
+        same side. Splitting over the concatenated rows instead lets frame i's
+        original sit in train while its mirror sits in test, and the probe
+        scores by recognising the frame rather than the mirror. Measured, that
+        leak read 0.86-0.93 on `play` with an identity control at 0.92 -- the
+        control is the only reason it was caught.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        n = min(len(x), len(y))
+        x, y = x[:n], y[:n]
+        perm = np.random.default_rng(0).permutation(n)
+        cut = n // 2
+        f_tr, f_te = perm[:cut], perm[cut:]
+        if len(f_tr) < 2 or len(f_te) < 2:
+            return float("nan")
+        Z = np.concatenate([x[f_tr], y[f_tr], x[f_te], y[f_te]])
+        lab = np.concatenate([np.zeros(len(f_tr)), np.ones(len(f_tr)),
+                              np.zeros(len(f_te)), np.ones(len(f_te))])
+        ntr = 2 * len(f_tr)
+        tr = np.arange(ntr)
+        te = np.arange(ntr, len(Z))
+        A, B = Z[tr][lab[tr] == 0], Z[tr][lab[tr] == 1]
+        if len(A) < 2 or len(B) < 2:
+            return float("nan")
+        mu = B.mean(0) - A.mean(0)
+        C = np.cov(Z[tr], rowvar=False)
+        # Ridge on the covariance: latent_dim can exceed the sample count, and a
+        # singular scatter matrix would otherwise fit noise perfectly.
+        C.flat[:: C.shape[0] + 1] += 1e-3 * np.trace(C) / C.shape[0] + 1e-8
+        w = np.linalg.solve(C, mu)
+        s = Z[te] @ w
+        # Mann-Whitney: AUC is the rank-sum of the positive class, which needs
+        # no threshold and handles ties correctly.
+        r = s.argsort().argsort().astype(np.float64) + 1.0
+        pos, neg = lab[te] == 1, lab[te] == 0
+        n1, n0 = pos.sum(), neg.sum()
+        if n1 == 0 or n0 == 0:
+            return float("nan")
+        return float((r[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+    # The identity control must be a TRUE null: the same latents split by a coin
+    # flip, so there is nothing to find. Contiguous halves are not that -- the
+    # eval cache is ordered by capture, so the first half and the second half
+    # are different replays and a probe separates them easily. That version read
+    # 0.92 and made every other number here meaningless.
+    rng = np.random.default_rng(1)
+    coin = rng.random(len(a)) < 0.5
+    n = min(int(coin.sum()), int((~coin).sum()))
     return {"probe_play": auc(a, zp.detach().cpu().numpy()),
             "probe_full": auc(a, zf.detach().cpu().numpy()),
-            "probe_identity": auc(a[:half], a[half:2 * half])}
+            "probe_identity": auc(a[coin][:n], a[~coin][:n])}
 
 
 @torch.no_grad()
@@ -283,6 +324,14 @@ def main() -> None:
     ap.add_argument("--mirror-coef", type=float, default=Config.mirror_coef,
                     help="weight on the play-area-mirrored view with sign-"
                          "flipped dx/facing. Needs --state-coef > 0.")
+    ap.add_argument("--pred-detach-target", action="store_true",
+                    help="stop-gradient on the prediction target, so the "
+                         "encoder is not pushed to make the future easy to "
+                         "predict. See sokubot/train.py.")
+    ap.add_argument("--lambda-sigreg", type=float, default=Config.lambda_sigreg,
+                    help="SIGReg weight. 0 disables the distribution term "
+                         "entirely -- only meaningful for short ablations, "
+                         "since it is what prevents latent collapse.")
     ap.add_argument("--proj-coef", type=float, default=Config.proj_coef,
                     help="weight on predicting each player's projectiles. "
                          "Needs --state-coef > 0 and a sidecar with the "
@@ -310,6 +359,8 @@ def main() -> None:
                state_coef=args.state_coef,
                mirror_coef=args.mirror_coef,
                proj_coef=args.proj_coef,
+               lambda_sigreg=args.lambda_sigreg,
+               pred_detach_target=args.pred_detach_target,
                proj_slots=args.proj_slots,
                idm_coef=args.idm_coef,
                idm_pos_weight=args.idm_pos_weight,

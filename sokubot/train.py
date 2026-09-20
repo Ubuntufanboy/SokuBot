@@ -145,7 +145,24 @@ def compute_losses(
     actions = batch["actions"].to(device, non_blocking=True)  # [B, T, ticks, A]
 
     out = model(obs, actions)
-    l_pred = prediction_loss(out.zhat, out.z)
+    # STOP-GRADIENT ON THE TARGET, optionally.
+    #
+    # The encoder receives prediction gradient from BOTH sides of this loss:
+    # through `zhat = predictor(encode(obs))`, and through the target `z`
+    # itself. The second path is pressure to make future latents EASY TO
+    # PREDICT, and the cheapest way to satisfy it is to stop representing
+    # whatever moves -- which is exactly the position we need.
+    #
+    # Measured: a randomly-initialised encoder reads the play-area mirror at
+    # probe_play 0.90 on real frames, and 300 steps of training takes it to
+    # 0.77 -- identically with SIGReg, the HUD head and the counterfactual term
+    # each switched off, and identically with all of them off at once. Nothing
+    # in the auxiliary objective is responsible; the next-latent prediction is.
+    #
+    # Detaching the target is what I-JEPA and BYOL do for the same reason, and
+    # it removes that path by construction rather than trying to outweigh it.
+    target = out.z.detach() if getattr(cfg, "pred_detach_target", False) else out.z
+    l_pred = prediction_loss(out.zhat, target)
     l_sig = sigreg_stepwise(out.z, cfg)
     total = l_pred + cfg.lambda_sigreg * l_sig
 

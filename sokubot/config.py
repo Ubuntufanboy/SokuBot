@@ -132,6 +132,11 @@ class Config:
     # which is why the scaling has to be right up front.
     sigreg_scale_n: bool = True
     lambda_sigreg: float = 0.1
+    # Stop the prediction loss's gradient reaching the encoder through the
+    # TARGET latent. See train.py for the measurement that motivated it: the
+    # decay of spatial information is identical under every ablation of the
+    # auxiliary terms, so it is the next-latent objective itself.
+    pred_detach_target: bool = False
 
     # Weight on the counterfactual action-discrimination term, carried through
     # the whole run rather than bolted on afterwards. `scripts/finetune_action.py`
