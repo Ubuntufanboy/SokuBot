@@ -1542,9 +1542,13 @@ def resolve_side_arg(a) -> int:
         return 2
     if a.side is None:
         a.side = side
-        print(f"side: the agent is player {side + 1} "
-              f"(its profile is the one selected for slot {side + 1})",
-              flush=True)
+        # Read from config123.dat NOW. With --attach the operator starts the
+        # game afterwards, and a profile they change in the game's own menu is
+        # not seen here -- the same wrong-bar failure this exists to prevent.
+        print(f"side: the agent is player {side + 1} (its profile is selected "
+              f"for slot {side + 1} in config123.dat, read just now). If you "
+              f"change profiles in the game, this is stale: run `hud` and check "
+              f"the bar it calls yours against the screen.", flush=True)
     elif a.side != side:
         print(f"WARNING: --side {a.side} says player {a.side + 1}, but the "
               f"profiles put the agent in slot {side + 1}. If --side is wrong "

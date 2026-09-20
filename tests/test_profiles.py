@@ -115,3 +115,35 @@ def test_a_shared_pause_key_is_not_a_collision(game):
     """
     _config(game, "anon", "sokubot")
     assert "anon" not in pf.audit(game)["collides_with_agent"]
+
+
+# --- the probe and the launcher share one verdict ---------------------------
+@pytest.fixture
+def probe():
+    from scripts.live_probe import profiles_probe
+    return profiles_probe
+
+
+@pytest.mark.parametrize("p1, p2", [
+    ("anon", "sokubot"),        # good
+    ("sokubot", "anon"),        # good, other chair
+    ("anon", "clash"),          # agent in neither slot
+    ("clash", "sokubot"),       # a loaded profile shares keys
+])
+def test_the_probe_passes_exactly_when_the_launcher_would_start(game, probe,
+                                                                p1, p2, capsys):
+    _config(game, p1, p2)
+    try:
+        pf.resolve_side(game)
+        launcher_starts = True
+    except pf.SlotError:
+        launcher_starts = False
+    assert (probe(game) == 0) is launcher_starts
+    capsys.readouterr()
+
+
+def test_the_probe_now_fails_an_agent_the_game_will_not_read(game, probe, capsys):
+    """It used to print 'NOT SELECTED' and exit 0."""
+    _config(game, "anon", "clash")
+    assert probe(game) == 1
+    assert "neither slot" in capsys.readouterr().err

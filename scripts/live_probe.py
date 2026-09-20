@@ -750,11 +750,13 @@ def profiles_probe(game: Path, agent: str = "sokubot") -> int:
     print()
     print("safe to play against locally: "
           + (", ".join(r["safe_opponent_profiles"]) or "NONE"))
-    # A collision with the profile that is actually loaded is the only one that
-    # can bite tonight, so it is the only one that fails the probe.
-    bad = pf.live_collisions(r)
-    if bad or r["pad_complaints"]:
-        print(f"\nFAIL: {bad or 'pad mismatch'}", file=sys.stderr)
+    # The verdict is the launcher's own, from the same function, so the probe can
+    # never pass a setup the launcher would refuse or the reverse. That includes
+    # an agent selected for NEITHER slot, which the game will not read.
+    try:
+        pf.resolve_side(game, agent)
+    except pf.SlotError as e:
+        print(f"\nFAIL: {e}", file=sys.stderr)
         return 1
     return 0
 
