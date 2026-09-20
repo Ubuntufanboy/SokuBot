@@ -801,9 +801,14 @@ weeks.
    reward questions, which is the first time that has been the honest place to
    point.
 3. **Finetune against CPU bots in the real game.** Now unblocked: the live loop
-   can run unattended (`scripts/play_match.py --launch --seek-battle`), which
-   makes real-environment episodes collectable rather than hypothetical. The
-   first learning signal that is not self-referential.
+   can run unattended, which makes real-environment episodes collectable rather
+   than hypothetical. The first learning signal that is not self-referential.
+   *Correction, 2026-09-20:* `--launch --seek-battle` exist only in
+   `sokubot/live/agent.py`, not `play_match.py`, and that path drives a virtual
+   gamepad (which makes Soku's menus scroll) and mashes buttons blind, so it is
+   not the unattended loop this line claims. The harness that actually plays is
+   `scripts/play_cheat_match.py`; the launcher that removes its manual steps is
+   planned, not built.
 
 **What would raise the ceiling, if it needs raising.** Four runs peaked between
 +0.0016 and +0.00215. The binding constraint is most likely the world model's

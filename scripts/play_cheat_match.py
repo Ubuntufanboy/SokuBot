@@ -248,6 +248,12 @@ HELP = """commands (write a line to /tmp/sokubot.ctl):
                           which one --side says is ours. Check it against the
                           screen before arming: get this bit wrong and the
                           agent plays to the opponent's health.
+  arm | fight             let the agent play. A LOCAL vision run refuses until
+                          identity is known; a --server run does NOT check, and
+                          if `whoami` has not run the server answers with an
+                          empty reply and the pad sits idle.
+  disarm                  stop playing and neutralise the pad. The game keeps
+                          running, so this is safe where a pause is not.
   rec [path] / rec stop   start or stop recording
   stop                    end the session
 """
