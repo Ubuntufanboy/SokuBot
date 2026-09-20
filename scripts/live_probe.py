@@ -752,8 +752,7 @@ def profiles_probe(game: Path, agent: str = "sokubot") -> int:
           + (", ".join(r["safe_opponent_profiles"]) or "NONE"))
     # A collision with the profile that is actually loaded is the only one that
     # can bite tonight, so it is the only one that fails the probe.
-    live = {sel["p1"], sel["p2"]} - {agent}
-    bad = sorted(live & set(r["collides_with_agent"]))
+    bad = pf.live_collisions(r)
     if bad or r["pad_complaints"]:
         print(f"\nFAIL: {bad or 'pad mismatch'}", file=sys.stderr)
         return 1

@@ -1523,6 +1523,35 @@ def remote_vision_session(pad: VirtualKeypad, a) -> int:
             brain.close()
 
 
+def resolve_side_arg(a) -> int:
+    """Fill `a.side` from the profiles, or say why not. 0 = go, else an exit code.
+
+    Runs before the pad or the game exist, so a refusal costs nothing. An
+    explicit --side is the operator overriding the profiles: it is checked and
+    warned about, never refused.
+    """
+    from sokubot.live import profiles as pf
+    try:
+        side, _ = pf.resolve_side(a.game)
+    except pf.SlotError as e:
+        if a.side is not None:
+            print(f"WARNING: could not check --side {a.side} against the "
+                  f"profiles: {e}", flush=True)
+            return 0
+        print(f"NOT STARTING: {e}", flush=True)
+        return 2
+    if a.side is None:
+        a.side = side
+        print(f"side: the agent is player {side + 1} "
+              f"(its profile is the one selected for slot {side + 1})",
+              flush=True)
+    elif a.side != side:
+        print(f"WARNING: --side {a.side} says player {a.side + 1}, but the "
+              f"profiles put the agent in slot {side + 1}. If --side is wrong "
+              f"the policy is fed the OPPONENT's health as its own.", flush=True)
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--game", type=Path,
@@ -1560,13 +1589,16 @@ def main() -> int:
                          "encoder said beside what was true. It never reaches "
                          "the policy, which still sees only pixels and its own "
                          "inputs. Pass an empty string to disable.")
-    ap.add_argument("--side", type=int, default=0, choices=(0, 1),
-                    help="0 = the agent is PLAYER 1. This is now load-bearing "
-                         "in a second place: it picks WHICH HEALTH BAR IS "
-                         "MINE, because the HUD is indexed by player and never "
-                         "moves when the characters swap sides. `whoami` "
-                         "settles the SIDE, which is a different bit; run "
-                         "`hud` to check this one against the screen.")
+    ap.add_argument("--side", type=int, default=None, choices=(0, 1),
+                    help="0 = the agent is PLAYER 1, 1 = PLAYER 2. Default: read "
+                         "it from which slot the agent's profile is selected in "
+                         "(config123.dat), and refuse to start if that is "
+                         "ambiguous or unsafe. This is load-bearing in a second "
+                         "place: it picks WHICH HEALTH BAR IS MINE, because the "
+                         "HUD is indexed by player and never moves when the "
+                         "characters swap sides. `whoami` settles the SIDE, "
+                         "which is a different bit; run `hud` to check this one "
+                         "against the screen.")
     # The filename says what it is. This run reads the game's memory, which is
     # cheating, and a file called match.mp4 sitting beside honest ones is how a
     # probe gets quoted as a result six months later.
@@ -1587,6 +1619,14 @@ def main() -> int:
         # This one does not read a byte of game memory, and calling its
         # recording a cheating diagnostic would be its own kind of wrong.
         a.record = Path("results/VISION_no-memory_diagnostic.mp4")
+
+    if a.verify:
+        if a.side is None:
+            a.side = 0                 # the reader checks do not use it
+    else:
+        rc = resolve_side_arg(a)
+        if rc:
+            return rc
 
     proc = None
     if not a.attach:

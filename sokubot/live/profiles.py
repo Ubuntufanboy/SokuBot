@@ -247,3 +247,57 @@ def audit(game_dir: Path, agent: str = "sokubot") -> dict:
     report["safe_opponent_profiles"] = sorted(
         n for n in profs if n != agent and n not in report["collides_with_agent"])
     return report
+
+
+def live_collisions(report: dict) -> list[str]:
+    """Installed profiles that collide with the agent AND are loaded right now.
+
+    A collision with a profile nobody selected cannot bite tonight, so it is the
+    only kind that should stop a run. One definition, because `live_probe
+    --profiles` and the launcher must never disagree about it.
+    """
+    live = {report["selected"]["p1"], report["selected"]["p2"]} - {report["agent"]}
+    return sorted(live & set(report["collides_with_agent"]))
+
+
+class SlotError(RuntimeError):
+    """The agent has no slot it is safe to arm in. The message says why."""
+
+
+def resolve_side(game_dir: Path, agent: str = "sokubot") -> tuple[int, dict]:
+    """Which HUD side the agent plays -- 0 = player 1, 1 = player 2 -- or `SlotError`.
+
+    The slot is CONFIGURATION, not game state: `config123.dat` names the profile
+    each slot loads, and the agent's profile is in exactly one of them. Reading
+    it replaces a default of 0 that silently fed the opponent's health to the
+    policy as its own whenever the agent was actually player 2.
+
+    LOCAL Vs Player only. Online the opponent's profile is not on this machine
+    and the slot comes from who hosted, not from a profile.
+
+    Refuses rather than guesses when the profile is in neither slot, when the pad
+    disagrees with the profile (the agent would press keys the game is not
+    listening for), or when a LOADED profile shares a key with the agent's pad.
+    Returns (side, the full `audit` report).
+    """
+    try:
+        rep = audit(Path(game_dir), agent)
+    except (OSError, ValueError) as e:
+        raise SlotError(f"cannot read profiles under {game_dir}: {e}") from e
+    slot = rep["agent_slot"]
+    sel = rep["selected"]
+    if slot is None:
+        raise SlotError(
+            f"profile {agent!r} is selected for neither slot (P1={sel['p1']!r}, "
+            f"P2={sel['p2']!r}), so the game will not read the agent's pad. "
+            f"Select it in the game's profile menu, or pass --side to override.")
+    if rep["pad_complaints"]:
+        raise SlotError("the agent's profile and its pad disagree: "
+                        + "; ".join(rep["pad_complaints"]))
+    bad = live_collisions(rep)
+    if bad:
+        raise SlotError(
+            f"loaded profile {', '.join(bad)} shares keys with the agent's pad, "
+            f"so the human's player would be driven too. Run "
+            f"`python -m scripts.live_probe --profiles` for the key list.")
+    return slot - 1, rep
