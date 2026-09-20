@@ -148,9 +148,15 @@ BUTTON_CODES = (
 #
 # Arrows plus ZXCVBN instead, which is the scheme `profile1p.pf` uses and which
 # demonstrably drives the game. Collision with the human is avoided by choosing
-# against their actual profile rather than by hoping: P1 (`anon`) holds
-# W/A/S/D + P/O/SPACE/F/I/U, so none of these overlap. Check this again if the
-# human's profile changes -- `scripts/live_probe.py --profiles` prints them.
+# against their actual profile rather than by hoping.
+#
+# Do not trust a comment for what the human holds -- this one used to claim P1
+# (`anon`) held W/A/S/D + P/O/SPACE/F/I/U and it had gone stale: `anon.pf` now
+# binds the ARROW keys and P/O/I/F. Read the file. `sokubot/live/profiles.py`
+# parses `.pf` and `scripts/live_probe.py --profiles` prints the audit,
+# including which profile each slot is set to load. Measured today: `anon`,
+# `profile1p`, `profile2p` and `LeWorld` are safe; `noob`, `bleh` and `apollo`
+# each collide with the bindings below.
 KEYPAD_CODES = (
     ("up",     "KEY_T"),  ("down",  "KEY_G"),
     ("left",   "KEY_H"),  ("right", "KEY_J"),
@@ -175,9 +181,28 @@ SPARE_KEYS = tuple(
 )
 
 
-# P1's controls, for setup only. Read off `profile/anon.pf`.
-P1_KEYS = {"up": "KEY_W", "down": "KEY_S", "left": "KEY_A", "right": "KEY_D",
-           "confirm": "KEY_P", "cancel": "KEY_O"}
+# P1's controls, for setup only -- the `p1` console command taps these to drive
+# menus, which are P1-driven throughout.
+#
+# These were W/A/S/D and were WRONG: `anon.pf` binds the arrow keys, so every
+# `p1 left`/`p1 up` sent a key nobody was listening for and only `confirm` and
+# `cancel` appeared to work. Read from the profile rather than hardcoded, with
+# the old values as the fallback for when the game directory is not to hand.
+P1_KEYS = {"up": "KEY_UP", "down": "KEY_DOWN", "left": "KEY_LEFT",
+           "right": "KEY_RIGHT", "confirm": "KEY_P", "cancel": "KEY_O"}
+
+
+def p1_keys_from_profile(game_dir) -> dict:
+    """P1's actual bindings, or `P1_KEYS` if they cannot be read."""
+    try:
+        from .profiles import load_all, selected_profiles
+        p1, _ = selected_profiles(game_dir)
+        prof = load_all(game_dir)[p1]
+        k = prof.keys()
+        return {"up": k["up"], "down": k["down"], "left": k["left"],
+                "right": k["right"], "confirm": k["a"], "cancel": k["b"]}
+    except Exception:
+        return dict(P1_KEYS)
 
 
 class VirtualPadError(RuntimeError):

@@ -45,7 +45,14 @@ REQUEST = struct.Struct("!IIBI")
 # then ticks*10 packed bits
 REPLY_HEAD = struct.Struct("!IIB")
 
-DEFAULT_PORT = 10800
+# NOT 10800. That is Soku's own netplay port -- `config123.dat` records it as
+# the port on every host in the recent-connection list, and the game binds it
+# when it hosts. The two only ever collided once inference had to share a
+# machine with the game, which is exactly the situation the LAN box going away
+# creates, and the failure is an "address already in use" on whichever started
+# second. Moved out of the way rather than documented as a hazard.
+DEFAULT_PORT = 10850
+SOKU_NETPLAY_PORT = 10800
 JPEG_QUALITY = 85
 
 

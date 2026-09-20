@@ -706,6 +706,60 @@ def frames_probe(ckpt: Path, work: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+def profiles_probe(game: Path, agent: str = "sokubot") -> int:
+    """Print the key-binding audit `pad.py` has advertised for a month.
+
+    Wine's dinput ignores window focus, so a key the agent's device sends is
+    delivered to whichever player's profile holds it -- both, if both do. This
+    is the pre-flight for local Vs Player. Online it does not apply: the
+    opponent is on their own machine.
+    """
+    from sokubot.live import profiles as pf
+    try:
+        r = pf.audit(game, agent)
+    except (OSError, ValueError) as e:
+        print(f"cannot read profiles under {game}: {e}", file=sys.stderr)
+        return 1
+
+    sel = r["selected"]
+    slot = r["agent_slot"]
+    print(f"game       {game}")
+    print(f"selected   P1={sel['p1']}  P2={sel['p2']}")
+    print(f"agent      {agent} -> "
+          + (f"player {slot}" if slot else
+             "NOT SELECTED for either slot -- the game will not read the pad"))
+    print()
+    print("bindings")
+    for name, keys in sorted(r["keys"].items()):
+        mark = "*" if name == agent else " "
+        row = " ".join(f"{c}={k.removeprefix('KEY_')}" for c, k in keys.items())
+        print(f" {mark}{name:11s} {row}")
+    print()
+    for line in r["pad_complaints"]:
+        print(f"PAD MISMATCH  {line}")
+    if not r["pad_complaints"]:
+        print("pad agrees with the agent's profile on all ten controls")
+    print()
+    for name, c in sorted(r["collides_with_agent"].items()):
+        detail = ", ".join(f"{k.removeprefix('KEY_')} ({a} vs {b})"
+                           for k, (a, b) in sorted(c.items()))
+        print(f"COLLIDES      {name}: {detail}")
+    for name, c in sorted(r["benign_overlap"].items()):
+        detail = ", ".join(k.removeprefix("KEY_") for k in sorted(c))
+        print(f"  (benign)    {name}: {detail} -- the pad has no code for these")
+    print()
+    print("safe to play against locally: "
+          + (", ".join(r["safe_opponent_profiles"]) or "NONE"))
+    # A collision with the profile that is actually loaded is the only one that
+    # can bite tonight, so it is the only one that fails the probe.
+    live = {sel["p1"], sel["p2"]} - {agent}
+    bad = sorted(live & set(r["collides_with_agent"]))
+    if bad or r["pad_complaints"]:
+        print(f"\nFAIL: {bad or 'pad mismatch'}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true",
@@ -739,11 +793,19 @@ def main() -> int:
                     default=Path.home() / ".cache/sokubot/corpus_sample")
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--rounds", type=int, default=1)
+    ap.add_argument("--profiles", action="store_true",
+                    help="audit profile/*.pf key bindings for collisions with "
+                         "the agent, and say which slot loads which profile")
+    ap.add_argument("--game", type=Path,
+                    default=Path.home() / ".wine-soku/drive_c/Games/Soku",
+                    help="game directory holding profile/ and config123.dat")
     ap.add_argument("--prefix", type=Path,
                     default=Path(os.environ.get("WINEPREFIX",
                                                 Path.home() / ".wine-soku")))
     a = ap.parse_args()
 
+    if a.profiles:
+        return profiles_probe(a.game)
     if a.check:
         return check()
     if a.joycpl:
