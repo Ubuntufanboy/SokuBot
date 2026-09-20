@@ -528,10 +528,90 @@ class EntropyFloor:
                 "ent_violation": self.floor - entropy}
 
 
+class ButtonRateFloor:
+    """Keeps each button's PRESS RATE near the corpus's, one dual per button.
+
+    THE FAILURE THIS EXISTS FOR
+    ---------------------------
+    A trained policy's aggregate press rate was 0.135 against the corpus's
+    0.098 -- a 1.4x drift that looks benign. Per button it pressed `spell`
+    **10.8x** and `change` **7.2x** more often than any human in 200 hours.
+    Those are the two rarest buttons in the corpus, about 0.5% each, so the
+    direction buttons at ~0.27 dominate the mean and bury them.
+
+    Neither existing guard sees it. The KL to the reference is over the joint
+    distribution, where a Bernoulli moving 0.005 -> 0.060 is a large divergence
+    in its own dimension and a rounding error inside a ~30-dimensional sum. The
+    entropy floor is if anything satisfied *more* by a policy that spreads mass
+    onto rare buttons. Both were healthy while this happened.
+
+    Why it matters beyond looking wrong: the rarest inputs are the ones the
+    world model saw least, so they are where it is freest to be wrong, and a
+    policy optimising against that model is actively drawn there. Masking both
+    buttons showed 84-86% of the measured advantage survived -- so most of the
+    gain was real, and the remaining sixth was an advantage over the model
+    rather than over the game.
+
+    ONE MULTIPLIER PER BUTTON, NOT ONE OVERALL
+    ------------------------------------------
+    The whole point is that the violation is per dimension. A single dual on
+    the aggregate rate would be satisfied by the direction buttons and never
+    bite on `spell`, which is exactly the blindness being fixed.
+
+    Shaped like `EntropyFloor` deliberately -- a Lagrange multiplier that costs
+    nothing while the constraint holds and grows while it is violated -- so it
+    cannot tax a policy that is behaving, and so the bounds that stopped that
+    controller winding up apply here unchanged.
+    """
+
+    def __init__(self, corpus_rates, device, tolerance: float = 2.0,
+                 lr: float = 0.05, min_log_alpha: float = -4.0,
+                 max_log_alpha: float = 2.0):
+        # A MULTIPLE of the human rate, not an absolute margin. `spell` at
+        # 0.0056 and `left` at 0.2724 differ by fifty times, so one absolute
+        # tolerance either pins the common buttons or lets the rare ones run.
+        self.ceiling = torch.as_tensor(corpus_rates, dtype=torch.float32,
+                                       device=device) * tolerance
+        self.log_alpha = torch.zeros(len(self.ceiling), device=device,
+                                     requires_grad=True)
+        with torch.no_grad():
+            self.log_alpha.fill_(min_log_alpha)
+        self.opt = torch.optim.Adam([self.log_alpha], lr=lr)
+        self.lo, self.hi = min_log_alpha, max_log_alpha
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.detach().clamp(self.lo, self.hi).exp()
+
+    def excess(self, rates: torch.Tensor) -> torch.Tensor:
+        """Expected press rates [10] -> how far each exceeds its ceiling.
+
+        `rates` must come from the policy's DISTRIBUTIONS, not from sampled
+        actions: a sampled 0/1 carries no gradient, so a penalty built on it
+        would report a violation and be unable to correct it. See
+        `SokuPolicy.log_prob_of(..., return_rates=True)`.
+        """
+        return (rates - self.ceiling).clamp(min=0.0)
+
+    def update(self, rates: torch.Tensor) -> dict:
+        excess = self.excess(rates).detach()
+        loss = -(self.log_alpha.clamp(self.lo, self.hi) * excess).sum()
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        self.opt.step()
+        with torch.no_grad():
+            self.log_alpha.clamp_(self.lo, self.hi)
+        return {"btn_excess": float(excess.sum()),
+                "btn_alpha_max": float(self.alpha.max()),
+                "btn_worst": int(excess.argmax()) if float(excess.max()) > 0 else -1}
+
+
 def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
               old_logp: torch.Tensor, cfg: GRPOConfig,
               ref_logp: Optional[torch.Tensor] = None,
-              ent_alpha: float = 0.0) -> tuple[torch.Tensor, dict]:
+              ent_alpha: float = 0.0,
+              button_floor: Optional["ButtonRateFloor"] = None
+              ) -> tuple[torch.Tensor, dict]:
     """Clipped surrogate, a k3 KL back to the sampling policy, and optionally a
     second KL back to a fixed reference.
 
@@ -547,7 +627,11 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
     side = traj["side"][:, None].expand(B, T).reshape(B * T)
     acts = traj["mine"].reshape(B * T, *traj["mine"].shape[2:])
 
-    logp, ent = policy.log_prob_of(obs, side, acts)
+    if button_floor is None:
+        logp, ent = policy.log_prob_of(obs, side, acts)
+        rates = None
+    else:
+        logp, ent, rates = policy.log_prob_of(obs, side, acts, return_rates=True)
     logp, ent = logp.view(B, T), ent.view(B, T)
     alive = traj["alive"]
 
@@ -580,6 +664,12 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
     # fixed bonus and stays at 0 unless something explicitly wants it.
     loss = (((pg + cfg.kl_coef * kl + cfg.kl_ref_coef * kl_ref
               - (cfg.entropy_coef + ent_alpha) * ent) * alive).sum() / denom)
+    if button_floor is not None:
+        # Added OUTSIDE the alive-weighted mean because it is a constraint on
+        # the policy's distribution, not on any particular transition -- the
+        # rate is already an average over every step in the batch.
+        btn = (button_floor.alpha * button_floor.excess(rates)).sum()
+        loss = loss + btn
     with torch.no_grad():
         stats = {
             "pg": float((pg * alive).sum() / denom),
@@ -588,6 +678,7 @@ def grpo_loss(policy: SokuPolicy, traj: dict, adv: torch.Tensor,
             "ratio": float((ratio * alive).sum() / denom),
             "clip_frac": float((((ratio - 1).abs() > cfg.clip_eps) * alive).sum() / denom),
             "kl_ref": float((kl_ref * alive).sum() / denom),
+            "btn_penalty": float(btn) if button_floor is not None else 0.0,
         }
     return loss, stats
 

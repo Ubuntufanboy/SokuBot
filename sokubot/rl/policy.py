@@ -46,6 +46,41 @@ class PolicyOutput:
     entropy: torch.Tensor      # [B]
 
 
+def representable_prior(btn_probs, logit_bound: float, names=None):
+    """Floor button rates to what a bounded logit can actually express.
+
+    A corpus where a button is NEVER pressed gives log(p/(1-p)) -> -13.82 after
+    the 1e-6 clamp, and `set_action_prior` rightly refuses to represent that at
+    logit_bound 6.0 rather than silently shipping a shrunken prior. But
+    refusing is not an answer when the corpus legitimately contains zeros: the
+    self-play behaviour policy never presses `change` or `spell`, so their rate
+    is exactly 0.
+
+    Raising the bound is the wrong repair -- 6.0 is the value that stopped four
+    identical policy collapses. Flooring is the right one, and it is honest
+    about what it means: "as unlikely as this parameterisation can say". At
+    bound 6.0 that floor is p = 1/(1+e^6) = 0.00247.
+
+    This is not a licence to press them. A button the world model has never
+    seen pressed has no trustworthy predicted effect, and --button-tolerance
+    caps press rates at a multiple of the corpus rate, which for these is
+    essentially zero. The floor makes the prior representable; the constraint
+    keeps the policy near it.
+    """
+    import numpy as np
+    # Strictly INSIDE the bound. set_action_prior tests `>= L`, so flooring to
+    # exactly L trips the same guard this exists to satisfy -- measured: "needs
+    # logits up to 6.00 but logit_bound is 6.0".
+    lo = 1.0 / (1.0 + float(np.exp(logit_bound - 1e-2)))
+    q = np.clip(np.asarray(btn_probs, dtype=np.float64), lo, 1.0 - lo)
+    moved = np.flatnonzero(np.abs(q - np.asarray(btn_probs, np.float64)) > 1e-12)
+    if len(moved):
+        for i in moved:
+            nm = names[i] if names is not None and i < len(names) else f"btn{i}"
+            print(f"  prior floor: {nm} {float(btn_probs[i]):.6f} -> {q[i]:.6f} "
+                  f"(logit bound {logit_bound})", flush=True)
+    return q
+
 class SokuPolicy(nn.Module):
     """[B, H, latent] + side -> a distribution over one decision step."""
 
@@ -167,11 +202,18 @@ class SokuPolicy(nn.Module):
         return PolicyOutput(self._assemble(lr_i, ud_i, free), lp, ent)
 
     def log_prob_of(self, z_hist: torch.Tensor, side: torch.Tensor,
-                    actions: torch.Tensor):
+                    actions: torch.Tensor, return_rates: bool = False):
         """Re-score stored actions under current parameters (the GRPO ratio).
 
         Recovers the categorical index from the stored one-hot pair: this is
         lossless because `_assemble` can never set both bits of an axis.
+
+        `return_rates` adds the EXPECTED press rate per button, [10], which is
+        a third return value and off by default so existing callers are
+        untouched. It is computed from the distributions rather than from
+        sampled actions because a sampled 0/1 carries no gradient, and a
+        constraint on press rates has to be able to push back on the
+        parameters that produce them.
         """
         d_lr, d_ud, d_btn = self.distributions(z_hist, side)
         lr_i = (actions[..., IDX_LEFT] > 0.5).long() + 2 * (actions[..., IDX_RIGHT] > 0.5).long()
@@ -180,7 +222,16 @@ class SokuPolicy(nn.Module):
         lp = (d_lr.log_prob(lr_i) + d_ud.log_prob(ud_i)).sum(-1) \
             + d_btn.log_prob(free).sum((-1, -2))
         ent = (d_lr.entropy() + d_ud.entropy()).sum(-1) + d_btn.entropy().sum((-1, -2))
-        return lp, ent
+        if not return_rates:
+            return lp, ent
+        # Same ten-slot order `_assemble` writes: the direction bits come from
+        # the two categoricals (index 1 and 2 of each axis), the rest are the
+        # Bernoullis' own probabilities.
+        lrp, udp, bp = d_lr.probs, d_ud.probs, d_btn.probs
+        rates = torch.stack([udp[..., 1].mean(), udp[..., 2].mean(),
+                             lrp[..., 1].mean(), lrp[..., 2].mean()]
+                            + [bp[..., i].mean() for i in range(N_FREE)])
+        return lp, ent, rates
 
 
 def jitter_actions(actions: torch.Tensor, sigma_frames: float = 1.0,

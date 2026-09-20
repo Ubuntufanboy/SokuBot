@@ -581,6 +581,10 @@ def main() -> int:
     ap.add_argument("--horizon-weights", action="store_true",
                     help="one unroll loss per horizon with learned "
                          "uncertainty weighting instead of one pooled term")
+    ap.add_argument("--pos-weight-max", type=float, default=5.0,
+                    help="clamp on the per-flag BCE pos_weight. 1.0 makes the "
+                         "flag heads calibrated; anything above it trades "
+                         "calibration for gradient share on rare classes.")
     ap.add_argument("--action-skip", action="store_true",
                     help="a direct zero-initialised path from the buttons to "
                          "the output head. The action otherwise reaches the "
@@ -691,7 +695,18 @@ def main() -> int:
     # `crushed` visible at a 0.11% base rate, but it also pushes every flag's
     # predicted probability far above its true rate -- measured, `guarding`
     # came out at 0.52 against 4.66% -- which makes the block gate unreadable.
-    pw = default_pos_weight().clamp(max=5.0)
+    # BCE with pos_weight w has minimiser w*p/(w*p + 1 - p), a monotone
+    # distortion, so any w != 1 is a deliberate miscalibration. Measured at
+    # w=5: the game blocks 0.578 of arriving attacks when holding away and the
+    # model predicts 0.834, against a formula value of 0.873 -- the model is
+    # calibrated FOR ITS LOSS, and the loss is what is skewed. At w=1 the
+    # minimiser is p, so the predicted causal effect should land near the
+    # measured +0.564 instead of +0.741.
+    #
+    # The reason w>1 existed is gradient share for rare flags, and
+    # --flag-entropy-weight is the tool for that: it scales a CHANNEL's loss
+    # without moving where that channel's optimum sits.
+    pw = default_pos_weight().clamp(max=a.pos_weight_max)
     cont_idx = np.array(CONTINUOUS)
     sc_np, live_np = delta_scale(S, E, cont_idx)
     dsc = torch.as_tensor(sc_np).to(a.device)
@@ -784,6 +799,7 @@ def main() -> int:
                         "ct_weight": a.ct_weight,
                         "arrival_weight": a.arrival_weight,
                         "act_skip": a.action_skip,
+                        "pos_weight_max": a.pos_weight_max,
                         "horizon_weights": a.horizon_weights},
                        a.out / "sim.pt")
     print(f"\n-> {a.out}/sim.pt")
