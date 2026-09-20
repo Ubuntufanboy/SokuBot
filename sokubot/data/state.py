@@ -367,3 +367,85 @@ def read_state(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
             f"not a position. Check CHAR_POSITION_X_OFFSET against the game "
             f"build before trusting any of these labels.")
     return state, proj, action, valid
+
+
+# --- the camera, and the world -> screen map it makes possible --------------
+#
+# Added to the sidecar 2026-09-09. Every positional label above is in WORLD
+# units; a perception model sees SCREEN pixels; and Soku's camera pans with the
+# players and zooms with their separation, so the transform changes every frame
+# and cannot be recovered from the frame itself.
+#
+# Verified on a 12 789-frame capture the day the columns were added: the rect
+# is valid on 100% of frames, its width runs 640..1270 world units with the
+# aspect ratio held at exactly 4:3, `corr(width, 1/scale) = +1.0000` between two
+# separately-read fields, and BOTH characters project inside the viewport on
+# 99.33% of frames.
+CAMERA_COLUMNS: tuple[str, ...] = (
+    "cam_x", "cam_y", "cam_scale",
+    "cam_left", "cam_top", "cam_right", "cam_bottom",
+)
+CAM = {name: i for i, name in enumerate(CAMERA_COLUMNS)}
+
+# The game renders 640x480 before the capture squashes it; screen coordinates
+# below are normalised to [-1, 1] instead, so they are independent of whatever
+# resolution a model happens to consume.
+GAME_W, GAME_H = 640.0, 480.0
+
+
+def has_camera_columns(cols) -> bool:
+    return all(c in cols for c in CAMERA_COLUMNS)
+
+
+def read_camera(path: Path) -> np.ndarray:
+    """-> float32 [N, 7] in CAMERA_COLUMNS order, or [N, 7] of zeros.
+
+    Returns zeros rather than raising for a capture taken before the columns
+    existed, because the whole corpus predates them and a caller that wants to
+    mix old and new should test `valid_camera` rather than handle an exception.
+    """
+    with _open(path) as fh:
+        reader = csv.DictReader(fh)
+        cols = reader.fieldnames or []
+        if not has_camera_columns(cols):
+            return np.zeros((sum(1 for _ in reader), len(CAMERA_COLUMNS)),
+                            np.float32)
+        raw = list(reader)
+    if raw and raw[-1].get("cam_right") is None:
+        raw.pop()
+    out = np.zeros((len(raw), len(CAMERA_COLUMNS)), np.float32)
+    for i, r in enumerate(raw):
+        for j, c in enumerate(CAMERA_COLUMNS):
+            v = r.get(c)
+            out[i, j] = 0.0 if v in (None, "") else float(v)
+    return out
+
+
+def valid_camera(cam: np.ndarray) -> np.ndarray:
+    """Frames whose rect can actually be divided by."""
+    return cam[:, CAM["cam_right"]] > cam[:, CAM["cam_left"]]
+
+
+def to_screen(world_x: np.ndarray, world_y: np.ndarray,
+              cam: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """World coordinates -> screen, normalised to [-1, 1], y DOWN.
+
+    `world_x`/`world_y` are in game units (NOT divided by STAGE_SPAN) and
+    broadcast against `cam`, so a [N, 2] of both players works as well as an
+    [N] of one.
+
+    Soku's world y increases UPWARD while screen y increases downward, and the
+    camera's `top` edge therefore holds the LARGER value. That sign is the
+    thing to get wrong here -- a guard that assumed `bottom > top` zeroed an
+    entire 12 788-frame capture before this was understood -- so the vertical
+    map is written to be explicit about it rather than symmetric with x.
+    """
+    L = cam[:, CAM["cam_left"]]
+    R = cam[:, CAM["cam_right"]]
+    T = cam[:, CAM["cam_top"]]
+    B = cam[:, CAM["cam_bottom"]]
+    if world_x.ndim == 2:
+        L, R, T, B = L[:, None], R[:, None], T[:, None], B[:, None]
+    sx = (world_x - L) / np.maximum(R - L, 1e-6) * 2.0 - 1.0
+    sy = (T - world_y) / np.maximum(T - B, 1e-6) * 2.0 - 1.0
+    return sx.astype(np.float32), sy.astype(np.float32)

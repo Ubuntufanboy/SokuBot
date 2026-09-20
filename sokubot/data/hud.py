@@ -510,3 +510,91 @@ def read_frame_hud(frames: np.ndarray, flip: bool = True) -> np.ndarray:
         _cards_lit(frames, P1_CARD_X), _cards_lit(frames, P2_CARD_X),
     ], axis=1).astype(np.float32)
     return np.clip(out, 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# One frame at a time, for the live loop
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# The pixels-to-state encoder sees 224x224 downscaled from 640x480. At that
+# size the health bar is a two-pixel strip and the six-pixel spirit hexagons
+# are gone, so it cannot read either -- and it does not fail loudly, it falls
+# back on the one thing that IS visible at 224px: how far into the round we
+# are. Measured on two real matches, against the game's own memory:
+#
+#                  R2 per row   R2 of "predict the average of both bars"   R2 on p1-p2
+#     hp              0.560                   0.693                           0.086
+#     spirit          0.377                   0.565                           0.000
+#
+# It is beaten by a constant, and on the difference between the two players --
+# the only part that says who is WINNING -- it has nothing. The per-row R2 hid
+# this because the two bars correlate at +0.73, so predicting their mean scores
+# well on each row while knowing nothing about either player.
+#
+# The bars, meanwhile, are 189 px wide, high contrast, and at a fixed address.
+# Reading them where they are costs about a millisecond and is exact. This is
+# still pixels-only: it is the same screen, looked at properly.
+#
+# PLAYER ORDER, NOT SCREEN ORDER
+# ------------------------------
+# The characters swap sides freely, but the HUD does not: P1's bar is top-left
+# for the whole match. So these come back indexed by PLAYER and need no side
+# inference at all -- only the agent's own slot, which is a known constant
+# rather than something to estimate every frame.
+
+HUD_LIVE_CHANNELS = ("hp", "spirit")
+
+
+def read_frame(frame: np.ndarray, flip: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    """One uint8 [480,480,3] frame -> (hp[2], spirit[2]), indexed by PLAYER.
+
+    `flip` matches `read_trace`: capture orientation is bottom-up, so the
+    default flips it upright. Getting this wrong is silent -- it samples the
+    card row instead of the health bar and returns a plausible-looking small
+    number -- so prefer `detect_flip` over assuming.
+    """
+    if frame.shape[:2] != (480, 480):
+        raise ValueError(f"expected [480,480,3], got {frame.shape}")
+    f = frame[None]
+    if flip:
+        f = f[:, ::-1]
+    fr, fc = FILL_ROWS
+    y1, _ = _split_bar(f[:, fr:fc, P1_HP_X[0]:P1_HP_X[1]])
+    y2, _ = _split_bar(f[:, fr:fc, P2_HP_X[0]:P2_HP_X[1]])
+    hp = np.array([y1[0], y2[0]], dtype=np.float32)
+    sp = np.array([_spirit(f, P1_SPIRIT_X)[0], _spirit(f, P2_SPIRIT_X)[0]],
+                  dtype=np.float32)
+    return np.clip(hp, 0.0, 1.0), np.clip(sp, 0.0, 1.0)
+
+
+def detect_flip(frames: np.ndarray) -> bool | None:
+    """Which orientation puts the health bars where the constants say.
+
+    -> True if `frames` are bottom-up (the corpus/capture convention), False if
+    they are already upright, None if neither reads as a health bar.
+
+    The test is not "which is brighter" but which orientation produces a
+    PLAUSIBLE PAIR of bars: both inside [0,1] with at least one of them
+    substantially lit. Upside down, the sample lands on the spell-card strip,
+    which is dim and unsaturated in the channels `_split_bar` keys on, so the
+    wrong orientation reads near zero for both players.
+    """
+    best, score = None, 0.0
+    for flip in (True, False):
+        f = frames[:, ::-1] if flip else frames
+        fr, fc = FILL_ROWS
+        y1, _ = _split_bar(f[:, fr:fc, P1_HP_X[0]:P1_HP_X[1]])
+        y2, _ = _split_bar(f[:, fr:fc, P2_HP_X[0]:P2_HP_X[1]])
+        # A high quantile, not the median: loading screens, round-start fades
+        # and KO whiteouts all read as an empty bar, and a handful of them is
+        # enough to sink a median. The question is whether this orientation
+        # EVER shows a health bar, so take the frames where it is most lit.
+        s = float(np.quantile(y1, 0.9) + np.quantile(y2, 0.9))
+        if s > score:
+            best, score = flip, s
+    # A live bar is most of 189 px. Anything under a tenth of one bar on both
+    # players is the card strip, not health, and calling it either way would be
+    # a guess dressed as a measurement.
+    return best if score > 0.10 else None
