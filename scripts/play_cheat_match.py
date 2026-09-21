@@ -57,6 +57,7 @@ import torch
 
 from sokubot.data.state import CH, FULL_HP, STAGE_SPAN
 from sokubot.live.capture import find_game_window
+from sokubot.live.latency import format_summary, summarise
 from sokubot.live.memstate import Frame, LiveState, find_game_pid
 from sokubot.live.pad import BUTTONS, VirtualKeypad
 from sokubot.rl.policy import SokuPolicy
@@ -254,6 +255,8 @@ HELP = """commands (write a line to /tmp/sokubot.ctl):
                           empty reply and the pad sits idle.
   disarm                  stop playing and neutralise the pad. The game keeps
                           running, so this is safe where a pause is not.
+  latency                 per-decision p50/p90/p99 against the period, over
+                          decisions that ran the policy
   rec [path] / rec stop   start or stop recording
   stop                    end the session
 """
@@ -920,6 +923,9 @@ class Pilot(threading.Thread):
         self.late_run = 0
         self.blind_run = 0
         self.dt_ms = 0.0
+        # Every decision that produced an action, in ms. Kept apart from the
+        # EMA above, which cannot show a p99 twice the period.
+        self.lat_ms = deque(maxlen=20000)
         self.stop_reason = None
         # 12 s of a frozen screen is far longer than any hitstop, KO freeze or
         # round transition, and far shorter than a human's patience.
@@ -1003,6 +1009,10 @@ class Pilot(threading.Thread):
                 act, f = None, None
             dt = (time.monotonic() - t0) * 1000.0
             self.dt_ms = dt if not self.dt_ms else 0.9 * self.dt_ms + 0.1 * dt
+            # Only decisions that ran the policy: while the history window
+            # fills, decide() returns early and would flatter the numbers.
+            if act is not None:
+                self.lat_ms.append(dt)
             if f is None:
                 hist.clear()
                 self.blind += 1
@@ -1113,7 +1123,11 @@ class Pilot(threading.Thread):
             extra += f" | re-anchored {self.reanchors}x"
         return (f"decisions {self.decides} | blind {self.blind} | late "
                 f"{self.late} | decide {self.dt_ms:.0f} ms of a "
-                f"{1000*self.period:.0f} ms budget{extra}")
+                f"{1000*self.period:.0f} ms budget{extra}\n  latency: "
+                + self.latency_report())
+
+    def latency_report(self) -> str:
+        return format_summary(summarise(self.lat_ms, 1000 * self.period))
 
 
 def session(ls, pad: VirtualKeypad, a) -> int:
@@ -1155,6 +1169,8 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                   f"detected from the game's own scene state", flush=True)
     pilot = (Pilot(ls, pol, obs, side, H, ticks, brain=brain, truth=truth)
              if pol is not None else None)
+    if pilot is not None:
+        pilot.late_run_limit = a.late_run_limit
     if pilot is not None and brain is not None:
         pilot.reanchor_fn = lambda: remote_calibrate(ls, brain, pad, hold_s=0.6)
         print(f"re-anchoring identity every {pilot.reanchor_s:.0f}s "
@@ -1295,6 +1311,9 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     else:
                         print(ls.describe() if vision else describe(ls),
                               flush=True)
+                elif cmd == "latency":
+                    print(pilot.latency_report() if pilot else "no pilot",
+                          flush=True)
                 elif cmd == "rec":
                     if args and args[0] == "stop":
                         if rec:
@@ -1564,6 +1583,11 @@ def main() -> int:
                     default=Path("~/.wine-soku").expanduser())
     ap.add_argument("--display", default=os.environ.get("DISPLAY", ":0"))
     ap.add_argument("--policy", type=Path, default=None)
+    ap.add_argument("--late-run-limit", type=int, default=60,
+                    help="auto-disarm after this many decisions IN A ROW over "
+                         "the period. 60 (~5 s) suits play; a latency "
+                         "measurement wants ~10 so an overloaded machine "
+                         "stops itself within a second or two.")
     ap.add_argument("--verify", action="store_true",
                     help="run the reader checks instead of playing. ALWAYS "
                          "do this first on a fresh machine or after any "
