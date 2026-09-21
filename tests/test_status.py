@@ -185,3 +185,31 @@ def test_an_error_outranks_everything():
 def test_the_ordinary_states(kw, word, level):
     head, lv = st.summarise(_s(slot=2, **kw))
     assert word in head and lv == level and "P2" in head
+
+
+# --- the default path is what actually runs -------------------------------------------
+def test_the_writer_and_the_reader_agree_on_the_default_path(tmp_path, monkeypatch):
+    """Every other test pins an explicit path. The harness and the overlay use NONE, and must
+    land on the same file."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    w = st.StatusWriter()                                   # no path: what the harness does
+    w.update(force=True, slot=2, armed=True, server_ok=True)
+    assert w.path == st.default_path() == tmp_path / "sokubot.status.json"
+    s = st.read_status()                                    # no path: what the overlay does
+    assert s is not None and (s.slot, s.armed) == (2, True)
+
+
+def test_the_overlay_process_reads_the_harnesss_default_file(tmp_path, monkeypatch):
+    """End to end across a process boundary, with only the environment shared."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))     # restored afterwards, not deleted
+    w = st.StatusWriter()                                    # this process is the live writer
+    w.update(force=True, slot=2, armed=True, gate_open=True, server_ok=True)
+    out = subprocess.run([sys.executable, "-m", "scripts.sokubot_overlay", "--once",
+                          "--game-rect", "13,77,640,480"],
+                         env={**os.environ, "OMP_NUM_THREADS": "1"}, capture_output=True,
+                         text=True, timeout=60, cwd=str(Path(__file__).parent.parent))
+    assert out.returncode == 0, out.stderr
+    assert "PLAYING" in out.stdout and "P2" in out.stdout

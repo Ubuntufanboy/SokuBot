@@ -128,7 +128,8 @@ def stop_stale_wine(prefix: Path) -> None:
     time.sleep(2)
 
 
-def launch_game(game_dir: Path, prefix: Path, display: str) -> subprocess.Popen:
+def launch_game(game_dir: Path, prefix: Path, display: str,
+                mods: bool = False) -> subprocess.Popen:
     env = {**os.environ, "DISPLAY": display, "WINEPREFIX": str(prefix),
            "WINEDEBUG": "-all",
            # Audio deliberately NOT disabled. This used to set
@@ -138,13 +139,27 @@ def launch_game(game_dir: Path, prefix: Path, display: str) -> subprocess.Popen:
            # render black)". Measured again here: the process came up, slept in
            # poll_schedule_timeout on 27 ticks of CPU over two minutes, and
            # never created a window. The operator wants the music on anyway.
-           # d3d9=b bypasses the SWRSToys mod loader (`d3d9.dll` in the game
-           # folder) and runs vanilla. Not optional here: with the loader in
-           # place the game rendered a pure black window on the host Wine, and
-           # it is also what popped "SokuFrameExtractor.dll has been disabled
-           # because the game crashed while loading it". Nothing in this path
-           # needs a mod -- the state comes from memory, not from the DLL.
            "WINEDLLOVERRIDES": "d3d9=b"}
+    # THE MOD LOADER IS OFF BY DEFAULT, and that is why --preset exists as a switch.
+    #
+    # `d3d9=b` makes Wine use its own builtin d3d9 instead of the game folder's
+    # d3d9.dll, which IS SokuModLoader, and the loader is the only thing that ever
+    # reads ModLoaderSettings.json. Measured 2026-09-20 by mapping the running process:
+    #
+    #     d3d9=b        mod DLLs mapped: 0   d3d9 from /usr/lib/wine/.../d3d9.dll
+    #     no override   mod DLLs mapped: 7   d3d9 from Games/Soku/d3d9.dll
+    #                   (ReplayInputView+, SokuLobbiesMod, WindowResizer)
+    #
+    # So with the override, no module preset can have ANY effect -- not `ablation`, and
+    # above all not `netplay`, whose entire point is loading giuroll. `mods=True` drops
+    # the override so the loader runs and the preset means something.
+    #
+    # The override was added because the loader "rendered a pure black window" and popped
+    # a SokuFrameExtractor dialog. The dialog is a module-set problem (turn the extractor
+    # off, which `ablation` and `netplay` both do); the black window was very likely the
+    # forced-software-GL hang described below.
+    if mods:
+        env.pop("WINEDLLOVERRIDES", None)
     # GL MODE, MEASURED TWICE AND THE ANSWER CHANGED.
     #
     # 2026-08-16: the host's Intel Haswell stack emitted "DRI3 error: Could not
@@ -1831,8 +1846,9 @@ def _play(a) -> int:
     with pad:                      # the pad must exist BEFORE the game starts
         if not a.attach:
             print(f"launching {a.game}/th123e.exe on {a.display} ...", flush=True)
-            proc = launch_game(a.game, a.prefix, a.display)
-            a.game_proc = proc
+            mods = a.preset != "none"
+            print(f"mod loader: {'ON (preset ' + a.preset + ')' if mods else 'OFF -- vanilla game, ModLoaderSettings.json is not read'}", flush=True)
+            proc = launch_game(a.game, a.prefix, a.display, mods=mods)
             if not (a.encoder or a.server):
                 # Only the MEMORY path needs the process to exist by now. The vision
                 # paths poll for the game WINDOW themselves (up to 10 minutes), so a
@@ -1890,8 +1906,10 @@ def main() -> int:
                          "The game has focus during a match, so a key that needs the "
                          "terminal is a key you cannot press when you need it.")
     ap.add_argument("--preset", choices=("none", "ablation", "netplay"), default="none",
-                    help="switch the SWRSToys module set first via SokuFrameExtractor's "
-                         "ops/soku_mods.py. Default `none` leaves it exactly as it is.")
+                    help="switch the SWRSToys module set via SokuFrameExtractor's "
+                         "ops/soku_mods.py AND let the mod loader run. `none` (default) "
+                         "launches a VANILLA game with the loader bypassed, so no module "
+                         "(giuroll included) is loaded and the settings file is not read.")
     ap.add_argument("--sfe-root", type=Path,
                     default=Path("~/K0NTR0L-2/SokuFrameExtractor").expanduser())
     ap.add_argument("--no-overlay", action="store_true",

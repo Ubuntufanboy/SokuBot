@@ -50,3 +50,30 @@ def test_the_prefix_and_display_still_reach_the_game(launched_env, monkeypatch):
     env = launched_env()
     assert env["WINEPREFIX"] == "/prefix" and env["DISPLAY"] == ":0"
     assert env["WINEDLLOVERRIDES"] == "d3d9=b"
+
+
+# --- the mod loader --------------------------------------------------------------
+# Measured 2026-09-20 by mapping the running game: with `d3d9=b` ZERO mod DLLs load (d3d9 comes
+# from Wine's builtin); without it the loader runs and giuroll, WindowResizer, etc. are mapped.
+# ModLoaderSettings.json is read only by the loader, so a module preset is a no-op unless the
+# override is dropped.
+def test_vanilla_is_the_default_and_bypasses_the_mod_loader(launched_env, monkeypatch):
+    monkeypatch.delenv("SOKUBOT_GL", raising=False)
+    assert launched_env()["WINEDLLOVERRIDES"] == "d3d9=b"
+
+
+def test_mods_true_lets_the_loader_run_even_if_the_parent_shell_set_the_override(launched_env, monkeypatch):
+    import scripts.play_cheat_match as m
+    seen = {}
+    monkeypatch.setenv("WINEDLLOVERRIDES", "d3d9=b")                 # inherited from a shell
+    monkeypatch.setattr(m.subprocess, "Popen", lambda cmd, **kw: seen.update(kw) or object())
+    m.launch_game(Path("/game"), Path("/prefix"), ":0", mods=True)
+    assert "WINEDLLOVERRIDES" not in seen["env"]
+
+
+def test_a_preset_means_the_loader_runs():
+    """`_play` derives `mods` from the preset; pin the rule at the source."""
+    import inspect
+    import scripts.play_cheat_match as m
+    src = inspect.getsource(m._play)
+    assert 'mods = a.preset != "none"' in src and "mods=mods" in src
