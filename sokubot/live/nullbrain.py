@@ -132,6 +132,10 @@ class NullServer(threading.Thread):
                 self._serve(conn)
             finally:
                 conn.close()
+                # serve_vision does `sess.reset()` in its `finally`: a closed
+                # connection forgets which character the agent is, so a client that
+                # reconnects must calibrate again. Mimic that or reconnect tests lie.
+                self.brain.calibrated = False
         srv.close()
 
     def _serve(self, conn: socket.socket) -> None:

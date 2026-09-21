@@ -530,26 +530,85 @@ class RemoteBrain:
         self.hud_ok = 0
         self.hud_fail = 0
         self.host, self.port, self.size = host, port, size
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(timeout)
-        self.sock.connect((host, port))
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.timeout = timeout
+        # One request in flight at a time. The pilot thread and the console thread
+        # both call the server, and two interleaved request/reply pairs on one
+        # socket read each other's replies.
+        self._lock = threading.Lock()
+        self._backoff, self._next_try = 0.5, 0.0
+        self.sock = self._open()
         self.rtt_ms = 0.0
 
-    def _call(self, op: bytes, payload: bytes = b"") -> bytes:
-        from sokubot.live.wire import HDR, recv_exactly
-        t0 = time.perf_counter()
+    def _open(self):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(self.timeout)
+        s.connect((self.host, self.port))
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return s
+
+    def _reconnect(self) -> None:
+        """Open a fresh connection, at most once per backoff interval. Raises if it cannot.
+
+        The server FORGETS who the agent is when a connection closes
+        (serve_vision resets its session in a `finally`), and a restart may be a
+        different build. So a reconnect clears `identified`, and refuses a server
+        whose cadence or input size changed under us: the pilot's pacing and the
+        frames it ships were set from the old one.
+        """
+        import json
+        now = time.monotonic()
+        if now < self._next_try:
+            raise ConnectionError(f"server down; next reconnect in {self._next_try - now:.1f}s")
         try:
-            self.sock.sendall(HDR.pack(op, len(payload)) + payload)
-            rop, n = HDR.unpack(recv_exactly(self.sock, HDR.size))
-            out = recv_exactly(self.sock, n) if n else b""
-        except OSError as e:            # ConnectionError and socket.timeout are both OSError
-            self.ok, self.last_error = False, f"{type(e).__name__}: {e}"
+            sock = self._open()
+        except OSError as e:
+            self._backoff = min(self._backoff * 2, 4.0)
+            self._next_try = now + self._backoff
+            self.last_error = f"reconnect failed: {type(e).__name__}: {e}"
             raise
-        self.ok, self.last_error = True, ""
-        dt = (time.perf_counter() - t0) * 1000
-        self.rtt_ms = dt if not self.rtt_ms else 0.9 * self.rtt_ms + 0.1 * dt
-        return out
+        old, self.sock = self.sock, sock
+        try:
+            old.close()
+        except OSError:
+            pass
+        self.identified = False
+        spec = getattr(self, "spec", None)
+        if spec is not None:
+            try:
+                got = json.loads(self._exchange(b"I", b"").decode())
+            except (OSError, ValueError) as e:
+                self._next_try = now + 4.0
+                self.last_error = f"reconnected but could not read the server's spec: {e}"
+                raise ConnectionError(self.last_error) from e
+            for k in ("ticks", "history", "size"):
+                if got.get(k) != spec.get(k):
+                    self._next_try = now + 4.0
+                    self.last_error = (f"server changed its {k} ({spec.get(k)} -> "
+                                       f"{got.get(k)}); restart the client")
+                    raise ConnectionError(self.last_error)
+        self._backoff, self._next_try = 0.5, 0.0
+
+    def _exchange(self, op: bytes, payload: bytes) -> bytes:
+        from sokubot.live.wire import HDR, recv_exactly
+        self.sock.sendall(HDR.pack(op, len(payload)) + payload)
+        rop, n = HDR.unpack(recv_exactly(self.sock, HDR.size))
+        return recv_exactly(self.sock, n) if n else b""
+
+    def _call(self, op: bytes, payload: bytes = b"") -> bytes:
+        with self._lock:
+            if not self.ok:
+                self._reconnect()
+            t0 = time.perf_counter()
+            try:
+                out = self._exchange(op, payload)
+            except OSError as e:        # ConnectionError and socket.timeout are both OSError
+                self.ok, self.last_error = False, f"{type(e).__name__}: {e}"
+                raise
+            self.ok, self.last_error = True, ""
+            dt = (time.perf_counter() - t0) * 1000
+            self.rtt_ms = dt if not self.rtt_ms else 0.9 * self.rtt_ms + 0.1 * dt
+            return out
 
     def _shrink(self, pair: np.ndarray) -> bytes:
         from sokubot.live.visionstate import VisionState
@@ -1234,6 +1293,8 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     # (see status.fields_from); the rest keep their honest defaults.
     slot = a.side + 1
     notice = ""
+    next_probe = 0.0
+    lost_server = False
     status = StatusWriter()
     status.update(force=True, **fields_from(pilot, brain, slot))
     status_armed = False
@@ -1426,6 +1487,33 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                       f"  {pilot.stats()}\n"
                       f"  `arm` to resume once the situation is fixed",
                       flush=True)
+            if brain is not None:
+                if armed and (not brain.ok or not brain.identified):
+                    # The server went away, or came back having forgotten who the
+                    # agent is. Either way the agent is not playing, however armed it
+                    # looks -- so say so and stop, rather than sit idle for the ~13 s
+                    # the blind-read watchdog would take.
+                    armed = False
+                    pilot.armed.clear()
+                    pad.neutral()
+                    lost_server = not brain.ok
+                    notice = ("server lost: reconnecting. `whoami`, then re-arm"
+                              if lost_server else
+                              "identity lost (server restarted): `whoami`, then re-arm")
+                    print(f"\n*** AUTO-DISARM: {notice} ***\n", flush=True)
+                if not brain.ok and time.monotonic() >= next_probe:
+                    # A disarmed pilot makes no calls, so nothing else would ever notice
+                    # the server come back. A ping goes through the reconnect path.
+                    next_probe = time.monotonic() + 1.0
+                    try:
+                        brain.ping()
+                    except OSError:
+                        pass
+                if lost_server and brain.ok and not armed:
+                    # Found again. Do not leave "server lost" on screen: it is stale
+                    # and would send the user looking for a problem that is gone.
+                    lost_server = False
+                    notice = "server is back but forgot the agent: `whoami`, then re-arm"
             # A transition (arm, disarm, a watchdog stop) is written at once so the
             # overlay never lags a state change; everything else is rate-limited.
             now_armed = bool(pilot is not None and pilot.armed.is_set())
