@@ -287,7 +287,8 @@ HELP = """commands (write a line to /tmp/sokubot.ctl):
                           is also shown in the status overlay.
   disarm | hands-off      stop playing and neutralise the pad. The game keeps
                           running, so this is safe where a pause is not.
-  toggle                  arm if disarmed, disarm if armed (what the hotkey sends)
+  toggle                  what the hotkey sends: disarm if armed; otherwise arm --
+                          CALIBRATING first (hands off, ~3 s) if identity is unknown
   latency                 per-decision p50/p90/p99 against the period, over
                           decisions that ran the policy
   rec [path] / rec stop   start or stop recording
@@ -1311,9 +1312,60 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     notice = ""
     next_probe = 0.0
     lost_server = False
+    busy = ""
     status = StatusWriter()
     status.update(force=True, **fields_from(pilot, brain, slot))
     status_armed = False
+    status_busy = ""
+    def identity_unknown() -> bool:
+        """The same predicate the `arm` guard applies, for the hotkey to consult."""
+        if brain is not None:
+            return not brain.identified
+        if vision:
+            return (ls.vs.i_am_left is None
+                    and not (ls.vs.n_char and ls.vs.my_char is not None
+                             and not ls.vs.mirror_match))
+        return False
+
+    calib = {"thread": None}
+
+    def calibrating() -> bool:
+        t = calib["thread"]
+        return t is not None and t.is_alive()
+
+    def start_calibration(then_arm: bool) -> None:
+        """Establish identity on a WORKER thread.
+
+        It takes >= 3 s (walk left 1 s, right 2 s). Run inline it would block this
+        loop, the status heartbeat would stop, and at 3 s the overlay would flip to
+        OFFLINE in the middle of it. It also means a hotkey press can do the whole
+        thing -- calibrate, then arm -- with no typing in a terminal, which the game
+        would read as game input.
+        """
+        nonlocal busy, notice
+        if calibrating():
+            return
+        busy, notice = "CALIBRATING - hands off the keyboard", ""
+
+        def work() -> None:
+            nonlocal busy, notice
+            try:
+                if brain is not None:
+                    msg = remote_calibrate(ls, brain, pad)
+                else:
+                    msg = ls.calibrate(pad) if vision else whoami(ls, pad)
+            except Exception as e:                       # noqa: BLE001
+                msg = f"calibration failed: {type(e).__name__}: {e}"
+            print(msg, flush=True)
+            ok = "agent is" in msg
+            notice = "" if ok else f"calibration failed: {msg}"[:120]
+            busy = ""
+            if ok and then_arm:
+                ctl.push("arm")
+
+        calib["thread"] = threading.Thread(target=work, daemon=True)
+        calib["thread"].start()
+
     hk = None
     if not a.no_hotkey:
         hk = KeyWatcher.for_evdev(lambda: ctl.push("toggle"), key=a.hotkey,
@@ -1333,8 +1385,20 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     # From the hotkey. The PILOT is the source of truth: the local
                     # `armed` only catches up with a watchdog stop later in the same
                     # loop iteration, so it can lag it by one pass.
-                    cmd = ("disarm" if pilot is not None and pilot.armed.is_set()
-                           else "arm")
+                    if pilot is not None and pilot.armed.is_set():
+                        cmd = "disarm"
+                    elif calibrating():
+                        print("[hotkey] already calibrating -- hands off", flush=True)
+                        continue
+                    elif pilot is not None and identity_unknown():
+                        # One key does the whole thing. Refusing here, as `arm` does,
+                        # would send the player to a terminal they cannot use mid-game.
+                        print("[hotkey] identity unknown -> calibrating, then arming",
+                              flush=True)
+                        start_calibration(then_arm=True)
+                        continue
+                    else:
+                        cmd = "arm"
                     print(f"[hotkey] {cmd}", flush=True)
                 if cmd == "stop":
                     return 0
@@ -1387,7 +1451,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                         # The server holds every decision until it knows which
                         # character is the agent, so arming now would look armed and
                         # do nothing. Refuse, and say so where the user can see it.
-                        notice = "NOT ARMED: identity unknown (run `whoami` first)"
+                        notice = "NOT ARMED: identity unknown (press the hotkey to calibrate and arm)"
                         print(f"{notice} -- the server answers nothing until it "
                               f"knows which character is the agent", flush=True)
                     else:
@@ -1435,11 +1499,8 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                         # confident answer.
                         print("disarm first -- calibration needs the pad to "
                               "itself", flush=True)
-                    elif brain is not None:
-                        print(remote_calibrate(ls, brain, pad), flush=True)
                     else:
-                        print(ls.calibrate(pad) if vision else whoami(ls, pad),
-                              flush=True)
+                        start_calibration(then_arm=False)
                 elif cmd == "hud":
                     if brain is None:
                         print("hud is a vision-path command (needs --server)",
@@ -1513,9 +1574,10 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     pilot.armed.clear()
                     pad.neutral()
                     lost_server = not brain.ok
-                    notice = ("server lost: reconnecting. `whoami`, then re-arm"
+                    notice = ("server lost: reconnecting. Press the hotkey once it is back"
                               if lost_server else
-                              "identity lost (server restarted): `whoami`, then re-arm")
+                              "identity lost (server restarted): press the hotkey to "
+                              "calibrate and arm")
                     print(f"\n*** AUTO-DISARM: {notice} ***\n", flush=True)
                 if not brain.ok and time.monotonic() >= next_probe:
                     # A disarmed pilot makes no calls, so nothing else would ever notice
@@ -1529,13 +1591,15 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     # Found again. Do not leave "server lost" on screen: it is stale
                     # and would send the user looking for a problem that is gone.
                     lost_server = False
-                    notice = "server is back but forgot the agent: `whoami`, then re-arm"
+                    notice = "server is back but forgot the agent: press the hotkey to calibrate and arm"
             # A transition (arm, disarm, a watchdog stop) is written at once so the
             # overlay never lags a state change; everything else is rate-limited.
             now_armed = bool(pilot is not None and pilot.armed.is_set())
-            status.update(force=now_armed != status_armed,
-                          **fields_from(pilot, brain, slot, notice))
-            status_armed = now_armed
+            now_busy = busy
+            # "Hands off the keyboard" must not lag: force it out like an arm/disarm.
+            status.update(force=now_armed != status_armed or now_busy != status_busy,
+                          **fields_from(pilot, brain, slot, notice, now_busy))
+            status_armed, status_busy = now_armed, now_busy
             if armed:
                 act, seq = pilot.take(last_seq)
                 if seq == last_seq:

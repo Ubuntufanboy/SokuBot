@@ -44,6 +44,9 @@ def loop(monkeypatch, tmp_path):
         def neutral(self): pass
         def set_state(self, s): self.calls += 1
 
+        def press_only(self, name):
+            self.pressed = getattr(self, "pressed", []) + [name]
+
     class Loop:
         def __init__(self):
             self.rc = None

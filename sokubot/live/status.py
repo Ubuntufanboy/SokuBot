@@ -62,6 +62,10 @@ class Status:
     # this configuration (a local run), which is not a failure and must not read as one.
     server_ok: bool | None = None
     last_error: str = ""
+    # Something the agent is doing that the player must know about but that is NOT a fault,
+    # e.g. calibrating (hands off the keyboard). Kept apart from last_error so the overlay
+    # never renders "CALIBRATING" as an ERROR.
+    busy: str = ""
     # Filled by the writer, not by callers.
     schema: int = SCHEMA
     pid: int = 0
@@ -182,6 +186,8 @@ def summarise(s: Status | None) -> tuple[str, str]:
     who = f"P{s.slot}" if s.slot else "?"
     if s.last_error:
         return f"SokuBot: ERROR - {s.last_error}", "warn"
+    if s.busy:
+        return f"SokuBot ({who}): {s.busy}", "warn"
     if s.server_ok is False:
         return "SokuBot: NO SERVER" + (" (still armed)" if s.armed else ""), "warn"
     if not s.armed:
@@ -191,7 +197,7 @@ def summarise(s: Status | None) -> tuple[str, str]:
     return f"SokuBot ({who}): PLAYING", "ok"
 
 
-def fields_from(pilot, brain, slot: int, notice: str = "") -> dict:
+def fields_from(pilot, brain, slot: int, notice: str = "", busy: str = "") -> dict:
     """The status fields that have a REAL source today, read off the live objects.
 
     `notice` is a one-line reason the last command was refused (an arm with no identity,
@@ -207,7 +213,7 @@ def fields_from(pilot, brain, slot: int, notice: str = "") -> dict:
     `pilot.armed.is_set()`, `.stop_reason`, `.lat_ms`, `.late`, `.decides`, `.period`
     and `brain.ok`, `.last_error`.
     """
-    out: dict = {"slot": slot}
+    out: dict = {"slot": slot, "busy": busy}
     armed = bool(pilot is not None and pilot.armed.is_set())
     out["armed"] = armed
 

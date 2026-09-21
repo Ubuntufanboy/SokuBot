@@ -46,13 +46,14 @@ class Drop(Exception):
 class NullBrain:
     def __init__(self, mode: str = "neutral", ticks: int = 5, history: int = 12,
                  latency_ms: float = 0.0, drop_after: int | None = None,
-                 side_answer: str = "RIGHT"):
+                 side_answer: str = "RIGHT", calibration_fails: bool = False):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         self.mode, self.ticks, self.history = mode, ticks, history
         self.latency_ms = latency_ms
         self.drop_after = drop_after
         self.side_answer = side_answer
+        self.calibration_fails = calibration_fails
         self.calibrated = False
         self.decides = 0                # decisions that got an ANSWER
         self.requests = 0               # decide requests, answered or not
@@ -80,6 +81,8 @@ class NullBrain:
             self.calibrated = False
             return b"ok"
         if op == OP_CAL:
+            if self.calibration_fails:
+                return b"no movement detected -- the pad is not reaching the game"
             self.calibrated = True
             return (f"agent is the {self.side_answer} character "
                     f"(null server: nothing was measured)").encode()
