@@ -1346,6 +1346,26 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                              and not ls.vs.mirror_match))
         return False
 
+    def forget_identity() -> None:
+        """Drop the answer to "which character am I?".
+
+        The sides can change between rounds (measured: P1 started on the RIGHT in 2 of 5 rounds),
+        while the tracker only follows the agent frame to frame -- it cannot see the teleport at a
+        round start. So an identity that survived a round boundary is a silent bet on the wrong
+        character. Forgetting it makes the next arm calibrate, and on the server it also drops
+        the frame history, which at that point is full of KO and results frames.
+        """
+        if brain is not None:
+            try:
+                brain.reset()               # server forgets too; sets identified False
+            except OSError:
+                brain.identified = False    # a dead server forgot already; the ok flag handles it
+        elif vision:
+            v = ls.vs
+            v.i_am_left = None
+            for attr in ("last_my_x", "_id_score", "_prev_x"):
+                setattr(v, attr, None)
+
     calib = {"thread": None}
 
     def calibrating() -> bool:
@@ -1377,7 +1397,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                 msg = f"calibration failed: {type(e).__name__}: {e}"
             print(msg, flush=True)
             ok = "agent is" in msg
-            notice = "" if ok else f"calibration failed: {msg}"[:120]
+            notice = "" if ok else f"calibration failed (wait for FIGHT, hands off): {msg}"[:150]
             busy = ""
             if ok and then_arm:
                 ctl.push("arm")
@@ -1638,7 +1658,9 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                 saw_battle = False
                 pilot.armed.clear()
                 pad.neutral()
-                notice = "battle ended: the agent handed back. Press the hotkey to play again"
+                forget_identity()
+                notice = ("round over: the agent handed back and forgot which character it is "
+                          "(sides can change). Press the hotkey when the next round starts")
                 print(f"\n*** HANDED BACK: {notice} ***\n", flush=True)
             now_armed = bool(pilot is not None and pilot.armed.is_set())
             now_busy = busy

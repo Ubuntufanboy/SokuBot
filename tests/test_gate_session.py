@@ -29,6 +29,18 @@ class Brain:
 
     def __init__(self):
         self.decides = 0
+        self.resets = 0
+        self.calibrations = 0
+
+    def reset(self):
+        self.resets += 1
+        self.identified = False
+        return "ok"
+
+    def calibrate(self, before, after):
+        self.calibrations += 1
+        self.identified = True
+        return "agent is the RIGHT character (fake)"
 
     def decide(self, pair):
         self.decides += 1
@@ -40,7 +52,7 @@ class Brain:
 
 
 @pytest.fixture
-def battle(loop):
+def battle(loop, monkeypatch):
     """A vision session whose frames the test switches between menu and battle."""
     class Source:
         dead, still_for, fps, sink, vs = None, 0.0, 60, None, None
@@ -55,6 +67,9 @@ def battle(loop):
             return self._battle if self.in_battle else self._menu
 
     loop.pcm.VisionSource = Source
+    orig = loop.pcm.remote_calibrate
+    monkeypatch.setattr(loop.pcm, "remote_calibrate",
+                        lambda src, b, pad, hold_s=1.0: orig(src, b, pad, hold_s=0.05))
     src = Source()
     loop.src = src
     return loop, src
@@ -96,7 +111,7 @@ def test_a_battle_that_ends_hands_the_agent_back(battle):
     lp.send("arm"); lp.wait(lambda s: s.armed and s.gate_open is True)
     lp.wait(lambda s: s.latency_p50_ms is not None)        # it really is playing
     FakeGate.open = False                                  # the set ended
-    s = lp.wait(lambda s: (not s.armed) and "battle ended" in s.last_error, timeout=5)
+    s = lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
     assert s.gate_open is False
     calls = lp.pad.calls
     time.sleep(0.4)
@@ -113,17 +128,25 @@ def test_armed_before_any_battle_stays_armed_it_is_waiting_not_finished(battle):
     assert s.armed is True and s.last_error == ""
 
 
-def test_a_second_arm_after_a_hand_back_plays_the_next_battle(battle):
+def test_after_a_hand_back_the_agent_must_re_identify_before_it_plays_again(battle):
     lp, src = battle
     FakeGate.open = True
     start(lp, src)
     lp.send("arm"); lp.wait(lambda s: s.armed and s.latency_p50_ms is not None)
     FakeGate.open = False
-    lp.wait(lambda s: (not s.armed) and "battle ended" in s.last_error, timeout=5)
-    FakeGate.open = True                                   # the next set starts
+    lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
+    FakeGate.open = True                                   # the next round starts
+    lp.send("arm")                                         # arming with the OLD identity...
+    s = lp.wait(lambda s: "identity unknown" in s.last_error)
+    assert s.armed is False                                # ...is refused
+    lp.send("whoami")
+    end = time.time() + 5
+    while not src.brain.identified and time.time() < end:    # the OUTCOME, not a status that reads
+        time.sleep(0.02)                                     # busy=="" before it has even begun
+    assert src.brain.identified
+    lp.wait(lambda s: s.busy == "")
     lp.send("arm")
-    s = lp.wait(lambda s: s.armed and s.gate_open is True and s.last_error == "", timeout=5)
-    assert s.armed
+    assert lp.wait(lambda s: s.armed and s.gate_open is True and s.last_error == "", timeout=5).armed
 
 
 def test_a_run_with_no_frames_has_no_gate_and_claims_nothing(loop):
@@ -164,5 +187,69 @@ def test_the_real_gate_sees_a_battle_frame_and_a_menu_frame_through_the_session(
     s = lp.wait(lambda s: s.gate_open is True and s.latency_p50_ms is not None, timeout=6)
     assert lp.pad.calls > 0
     src.in_battle = False                                            # back to a menu
-    s = lp.wait(lambda s: (not s.armed) and "battle ended" in s.last_error, timeout=8)
+    s = lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=8)
     assert s.gate_open is False
+
+
+# --- identity does not survive a round boundary -----------------------------------------
+# Measured: P1 started on the RIGHT in 2 of 5 rounds, and the tracker cannot see the teleport at a
+# round start. An identity that outlives the round is a silent bet on the wrong character.
+class FakeWatcher:
+    instances = []
+
+    def __init__(self, on_press, key, exclude):
+        self.on_press = on_press
+        FakeWatcher.instances.append(self)
+
+    @classmethod
+    def for_evdev(cls, on_press, key="KEY_F12", exclude=None):
+        return cls(on_press, key, exclude)
+
+    def start(self): pass
+    def stop(self): pass
+
+
+def test_a_hand_back_makes_the_agent_and_the_server_forget_who_it_is(battle):
+    lp, src = battle
+    FakeGate.open = True
+    start(lp, src)
+    lp.send("arm"); lp.wait(lambda s: s.armed and s.latency_p50_ms is not None)
+    assert src.brain.identified is True and src.brain.resets == 0
+    FakeGate.open = False
+    lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
+    assert src.brain.identified is False
+    assert src.brain.resets == 1                           # the SERVER's history and identity too
+
+
+def test_the_next_hotkey_press_recalibrates_instead_of_arming_on_the_old_answer(battle):
+    lp, src = battle
+    FakeWatcher.instances.clear()
+    lp.pcm.KeyWatcher = FakeWatcher
+    lp.no_hotkey = False
+    FakeGate.open = True
+    start(lp, src)
+    press = FakeWatcher.instances[0].on_press
+    lp.send("arm"); lp.wait(lambda s: s.armed and s.latency_p50_ms is not None)
+    calibrations_before = src.brain.calibrations
+    FakeGate.open = False
+    lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
+    FakeGate.open = True
+    press()                                                # one press
+    lp.wait(lambda s: "CALIBRATING" in s.busy or s.armed)
+    s = lp.wait(lambda s: s.armed and s.busy == "", timeout=8)
+    assert src.brain.calibrations == calibrations_before + 1   # it re-identified first
+
+
+def test_a_local_run_forgets_identity_too(battle):
+    import types
+    lp, src = battle
+    src.brain = None                                       # a LOCAL vision run: no server
+    src.vs = types.SimpleNamespace(i_am_left=False, n_char=0, my_char=None, mirror_match=False,
+                                   last_my_x=1.0, _id_score=2.0, _prev_x=3.0)
+    FakeGate.open = True
+    start(lp, src)
+    lp.send("arm"); lp.wait(lambda s: s.armed and s.latency_p50_ms is not None)
+    FakeGate.open = False
+    lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
+    assert src.vs.i_am_left is None
+    assert (src.vs.last_my_x, src.vs._id_score, src.vs._prev_x) == (None, None, None)
