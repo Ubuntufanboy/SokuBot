@@ -920,6 +920,19 @@ class VisionSource:
             if self.sink is not None:
                 self.sink.offer(fr)
 
+    def latest(self):
+        """The newest frame alone, or None until the ring is full. NO copy.
+
+        The battle gate reads a 189 px health bar. Going through `_pair` concatenated two 480x480
+        frames (1.4 MB) on every poll, which measured 6.5 ms median (5.8% of a core) at 10 Hz on the
+        real game, nearly all of it that copy. Frames in the ring are never mutated, so handing out
+        the reference is safe.
+        """
+        with self._lock:
+            if len(self.ring) < self.ring.maxlen:
+                return None
+            return self.ring[-1]
+
     def _pair(self):
         """The current frame stacked on the one `delta/60` s before it."""
         with self._lock:
@@ -1332,6 +1345,13 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     gate_open = None if gate is None else False
     next_gate = 0.0
     saw_battle = False          # a battle has been open since the last arm
+    # Opt-in: record what the gate actually sees, at its own 10 Hz, with what each poll costs. This
+    # exists to CALIBRATE the gate against the real game (bar readings around KOs, the 2 s close, the
+    # polling cost on a latency-bound machine), which nothing else can measure.
+    gate_log = None
+    if gate is not None and os.environ.get("SOKUBOT_GATE_LOG"):
+        gate_log = open(os.environ["SOKUBOT_GATE_LOG"], "w", buffering=1)
+        gate_log.write("t,bar1,bar2,in_battle,armed,poll_ms\n")
     status = StatusWriter()
     status.update(force=True, **fields_from(pilot, brain, slot))
     status_armed = False
@@ -1636,15 +1656,20 @@ def session(ls, pad: VirtualKeypad, a) -> int:
             # overlay never lags a state change; everything else is rate-limited.
             if gate is not None and time.monotonic() >= next_gate:
                 next_gate = time.monotonic() + GATE_PERIOD_S
-                pair = ls._pair()
-                if pair is not None:
+                t_poll = time.perf_counter()
+                frame = ls.latest()
+                if frame is not None:
                     try:
-                        # The newer frame of the pair, in capture orientation: exactly what
-                        # RemoteBrain.read_hud feeds the HUD reader.
-                        gate.update(np.ascontiguousarray(pair[:, :, 3:]))
+                        # The newest frame in capture orientation: what RemoteBrain.read_hud feeds
+                        # the HUD reader (there, the second half of the pair).
+                        gate.update(frame)
                     except (ValueError, IndexError):
                         pass
                 gate_open = bool(gate.in_battle)
+                if gate_log is not None:
+                    b1, b2 = getattr(gate, "last", (float("nan"), float("nan")))
+                    gate_log.write(f"{time.time():.3f},{b1:.3f},{b2:.3f},{int(gate_open)},"
+                                   f"{int(armed)},{(time.perf_counter() - t_poll) * 1000:.2f}\n")
             battle_ok = gate_open is not False          # None (no gate) counts as open
             if pilot is not None:
                 (pilot.hold.clear if battle_ok else pilot.hold.set)()
@@ -1703,6 +1728,8 @@ def session(ls, pad: VirtualKeypad, a) -> int:
             rec.__exit__()
         if hk is not None:
             hk.stop()
+        if gate_log is not None:
+            gate_log.close()
         status.close()
         ctl.stop.set()
 

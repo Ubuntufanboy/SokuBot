@@ -66,6 +66,9 @@ def battle(loop, monkeypatch):
         def _pair(self):
             return self._battle if self.in_battle else self._menu
 
+        def latest(self):
+            return self._pair()[:, :, 3:]
+
     loop.pcm.VisionSource = Source
     orig = loop.pcm.remote_calibrate
     monkeypatch.setattr(loop.pcm, "remote_calibrate",
@@ -253,3 +256,46 @@ def test_a_local_run_forgets_identity_too(battle):
     lp.wait(lambda s: (not s.armed) and "round over" in s.last_error, timeout=5)
     assert src.vs.i_am_left is None
     assert (src.vs.last_my_x, src.vs._id_score, src.vs._prev_x) == (None, None, None)
+
+
+# --- the calibration log -----------------------------------------------------------------
+def test_the_gate_log_is_opt_in_and_records_bars_state_and_poll_cost(battle, monkeypatch, tmp_path):
+    lp, src = battle
+    log = tmp_path / "gate.csv"
+    monkeypatch.setenv("SOKUBOT_GATE_LOG", str(log))
+    FakeGate.open = True
+    start(lp, src)
+    lp.send("arm"); lp.wait(lambda s: s.armed)
+    time.sleep(0.5)
+    lp.stop()
+    lines = log.read_text().splitlines()
+    assert lines[0] == "t,bar1,bar2,in_battle,armed,poll_ms"
+    rows = [l.split(",") for l in lines[1:]]
+    assert len(rows) >= 3                                   # ~10 Hz
+    assert all(len(r) == 6 for r in rows)
+    assert any(r[3] == "1" and r[4] == "1" for r in rows)   # in a battle AND armed appears
+    assert all(float(r[5]) >= 0 for r in rows)              # the poll cost is recorded
+
+
+def test_without_the_variable_nothing_is_written(battle, tmp_path):
+    lp, src = battle
+    start(lp, src)
+    lp.stop()
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+# --- VisionSource.latest ---------------------------------------------------------------
+def test_latest_is_none_until_the_ring_is_full_and_then_hands_out_the_same_frame_uncopied():
+    import threading
+    from collections import deque
+    from scripts.play_cheat_match import VisionSource
+    v = VisionSource.__new__(VisionSource)               # no ffmpeg: only the ring and its lock
+    v.ring, v._lock = deque(maxlen=3), threading.Lock()
+    assert v.latest() is None
+    a, b, c = (np.full((4, 4, 3), i, np.uint8) for i in (1, 2, 3))
+    for f in (a, b):
+        v.ring.append(f)
+    assert v.latest() is None                            # still filling
+    v.ring.append(c)
+    assert v.latest() is c                               # the frame ITSELF: nothing was copied
+    assert v._pair().shape == (4, 4, 6)                  # and the pair path still works

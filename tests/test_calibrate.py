@@ -51,6 +51,9 @@ def rig(loop, monkeypatch):
         def _pair(self):
             return PAIR
 
+        def latest(self):
+            return PAIR[:, :, 3:]
+
     def build(hold_s=0.05, **server_kw):
         srv = NullServer(NullBrain(**server_kw)); srv.start(); assert srv.ready.wait(5)
         made.append(srv)

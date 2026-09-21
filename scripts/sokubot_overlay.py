@@ -50,7 +50,12 @@ def game_rect(display: str, override: Rect | None) -> Rect | None:
         from sokubot.live.capture import CaptureError, find_game_window
         g = find_game_window(display).refreshed()
         return Rect(g.x, g.y, g.w, g.h)
-    except Exception:                                   # noqa: BLE001 -- no window yet
+    except Exception as e:                              # noqa: BLE001
+        # "No window yet" is normal and quiet; anything else (a missing xdotool, an X error) is
+        # not, and silence here is what made a placement bug hard to see.
+        if "no window matching" not in str(e) and not getattr(game_rect, "_warned", False):
+            game_rect._warned = True
+            print(f"overlay: cannot look up the game window: {type(e).__name__}: {e}", file=sys.stderr)
         return None
 
 
@@ -105,6 +110,12 @@ def main() -> int:
                 state["warned"] = True
         else:
             root.geometry(f"{BAR[0]}x{BAR[1]}+{pos[0]}+{pos[1]}")
+            # REQUIRED: without an idle pass a MOVE of an already-mapped window is silently
+            # ignored (Tk defers it, and the label is reconfigured every 250 ms). Found on the real
+            # game: an overlay started before the game window stayed in the screen corner for the
+            # whole session, geometry() having "succeeded". It only worked when the position was
+            # set before the first map, which is all the earlier test exercised.
+            root.update_idletasks()
             if state["hidden"]:
                 root.deiconify()
                 state["hidden"] = False
@@ -124,7 +135,7 @@ def main() -> int:
         if t_end and time.time() > t_end:
             root.destroy()
             return
-        root.after(250, tick)
+        root.after(100, tick)
 
     place()
     tick()

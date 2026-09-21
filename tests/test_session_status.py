@@ -217,6 +217,9 @@ def remote_ls(loop):
 
         def _pair(self):
             return np.zeros((4, 4, 6), np.uint8)
+
+        def latest(self):
+            return np.zeros((4, 4, 3), np.uint8)
     loop.pcm.VisionSource = FakeSource
     return FakeSource()
 

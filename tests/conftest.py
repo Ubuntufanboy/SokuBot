@@ -29,6 +29,11 @@ class FakeGate:
 @pytest.fixture
 def loop(monkeypatch, tmp_path):
     import scripts.play_cheat_match as pcm
+    # Tests assign fakes straight onto the module (`lp.pcm.VisionSource = Fake`, `.KeyWatcher = ...`).
+    # Left alone those leak into every later test in the process -- it only showed once a test used
+    # the REAL VisionSource -- so put back whatever they might have replaced.
+    restore = {n: getattr(pcm, n) for n in ("VisionSource", "KeyWatcher", "BattleGate", "StatusWriter",
+                                            "remote_calibrate", "load_agent", "decide", "CTL")}
     FakeGate.open = True
     monkeypatch.setattr(pcm, "BattleGate", FakeGate)
     ctl = tmp_path / "ctl"
@@ -117,6 +122,8 @@ def loop(monkeypatch, tmp_path):
     lp.pcm = pcm
     lp.gate = FakeGate
     yield lp
-    if lp.t.is_alive():
+    if getattr(lp, "t", None) is not None and lp.t.is_alive():
         lp.stop()
+    for name, value in restore.items():
+        setattr(pcm, name, value)
 

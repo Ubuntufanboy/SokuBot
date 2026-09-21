@@ -127,6 +127,9 @@ def chain(loop, server):
 
         def _pair(self):
             return PAIR
+
+        def latest(self):
+            return PAIR[:, :, 3:]
     loop.pcm.VisionSource = FakeSource
     srv = server(drop_after=3)
     brain = client(srv)
