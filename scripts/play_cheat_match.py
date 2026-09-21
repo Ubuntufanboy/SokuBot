@@ -58,6 +58,7 @@ import torch
 
 from sokubot.data.state import CH, FULL_HP, STAGE_SPAN
 from sokubot.live.capture import find_game_window
+from sokubot.live.gate import BattleGate
 from sokubot.live.hotkey import DEFAULT_KEY, KeyWatcher
 from sokubot.live.latency import format_summary, summarise
 from sokubot.live.memstate import Frame, LiveState, find_game_pid
@@ -1026,6 +1027,10 @@ class Pilot(threading.Thread):
         self.side, self.H, self.ticks = side, H, ticks
         self.period = ticks / 60.0
         self.armed = threading.Event()
+        # Set while no battle is on screen: armed, but not deciding. Deciding on menu
+        # frames would fill the server's history with them, so the first second of the
+        # next battle would be read through a window of results-screen frames.
+        self.hold = threading.Event()
         self.stopped = threading.Event()
         self.cv = threading.Condition()
         self.chunk = None
@@ -1089,7 +1094,7 @@ class Pilot(threading.Thread):
         hist = deque(maxlen=max(self.H, 1))
         nxt = time.monotonic()
         while not self.stopped.is_set():
-            if not self.armed.is_set():
+            if not self.armed.is_set() or self.hold.is_set():
                 hist.clear()
                 self._publish(None)
                 time.sleep(0.05)
@@ -1241,6 +1246,14 @@ class Pilot(threading.Thread):
         return format_summary(summarise(self.lat_ms, 1000 * self.period))
 
 
+# The battle gate is polled from frames the capture already has (a few hundred microseconds of
+# numpy on two fixed slices). 10 Hz with 20 "closed" samples to close is 2 s: longer than a KO
+# flash or a super's screen wash (~0.33 s) so it does not drop the agent mid-round, and short
+# enough that a finished set hands back before the agent has wandered through a results screen.
+GATE_PERIOD_S = 0.1
+GATE_OFF_FRAMES = 20
+
+
 def _pad_path(pad):
     """The pad's evdev path, or None. Excluded from the hotkey so the agent's own
     device can never toggle it."""
@@ -1313,6 +1326,12 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     next_probe = 0.0
     lost_server = False
     busy = ""
+    # Is a battle on screen? Only a vision run has frames to ask; otherwise there is no
+    # gate and nothing is claimed either way (gate_open None).
+    gate = BattleGate(off_frames=GATE_OFF_FRAMES) if vision else None
+    gate_open = None if gate is None else False
+    next_gate = 0.0
+    saw_battle = False          # a battle has been open since the last arm
     status = StatusWriter()
     status.update(force=True, **fields_from(pilot, brain, slot))
     status_armed = False
@@ -1457,6 +1476,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     else:
                         armed = True
                         notice = ""
+                        saw_battle = False
                         pilot.armed.set()
                         print("ARMED -- the agent is now playing", flush=True)
                 elif cmd in ("disarm", "hands-off"):
@@ -1594,13 +1614,44 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     notice = "server is back but forgot the agent: press the hotkey to calibrate and arm"
             # A transition (arm, disarm, a watchdog stop) is written at once so the
             # overlay never lags a state change; everything else is rate-limited.
+            if gate is not None and time.monotonic() >= next_gate:
+                next_gate = time.monotonic() + GATE_PERIOD_S
+                pair = ls._pair()
+                if pair is not None:
+                    try:
+                        # The newer frame of the pair, in capture orientation: exactly what
+                        # RemoteBrain.read_hud feeds the HUD reader.
+                        gate.update(np.ascontiguousarray(pair[:, :, 3:]))
+                    except (ValueError, IndexError):
+                        pass
+                gate_open = bool(gate.in_battle)
+            battle_ok = gate_open is not False          # None (no gate) counts as open
+            if pilot is not None:
+                (pilot.hold.clear if battle_ok else pilot.hold.set)()
+            if armed and battle_ok and gate is not None:
+                saw_battle = True
+            elif armed and gate is not None and saw_battle and not battle_ok:
+                # A battle that WAS on screen is gone: the set ended (or the game left the
+                # battle). Hand back rather than keep pressing through a results screen. If
+                # no battle had opened yet since arming, stay armed: that is "waiting".
+                armed = False
+                saw_battle = False
+                pilot.armed.clear()
+                pad.neutral()
+                notice = "battle ended: the agent handed back. Press the hotkey to play again"
+                print(f"\n*** HANDED BACK: {notice} ***\n", flush=True)
             now_armed = bool(pilot is not None and pilot.armed.is_set())
             now_busy = busy
             # "Hands off the keyboard" must not lag: force it out like an arm/disarm.
             status.update(force=now_armed != status_armed or now_busy != status_busy,
-                          **fields_from(pilot, brain, slot, notice, now_busy))
+                          **fields_from(pilot, brain, slot, notice, now_busy, gate_open))
             status_armed, status_busy = now_armed, now_busy
-            if armed:
+            if armed and not battle_ok:
+                # Armed but no battle on screen: press nothing. The gate is a second,
+                # independent condition (gate.py): armed AND in a battle.
+                pad.neutral()
+                time.sleep(period)
+            elif armed:
                 act, seq = pilot.take(last_seq)
                 if seq == last_seq:
                     time.sleep(period)      # the decider is late; hold

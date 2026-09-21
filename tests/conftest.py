@@ -13,9 +13,24 @@ import pytest
 from sokubot.live import status as st
 
 
+class FakeGate:
+    """A BattleGate whose answer the TEST controls (`FakeGate.open`). A vision session builds a
+    real BattleGate, which would read the tests' blank frames as "no battle" and hold the pilot."""
+    open = True
+
+    def __init__(self, *a, **k):
+        self.in_battle = FakeGate.open
+
+    def update(self, frame):
+        self.in_battle = FakeGate.open
+        return self.in_battle
+
+
 @pytest.fixture
 def loop(monkeypatch, tmp_path):
     import scripts.play_cheat_match as pcm
+    FakeGate.open = True
+    monkeypatch.setattr(pcm, "BattleGate", FakeGate)
     ctl = tmp_path / "ctl"
     monkeypatch.setattr(pcm, "CTL", ctl)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
@@ -100,6 +115,7 @@ def loop(monkeypatch, tmp_path):
 
     lp = Loop()
     lp.pcm = pcm
+    lp.gate = FakeGate
     yield lp
     if lp.t.is_alive():
         lp.stop()

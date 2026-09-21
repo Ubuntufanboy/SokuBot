@@ -53,7 +53,9 @@ class Status:
     scene: str = "unknown"          # title | menu | select | battle | unknown
     slot: int | None = None         # player number the agent plays, 1 or 2
     armed: bool = False             # the agent is allowed to press buttons
-    gate_open: bool = False         # a battle is actually on screen
+    # True/False = a battle is / is not on screen. None = there is no gate in this
+    # configuration, which must not read as "waiting for a battle".
+    gate_open: bool | None = None
     rounds: list[int] = field(default_factory=lambda: [0, 0])   # [agent, foe]
     latency_p50_ms: float | None = None
     latency_p99_ms: float | None = None
@@ -192,13 +194,17 @@ def summarise(s: Status | None) -> tuple[str, str]:
         return "SokuBot: NO SERVER" + (" (still armed)" if s.armed else ""), "warn"
     if not s.armed:
         return f"SokuBot ({who}): OFF - hotkey to hand over", "idle"
-    if not s.gate_open:
+    if s.gate_open is False:
         return f"SokuBot ({who}): ARMED, waiting for a battle", "idle"
     return f"SokuBot ({who}): PLAYING", "ok"
 
 
-def fields_from(pilot, brain, slot: int, notice: str = "", busy: str = "") -> dict:
+def fields_from(pilot, brain, slot: int, notice: str = "", busy: str = "",
+                gate_open: bool | None = None) -> dict:
     """The status fields that have a REAL source today, read off the live objects.
+
+    `gate_open` is whether a battle is on screen, or None when there is no gate (then the
+    field is not written at all).
 
     `notice` is a one-line reason the last command was refused (an arm with no identity,
     say). It is shown only while disarmed, and only when there is no worse error.
@@ -214,6 +220,8 @@ def fields_from(pilot, brain, slot: int, notice: str = "", busy: str = "") -> di
     and `brain.ok`, `.last_error`.
     """
     out: dict = {"slot": slot, "busy": busy}
+    if gate_open is not None:               # no gate, no claim
+        out["gate_open"] = gate_open
     armed = bool(pilot is not None and pilot.armed.is_set())
     out["armed"] = armed
 

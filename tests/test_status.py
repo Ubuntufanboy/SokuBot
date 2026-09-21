@@ -179,7 +179,8 @@ def test_an_error_outranks_everything():
 
 @pytest.mark.parametrize("kw, word, level", [
     (dict(server_ok=True), "OFF", "idle"),
-    (dict(server_ok=True, armed=True), "waiting for a battle", "idle"),
+    (dict(server_ok=True, armed=True, gate_open=False), "waiting for a battle", "idle"),
+    (dict(server_ok=True, armed=True), "PLAYING", "ok"),        # no gate: no claim of waiting
     (dict(server_ok=True, armed=True, gate_open=True), "PLAYING", "ok"),
 ])
 def test_the_ordinary_states(kw, word, level):
