@@ -60,6 +60,7 @@ from sokubot.live.capture import find_game_window
 from sokubot.live.latency import format_summary, summarise
 from sokubot.live.memstate import Frame, LiveState, find_game_pid
 from sokubot.live.pad import BUTTONS, VirtualKeypad
+from sokubot.live.status import StatusWriter, fields_from
 from sokubot.rl.policy import SokuPolicy
 from sokubot.rl.state_arena import StateObs
 # Reused rather than reimplemented: the recorder finalises the mp4 properly on
@@ -508,6 +509,11 @@ class RemoteBrain:
     def __init__(self, host: str, port: int, size: int, timeout: float = 2.0,
                  my_player: int = 1):
         import socket
+        # Is the server answering? The last call decides. `last_error` is what the
+        # status channel shows, because "NO SERVER" alone does not say whether the
+        # process died, the network dropped or it merely stopped replying.
+        self.ok = True
+        self.last_error = ""
         # WHICH HEALTH BAR IS MINE.
         #
         # 0 = the agent holds player 1, whose bar is top-left. This is the one
@@ -528,9 +534,14 @@ class RemoteBrain:
     def _call(self, op: bytes, payload: bytes = b"") -> bytes:
         from sokubot.live.wire import HDR, recv_exactly
         t0 = time.perf_counter()
-        self.sock.sendall(HDR.pack(op, len(payload)) + payload)
-        rop, n = HDR.unpack(recv_exactly(self.sock, HDR.size))
-        out = recv_exactly(self.sock, n) if n else b""
+        try:
+            self.sock.sendall(HDR.pack(op, len(payload)) + payload)
+            rop, n = HDR.unpack(recv_exactly(self.sock, HDR.size))
+            out = recv_exactly(self.sock, n) if n else b""
+        except OSError as e:            # ConnectionError and socket.timeout are both OSError
+            self.ok, self.last_error = False, f"{type(e).__name__}: {e}"
+            raise
+        self.ok, self.last_error = True, ""
         dt = (time.perf_counter() - t0) * 1000
         self.rtt_ms = dt if not self.rtt_ms else 0.9 * self.rtt_ms + 0.1 * dt
         return out
@@ -1201,6 +1212,12 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     print(HELP, flush=True)
     print(f"control FIFO: {CTL}\n", flush=True)
     rec = None
+    # One-way status for the overlay. Only fields with a real source are written
+    # (see status.fields_from); the rest keep their honest defaults.
+    slot = a.side + 1
+    status = StatusWriter()
+    status.update(force=True, **fields_from(pilot, brain, slot))
+    status_armed = False
     try:
         while True:
             for line in ctl.take():
@@ -1362,6 +1379,12 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                       f"  {pilot.stats()}\n"
                       f"  `arm` to resume once the situation is fixed",
                       flush=True)
+            # A transition (arm, disarm, a watchdog stop) is written at once so the
+            # overlay never lags a state change; everything else is rate-limited.
+            now_armed = bool(pilot is not None and pilot.armed.is_set())
+            status.update(force=now_armed != status_armed,
+                          **fields_from(pilot, brain, slot))
+            status_armed = now_armed
             if armed:
                 act, seq = pilot.take(last_seq)
                 if seq == last_seq:
@@ -1390,6 +1413,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
         pad.neutral()
         if rec:
             rec.__exit__()
+        status.close()
         ctl.stop.set()
 
 

@@ -58,7 +58,9 @@ class Status:
     latency_p50_ms: float | None = None
     latency_p99_ms: float | None = None
     missed_slot_pct: float | None = None
-    server_ok: bool = False
+    # True/False = there IS a server and it is/is not answering. None = no server in
+    # this configuration (a local run), which is not a failure and must not read as one.
+    server_ok: bool | None = None
     last_error: str = ""
     # Filled by the writer, not by callers.
     schema: int = SCHEMA
@@ -180,10 +182,50 @@ def summarise(s: Status | None) -> tuple[str, str]:
     who = f"P{s.slot}" if s.slot else "?"
     if s.last_error:
         return f"SokuBot: ERROR - {s.last_error}", "warn"
-    if not s.server_ok:
+    if s.server_ok is False:
         return "SokuBot: NO SERVER" + (" (still armed)" if s.armed else ""), "warn"
     if not s.armed:
         return f"SokuBot ({who}): OFF - hotkey to hand over", "idle"
     if not s.gate_open:
         return f"SokuBot ({who}): ARMED, waiting for a battle", "idle"
     return f"SokuBot ({who}): PLAYING", "ok"
+
+
+def fields_from(pilot, brain, slot: int) -> dict:
+    """The status fields that have a REAL source today, read off the live objects.
+
+    `pilot` and `brain` may be None (no policy loaded / no server). Fields with no
+    source yet -- scene, rounds, gate_open -- are deliberately not returned, so they
+    keep their defaults instead of a guess: a field that is always None is honest,
+    and one rendered from a stale default is exactly what the reader was built to
+    prevent.
+
+    Pure and duck-typed so it is testable without a game: it touches only
+    `pilot.armed.is_set()`, `.stop_reason`, `.lat_ms`, `.late`, `.decides`, `.period`
+    and `brain.ok`, `.last_error`.
+    """
+    out: dict = {"slot": slot}
+    armed = bool(pilot is not None and pilot.armed.is_set())
+    out["armed"] = armed
+
+    error = ""
+    if brain is not None:
+        out["server_ok"] = bool(brain.ok)
+        if not brain.ok:
+            error = f"server: {brain.last_error}" if brain.last_error else "server not answering"
+    if not error and pilot is not None and not armed and pilot.stop_reason:
+        # A watchdog stop is worth showing until the user re-arms, and NOT after:
+        # `stop_reason` is never cleared, so an armed agent would otherwise sit next
+        # to an old error.
+        error = str(pilot.stop_reason)
+    out["last_error"] = error
+
+    if pilot is not None:
+        from sokubot.live.latency import summarise
+        # deque.copy() is one C call, so it cannot be mutated under us by the
+        # decision thread the way iterating it can.
+        s = summarise(list(pilot.lat_ms.copy())[-600:], 1000.0 * pilot.period)
+        out["latency_p50_ms"], out["latency_p99_ms"] = s["p50"], s["p99"]
+        out["missed_slot_pct"] = (100.0 * pilot.late / pilot.decides
+                                  if pilot.decides else None)
+    return out
