@@ -57,18 +57,8 @@ import torch
 
 from sokubot.data.state import CH, STAGE_SPAN
 
-HDR = struct.Struct("!cI")          # opcode, payload length
-OP_DECIDE, OP_CAL, OP_RESET, OP_PING, OP_INFO = b"D", b"C", b"R", b"P", b"I"
-
-
-def recv_exactly(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError(f"peer closed after {len(buf)} of {n} bytes")
-        buf += chunk
-    return bytes(buf)
+from sokubot.live.wire import (HDR, OP_CAL, OP_DECIDE, OP_INFO,   # noqa: F401
+                               OP_PING, OP_RESET, recv_exactly)
 
 
 class Session:

@@ -526,7 +526,7 @@ class RemoteBrain:
         self.rtt_ms = 0.0
 
     def _call(self, op: bytes, payload: bytes = b"") -> bytes:
-        from scripts.serve_vision import HDR, recv_exactly
+        from sokubot.live.wire import HDR, recv_exactly
         t0 = time.perf_counter()
         self.sock.sendall(HDR.pack(op, len(payload)) + payload)
         rop, n = HDR.unpack(recv_exactly(self.sock, HDR.size))
