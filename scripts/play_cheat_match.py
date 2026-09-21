@@ -47,6 +47,7 @@ import argparse
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -1751,6 +1752,131 @@ def resolve_side_arg(a) -> int:
     return 0
 
 
+def preflight_server(a) -> int:
+    """Can we reach the vision server? Checked BEFORE the game is launched.
+
+    The client used to launch the game and only then connect, so a server that was not
+    running produced a traceback with a game window left open behind it.
+    """
+    try:
+        b = RemoteBrain(a.server, a.port, size=224, my_player=a.side)
+        b.info()
+        b.close()
+    except OSError as e:
+        print(f"NOT STARTING: no vision server at {a.server}:{a.port} "
+              f"({type(e).__name__}: {e}).\n  Start one: `python -m scripts.serve_null` "
+              f"(no model, for testing the harness) or `scripts.serve_vision`.",
+              flush=True)
+        return 3
+    return 0
+
+
+def preset_command(name: str, sfe_root: Path):
+    """The command that switches the SWRSToys module set, or None for `none`."""
+    if name == "none":
+        return None
+    return [sys.executable, str(Path(sfe_root).expanduser() / "ops" / "soku_mods.py"), name]
+
+
+def apply_preset(a) -> int:
+    """Apply --preset, or leave the user's module set exactly as it is (the default)."""
+    cmd = preset_command(a.preset, a.sfe_root)
+    if cmd is None:
+        return 0
+    if not Path(cmd[1]).is_file():
+        print(f"NOT STARTING: --preset {a.preset} needs {cmd[1]} (set --sfe-root).", flush=True)
+        return 2
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        print(f"NOT STARTING: module preset failed:\n{r.stdout}{r.stderr}", flush=True)
+        return 2
+    print(f"module preset {a.preset!r} applied", flush=True)
+    return 0
+
+
+def start_overlay(a):
+    """The status strip, as a separate process so it cannot slow or stop the pad."""
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", "scripts.sokubot_overlay", "--display", a.display],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"overlay not started: {e}", flush=True)
+        return None
+
+
+def stop_overlay(proc) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def close_game(a) -> None:
+    """Close the game we launched (opt-in: a crash of THIS process should not, by
+    default, take a match the human is playing down with it)."""
+    stop_stale_wine(a.prefix)
+
+
+def _play(a) -> int:
+    """Everything after argument parsing: stop stale wine, create the pad, launch, run."""
+    proc = None
+    if not a.attach:
+        stop_stale_wine(a.prefix)
+    pad = VirtualKeypad()
+    with pad:                      # the pad must exist BEFORE the game starts
+        if not a.attach:
+            print(f"launching {a.game}/th123e.exe on {a.display} ...", flush=True)
+            proc = launch_game(a.game, a.prefix, a.display)
+            a.game_proc = proc
+            if not (a.encoder or a.server):
+                # Only the MEMORY path needs the process to exist by now. The vision
+                # paths poll for the game WINDOW themselves (up to 10 minutes), so a
+                # blind sleep here just delayed every start by 12 s and still was not
+                # a guarantee.
+                time.sleep(12)
+            # Audio is left alone on purpose. Muting it broke the game once
+            # (disabling the Wine driver made Soku fail DirectSound init and
+            # render black) and the operator prefers the music on anyway.
+        if a.encoder or a.server:
+            return vision_session(pad, a)
+
+        # With --attach the operator launches the game themselves, which they
+        # may well do AFTER this starts -- and that ordering is the correct one,
+        # because Wine's dinput enumerates input devices once at init and the
+        # pad has to exist first. So wait rather than fail.
+        pid = find_game_pid()
+        if pid is None and a.attach:
+            print("pad is up. START THE GAME NOW -- waiting for it ...",
+                  flush=True)
+            for _ in range(600):
+                pid = find_game_pid()
+                if pid is not None:
+                    break
+                time.sleep(1)
+        if pid is None:
+            print("game process not found")
+            return 4
+        try:
+            ls = LiveState.attach(pid)
+        except PermissionError:
+            print(f"cannot read /proc/{pid}/mem. The game is not a descendant "
+                  f"of this process -- a stale wineserver probably adopted it. "
+                  f"Kill every wineserver for this prefix and retry, or set "
+                  f"kernel.yama.ptrace_scope=0.")
+            return 5
+        print(f"attached to pid {pid}", flush=True)
+
+        if a.verify:
+            return verify(ls, pad, a.seconds)
+        return session(ls, pad, a)
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--game", type=Path,
@@ -1763,6 +1889,16 @@ def main() -> int:
                     help="evdev key that arms/disarms from ANY window (default F12). "
                          "The game has focus during a match, so a key that needs the "
                          "terminal is a key you cannot press when you need it.")
+    ap.add_argument("--preset", choices=("none", "ablation", "netplay"), default="none",
+                    help="switch the SWRSToys module set first via SokuFrameExtractor's "
+                         "ops/soku_mods.py. Default `none` leaves it exactly as it is.")
+    ap.add_argument("--sfe-root", type=Path,
+                    default=Path("~/K0NTR0L-2/SokuFrameExtractor").expanduser())
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="do not start the status strip (scripts.sokubot_overlay)")
+    ap.add_argument("--close-game", action="store_true",
+                    help="close the game this run launched when it exits (default: leave "
+                         "it, so a crash here does not end the human's match)")
     ap.add_argument("--no-hotkey", action="store_true",
                     help="do not watch the keyboards (also what to use without "
                          "`input` group access)")
@@ -1839,50 +1975,20 @@ def main() -> int:
         if rc:
             return rc
 
-    proc = None
-    if not a.attach:
-        stop_stale_wine(a.prefix)
-    pad = VirtualKeypad()
-    with pad:                      # the pad must exist BEFORE the game starts
-        if not a.attach:
-            print(f"launching {a.game}/th123e.exe on {a.display} ...", flush=True)
-            proc = launch_game(a.game, a.prefix, a.display)
-            time.sleep(12)
-            # Audio is left alone on purpose. Muting it broke the game once
-            # (disabling the Wine driver made Soku fail DirectSound init and
-            # render black) and the operator prefers the music on anyway.
-        if a.encoder or a.server:
-            return vision_session(pad, a)
-
-        # With --attach the operator launches the game themselves, which they
-        # may well do AFTER this starts -- and that ordering is the correct one,
-        # because Wine's dinput enumerates input devices once at init and the
-        # pad has to exist first. So wait rather than fail.
-        pid = find_game_pid()
-        if pid is None and a.attach:
-            print("pad is up. START THE GAME NOW -- waiting for it ...",
-                  flush=True)
-            for _ in range(600):
-                pid = find_game_pid()
-                if pid is not None:
-                    break
-                time.sleep(1)
-        if pid is None:
-            print("game process not found")
-            return 4
-        try:
-            ls = LiveState.attach(pid)
-        except PermissionError:
-            print(f"cannot read /proc/{pid}/mem. The game is not a descendant "
-                  f"of this process -- a stale wineserver probably adopted it. "
-                  f"Kill every wineserver for this prefix and retry, or set "
-                  f"kernel.yama.ptrace_scope=0.")
-            return 5
-        print(f"attached to pid {pid}", flush=True)
-
-        if a.verify:
-            return verify(ls, pad, a.seconds)
-        return session(ls, pad, a)
+    if a.server and not a.verify:
+        rc = preflight_server(a)
+        if rc:
+            return rc
+    rc = apply_preset(a)
+    if rc:
+        return rc
+    overlay = None if (a.no_overlay or a.verify) else start_overlay(a)
+    try:
+        return _play(a)
+    finally:
+        stop_overlay(overlay)
+        if a.close_game:
+            close_game(a)
 
 
 if __name__ == "__main__":
