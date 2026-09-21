@@ -46,6 +46,7 @@ from pathlib import Path
 
 import numpy as np
 
+from sokubot.live.mods import pause_refusal
 from sokubot.live.agent import Worker, kill_prefix, launch_game, report
 from sokubot.live.capture import (CaptureError, TrackedCapture, find_game_window)
 from sokubot.live.gate import ArmSwitch, BattleGate
@@ -54,6 +55,7 @@ from sokubot.live.protocol import DEFAULT_PORT, JPEG_QUALITY, connect
 from sokubot.live.schedule import ChunkScheduler, DelayPolicy
 
 CTL = Path("/tmp/sokubot.ctl")
+GAME_DIR = Path(os.environ.get("SOKU_GAME", "~/.wine-soku/drive_c/Games/Soku")).expanduser()
 HELP = """commands:
   key <KEY_X> [...]       tap raw keys by evdev name (setup menus only)\n  p1 <ctl> [ctl ...]      tap PLAYER ONE's keys (setup menus only)\n  press <btn> [btn ...]   tap each in turn (up down left right a b c d change spell)
   hold <btn> <seconds>    hold one control
@@ -300,6 +302,8 @@ def main() -> int:
                                     print(e, flush=True)
                                 time.sleep(0.45)
                             print(f"p1 {' '.join(args)}", flush=True)
+                        elif cmd in ("pause", "resume") and pause_refusal(cmd, GAME_DIR):
+                            print(pause_refusal(cmd, GAME_DIR), flush=True)
                         elif cmd in ("pause", "resume"):
                             # Wine's dinput reads evdev directly and ignores
                             # window focus, so while the game runs it reads the
