@@ -57,6 +57,7 @@ import torch
 
 from sokubot.data.state import CH, FULL_HP, STAGE_SPAN
 from sokubot.live.capture import find_game_window
+from sokubot.live.hotkey import DEFAULT_KEY, KeyWatcher
 from sokubot.live.latency import format_summary, summarise
 from sokubot.live.memstate import Frame, LiveState, find_game_pid
 from sokubot.live.pad import BUTTONS, VirtualKeypad
@@ -265,12 +266,12 @@ HELP = """commands (write a line to /tmp/sokubot.ctl):
                           which one --side says is ours. Check it against the
                           screen before arming: get this bit wrong and the
                           agent plays to the opponent's health.
-  arm | fight             let the agent play. A LOCAL vision run refuses until
-                          identity is known; a --server run does NOT check, and
-                          if `whoami` has not run the server answers with an
-                          empty reply and the pad sits idle.
-  disarm                  stop playing and neutralise the pad. The game keeps
+  arm | fight             let the agent play. Refused until identity is known
+                          (`whoami`), for a local run AND a --server run; the reason
+                          is also shown in the status overlay.
+  disarm | hands-off      stop playing and neutralise the pad. The game keeps
                           running, so this is safe where a pause is not.
+  toggle                  arm if disarmed, disarm if armed (what the hotkey sends)
   latency                 per-decision p50/p90/p99 against the period, over
                           decisions that ran the policy
   rec [path] / rec stop   start or stop recording
@@ -514,6 +515,10 @@ class RemoteBrain:
         # process died, the network dropped or it merely stopped replying.
         self.ok = True
         self.last_error = ""
+        # Has the server established which character is the agent? Until it has, it
+        # answers every decide with nothing and the pad sits idle -- which looks
+        # exactly like a working, armed agent that is choosing to do nothing.
+        self.identified = False
         # WHICH HEALTH BAR IS MINE.
         #
         # 0 = the agent holds player 1, whose bar is top-left. This is the one
@@ -588,10 +593,14 @@ class RemoteBrain:
         return act, enc
 
     def calibrate(self, before: np.ndarray, after: np.ndarray) -> str:
-        return self._call(b"C", self._shrink(before) + self._shrink(after)).decode()
+        msg = self._call(b"C", self._shrink(before) + self._shrink(after)).decode()
+        self.identified = "agent is" in msg
+        return msg
 
     def reset(self) -> str:
-        return self._call(b"R").decode()
+        out = self._call(b"R").decode()
+        self.identified = False
+        return out
 
     def ping(self) -> str:
         return self._call(b"P").decode()
@@ -1156,6 +1165,15 @@ class Pilot(threading.Thread):
         return format_summary(summarise(self.lat_ms, 1000 * self.period))
 
 
+def _pad_path(pad):
+    """The pad's evdev path, or None. Excluded from the hotkey so the agent's own
+    device can never toggle it."""
+    try:
+        return pad.device_path
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
 def session(ls, pad: VirtualKeypad, a) -> int:
     """Long-lived: holds the pad, takes commands, records."""
     pol = obs = None
@@ -1215,14 +1233,32 @@ def session(ls, pad: VirtualKeypad, a) -> int:
     # One-way status for the overlay. Only fields with a real source are written
     # (see status.fields_from); the rest keep their honest defaults.
     slot = a.side + 1
+    notice = ""
     status = StatusWriter()
     status.update(force=True, **fields_from(pilot, brain, slot))
     status_armed = False
+    hk = None
+    if not a.no_hotkey:
+        hk = KeyWatcher.for_evdev(lambda: ctl.push("toggle"), key=a.hotkey,
+                                  exclude=_pad_path(pad))
+        if hk is None:
+            print("hotkey UNAVAILABLE (no readable keyboard -- is your user in the "
+                  "`input` group?). Use the FIFO instead.", flush=True)
+        else:
+            hk.start()
+            print(f"hotkey {a.hotkey}: arm/disarm from any window", flush=True)
     try:
         while True:
             for line in ctl.take():
                 parts = line.split()
                 cmd, args = parts[0], parts[1:]
+                if cmd == "toggle":
+                    # From the hotkey. The PILOT is the source of truth: the local
+                    # `armed` only catches up with a watchdog stop later in the same
+                    # loop iteration, so it can lag it by one pass.
+                    cmd = ("disarm" if pilot is not None and pilot.armed.is_set()
+                           else "arm")
+                    print(f"[hotkey] {cmd}", flush=True)
                 if cmd == "stop":
                     return 0
                 elif cmd == "shot":
@@ -1244,6 +1280,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                     print(f"keyed {args}", flush=True)
                 elif cmd in ("arm", "fight"):
                     if pol is None:
+                        notice = "no policy loaded"
                         print("no --policy loaded; restart with one", flush=True)
                     elif (vision and brain is None
                           and ls.vs.i_am_left is None
@@ -1264,16 +1301,26 @@ def session(ls, pad: VirtualKeypad, a) -> int:
                                  "separate two of the same character, so the "
                                  "probe is still needed)"
                                  if ls.vs.mirror_match else "")
+                        notice = f"NOT ARMED: identity unknown ({how} first)"
                         print(f"NOT ARMED: run {how} first -- the encoder "
                               f"reports the scene left-to-right and cannot say "
                               f"which character is the agent.{extra}",
                               flush=True)
+                    elif brain is not None and not brain.identified:
+                        # The server holds every decision until it knows which
+                        # character is the agent, so arming now would look armed and
+                        # do nothing. Refuse, and say so where the user can see it.
+                        notice = "NOT ARMED: identity unknown (run `whoami` first)"
+                        print(f"{notice} -- the server answers nothing until it "
+                              f"knows which character is the agent", flush=True)
                     else:
                         armed = True
+                        notice = ""
                         pilot.armed.set()
                         print("ARMED -- the agent is now playing", flush=True)
-                elif cmd == "disarm":
+                elif cmd in ("disarm", "hands-off"):
                     armed = False
+                    notice = ""
                     if pilot is not None:
                         pilot.armed.clear()
                     pad.neutral()
@@ -1383,7 +1430,7 @@ def session(ls, pad: VirtualKeypad, a) -> int:
             # overlay never lags a state change; everything else is rate-limited.
             now_armed = bool(pilot is not None and pilot.armed.is_set())
             status.update(force=now_armed != status_armed,
-                          **fields_from(pilot, brain, slot))
+                          **fields_from(pilot, brain, slot, notice))
             status_armed = now_armed
             if armed:
                 act, seq = pilot.take(last_seq)
@@ -1413,6 +1460,8 @@ def session(ls, pad: VirtualKeypad, a) -> int:
         pad.neutral()
         if rec:
             rec.__exit__()
+        if hk is not None:
+            hk.stop()
         status.close()
         ctl.stop.set()
 
@@ -1622,6 +1671,13 @@ def main() -> int:
                     default=Path("~/.wine-soku").expanduser())
     ap.add_argument("--display", default=os.environ.get("DISPLAY", ":0"))
     ap.add_argument("--policy", type=Path, default=None)
+    ap.add_argument("--hotkey", default=DEFAULT_KEY,
+                    help="evdev key that arms/disarms from ANY window (default F12). "
+                         "The game has focus during a match, so a key that needs the "
+                         "terminal is a key you cannot press when you need it.")
+    ap.add_argument("--no-hotkey", action="store_true",
+                    help="do not watch the keyboards (also what to use without "
+                         "`input` group access)")
     ap.add_argument("--late-run-limit", type=int, default=60,
                     help="auto-disarm after this many decisions IN A ROW over "
                          "the period. 60 (~5 s) suits play; a latency "

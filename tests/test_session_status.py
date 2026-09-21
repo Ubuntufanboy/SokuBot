@@ -131,6 +131,8 @@ def loop(monkeypatch, tmp_path):
     monkeypatch.setattr(pcm, "StatusWriter", Rec)
 
     class Pad:
+        device_path = "/dev/input/event99"
+
         def __init__(self): self.calls = 0
         def neutral(self): pass
         def set_state(self, s): self.calls += 1
@@ -138,19 +140,23 @@ def loop(monkeypatch, tmp_path):
     class Loop:
         def __init__(self):
             self.rc = None
+            self.no_hotkey = True
             self.status_path = tmp_path / "sokubot.status.json"
 
-        def start(self, decide_ms=2, late_run_limit=60):
+        def start(self, decide_ms=2, late_run_limit=60, ls=None):
+            self.decide_ms = decide_ms
+
             def decide(ls, pol, obs, hist, side, H):
-                time.sleep(decide_ms / 1000)
+                time.sleep(self.decide_ms / 1000)
                 return np.zeros((1, 10), np.float32), object()
             monkeypatch.setattr(pcm, "decide", decide)
             a = types.SimpleNamespace(side=1, policy=Path("x.pt"), truth=None, server=None,
                                       display=":0", record=Path("/dev/null"), port=5599,
-                                      late_run_limit=late_run_limit)
+                                      late_run_limit=late_run_limit,
+                                      no_hotkey=self.no_hotkey, hotkey="KEY_F12")
             self.pad = Pad()
             self.t = threading.Thread(
-                target=lambda: setattr(self, "rc", pcm.session(types.SimpleNamespace(), self.pad, a)),
+                target=lambda: setattr(self, "rc", pcm.session(ls or types.SimpleNamespace(), self.pad, a)),
                 daemon=True)
             self.t.start()
             deadline = time.time() + 5
@@ -183,6 +189,7 @@ def loop(monkeypatch, tmp_path):
             return writers[0].log
 
     lp = Loop()
+    lp.pcm = pcm
     yield lp
     if lp.t.is_alive():
         lp.stop()
@@ -239,3 +246,147 @@ def test_a_state_change_is_forced_out_not_left_to_the_rate_limit(loop):
     # heartbeats. (Forcing every update would defeat the limiter and hammer the disk.)
     unforced = [f for f, _ in log if not f]
     assert len(unforced) >= 3
+
+
+# --- notices, the identity guard, hands-off ---------------------------------
+def test_a_refusal_reason_is_shown_only_while_disarmed():
+    f = st.fields_from(FakePilot(armed=False), None, 2, notice="NOT ARMED: identity unknown")
+    assert f["last_error"] == "NOT ARMED: identity unknown"
+    assert st.fields_from(FakePilot(armed=True), None, 2, notice="stale")["last_error"] == ""
+
+
+def test_a_real_error_outranks_a_refusal_notice():
+    f = st.fields_from(FakePilot(armed=False), FakeBrain(False, "gone"), 2, notice="n")
+    assert "gone" in f["last_error"] and f["last_error"] != "n"
+
+
+def test_the_remote_brain_tracks_whether_the_server_knows_who_it_is():
+    from sokubot.live.nullbrain import NullBrain, NullServer
+    from scripts.play_cheat_match import RemoteBrain
+    srv = NullServer(NullBrain()); srv.start(); assert srv.ready.wait(5)
+    try:
+        b = RemoteBrain("127.0.0.1", srv.port, size=224)
+        pair = np.zeros((480, 640, 6), np.uint8)
+        assert b.identified is False
+        b.calibrate(pair, pair)
+        assert b.identified is True
+        b.reset()
+        assert b.identified is False
+    finally:
+        srv.stop()
+
+
+class FakeVisionBrain:
+    """What the session needs of a RemoteBrain, with identity under test control."""
+    spec = {"history": 1, "ticks": 1}
+    ok, last_error, rtt_ms = True, "", 0.0
+
+    def __init__(self):
+        self.identified = False
+
+    def decide(self, pair):
+        time.sleep(0.002)
+        return np.zeros((1, 10), np.float32), None
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def remote_ls(loop):
+    """A stand-in VisionSource so session() takes its real vision + remote branch."""
+    class FakeSource:
+        dead, still_for, fps, sink, vs = None, 0.0, 60, None, None
+
+        def __init__(self):
+            self.brain = FakeVisionBrain()
+
+        def _pair(self):
+            return np.zeros((4, 4, 6), np.uint8)
+    loop.pcm.VisionSource = FakeSource
+    return FakeSource()
+
+
+def test_arming_before_the_server_knows_the_agent_is_refused_and_says_why(loop, remote_ls):
+    loop.start(ls=remote_ls)
+    loop.wait(lambda s: s.slot == 2)
+    loop.send("arm")
+    s = loop.wait(lambda s: "identity unknown" in s.last_error)
+    assert s.armed is False                       # it did NOT arm and go silent
+    remote_ls.brain.identified = True             # `whoami` succeeded
+    loop.send("arm")
+    s = loop.wait(lambda s: s.armed)
+    assert s.armed and s.last_error == ""         # and the reason is gone once armed
+
+
+def test_hands_off_disarms_like_disarm(loop):
+    loop.start()
+    loop.wait(lambda s: s.slot == 2)
+    loop.send("arm"); loop.wait(lambda s: s.armed)
+    loop.send("hands-off")
+    assert loop.wait(lambda s: not s.armed).armed is False
+
+
+class FakeWatcher:
+    """Stands in for KeyWatcher; the test presses the key by calling on_press."""
+    instances = []
+
+    def __init__(self, on_press, key, exclude):
+        self.on_press, self.key, self.exclude = on_press, key, exclude
+        FakeWatcher.instances.append(self)
+
+    @classmethod
+    def for_evdev(cls, on_press, key="KEY_F12", exclude=None):
+        return cls(on_press, key, exclude)
+
+    def start(self): pass
+    def stop(self): pass
+
+
+def test_the_hotkey_toggles_the_real_session(loop):
+    FakeWatcher.instances.clear()
+    loop.pcm.KeyWatcher = FakeWatcher
+    loop.no_hotkey = False
+    loop.start()
+    loop.wait(lambda s: s.slot == 2)
+    (w,) = FakeWatcher.instances
+    w.on_press()                                   # press 1: arm
+    assert loop.wait(lambda s: s.armed).armed is True
+    w.on_press()                                   # press 2: disarm
+    assert loop.wait(lambda s: not s.armed).armed is False
+
+
+def test_one_press_re_arms_after_a_watchdog_stop_and_it_stays_armed(loop):
+    """The pilot is the source of truth. After a watchdog stop ONE press must arm."""
+    FakeWatcher.instances.clear()
+    loop.pcm.KeyWatcher = FakeWatcher
+    loop.no_hotkey = False
+    loop.start(decide_ms=40, late_run_limit=3)     # every decision over a 16.7 ms period
+    loop.wait(lambda s: s.slot == 2)
+    (w,) = FakeWatcher.instances
+    w.on_press()
+    loop.wait(lambda s: s.armed)
+    loop.wait(lambda s: (not s.armed) and "over budget" in s.last_error)   # the watchdog stopped it
+    loop.decide_ms = 2                             # the machine recovers
+    w.on_press()                                   # ONE press
+    s = loop.wait(lambda s: s.armed and s.last_error == "")
+    time.sleep(0.4)
+    assert loop.status().armed is True             # ...and it does not trip again
+
+
+def test_the_hotkey_is_told_to_ignore_the_agents_own_pad(loop):
+    FakeWatcher.instances.clear()
+    loop.pcm.KeyWatcher = FakeWatcher
+    loop.no_hotkey = False
+    loop.start()
+    loop.wait(lambda s: s.slot == 2)
+    assert FakeWatcher.instances[0].exclude == "/dev/input/event99"
+
+
+def test_no_readable_keyboard_does_not_stop_the_session(loop, capsys):
+    loop.pcm.KeyWatcher = types.SimpleNamespace(for_evdev=lambda *a, **k: None)
+    loop.no_hotkey = False
+    loop.start()
+    loop.wait(lambda s: s.slot == 2)
+    assert loop.stop() == 0
+    assert "hotkey UNAVAILABLE" in capsys.readouterr().out

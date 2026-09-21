@@ -191,8 +191,11 @@ def summarise(s: Status | None) -> tuple[str, str]:
     return f"SokuBot ({who}): PLAYING", "ok"
 
 
-def fields_from(pilot, brain, slot: int) -> dict:
+def fields_from(pilot, brain, slot: int, notice: str = "") -> dict:
     """The status fields that have a REAL source today, read off the live objects.
+
+    `notice` is a one-line reason the last command was refused (an arm with no identity,
+    say). It is shown only while disarmed, and only when there is no worse error.
 
     `pilot` and `brain` may be None (no policy loaded / no server). Fields with no
     source yet -- scene, rounds, gate_open -- are deliberately not returned, so they
@@ -218,6 +221,11 @@ def fields_from(pilot, brain, slot: int) -> dict:
         # `stop_reason` is never cleared, so an armed agent would otherwise sit next
         # to an old error.
         error = str(pilot.stop_reason)
+    if not error and not armed and notice:
+        # Why the LAST command did nothing -- e.g. an arm refused for want of an
+        # identity. The user pressed a hotkey in a game window and cannot see the
+        # terminal; without this, "nothing happened" is all they would ever learn.
+        error = notice
     out["last_error"] = error
 
     if pilot is not None:

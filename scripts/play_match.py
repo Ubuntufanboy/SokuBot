@@ -146,6 +146,11 @@ class Control(threading.Thread):
             out, self.queue = self.queue, []
         return out
 
+    def push(self, line: str) -> None:
+        """Inject a command as if it had been written to the FIFO (a hotkey, say)."""
+        with self.lock:
+            self.queue.append(line)
+
 
 def tap(pad, name: str, hold_s: float = 0.05,
         gap_s: float = 0.45) -> None:
