@@ -141,13 +141,28 @@ def launch_game(game_dir: Path, prefix: Path, display: str) -> subprocess.Popen:
            # it is also what popped "SokuFrameExtractor.dll has been disabled
            # because the game crashed while loading it". Nothing in this path
            # needs a mod -- the state comes from memory, not from the DLL.
-           "WINEDLLOVERRIDES": "d3d9=b",
-           # Software GL. The host's Intel Haswell stack emits "DRI3 error:
-           # Could not get DRI3 device" and the game renders a pure black
-           # window through it; llvmpipe is what the capture containers have
-           # always used for this game, so it is the configuration with
-           # evidence behind it rather than the faster one.
-           "LIBGL_ALWAYS_SOFTWARE": "1"}
+           "WINEDLLOVERRIDES": "d3d9=b"}
+    # GL MODE, MEASURED TWICE AND THE ANSWER CHANGED.
+    #
+    # 2026-08-16: the host's Intel Haswell stack emitted "DRI3 error: Could not
+    # get DRI3 device" and the game rendered a pure black window, so this
+    # forced llvmpipe (software GL), which the capture containers always use.
+    #
+    # 2026-09-20: the opposite, same Wine 11.6 and Mesa 25.3.5. With
+    # LIBGL_ALWAYS_SOFTWARE=1 th123.exe parks in ntsync_schedule and NEVER
+    # creates a window (Mesa: "libEGL warning: Not allowed to force software
+    # rendering when API explicitly selects a hardware device"); even a
+    # brand-new prefix's wineboot hangs the same way. Hardware GL opens the
+    # window in 8 s and renders the title screen correctly (frame checked: mean
+    # RGB ~ (101, 84, 81), 1.4% near-black).
+    #
+    # So hardware is the default and SOKUBOT_GL=sw forces software. Whichever
+    # you pick, LOOK at a frame before believing a run: the failure this
+    # replaced was a black window that produced plausible-looking numbers.
+    if os.environ.get("SOKUBOT_GL", "hw").lower() == "sw":
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    else:
+        env.pop("LIBGL_ALWAYS_SOFTWARE", None)
     # No setsid, no shell: the game has to stay in our process tree or
     # /proc/pid/mem is unreadable under ptrace_scope=1.
     return subprocess.Popen(["wine", "th123e.exe"], cwd=str(game_dir), env=env,
