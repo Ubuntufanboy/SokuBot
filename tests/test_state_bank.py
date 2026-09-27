@@ -62,3 +62,12 @@ def test_the_simulator_trainer_reads_the_same_captures_and_zero_means_all(tmp_pa
     for limit, want in ((0, 3), (2, 2)):
         out = load_sequences(tmp_path / "corpus", limit, SLOTS, SKIP)
         assert len(set(out[3].tolist())) == want, (limit, want)
+
+
+def test_the_runners_scratch_directory_is_not_counted_as_a_replay(tmp_path):
+    """Each capture shard holds a `.work` directory; with a limit it used to eat one slot."""
+    _capture(tmp_path / "corpus" / "w0" / "5262777-11111111", 400)
+    _capture(tmp_path / "corpus" / "w0" / "5263014-22222222", 400)
+    (tmp_path / "corpus" / "w0" / ".work" / "replay").mkdir(parents=True)
+    found = state_bank.find_replays([tmp_path / "corpus"], limit=2)
+    assert [d.name for d in found] == ["5262777-11111111", "5263014-22222222"]

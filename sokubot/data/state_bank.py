@@ -63,7 +63,10 @@ def find_replays(roots: list[Path], limit: int = 0) -> list[Path]:
             continue
         waves = sorted(w for w in root.glob("w*") if w.is_dir())
         for parent in (waves or [root]):
-            out += [d for d in sorted(parent.iterdir()) if d.is_dir()]
+            # Hidden directories are the capture runner's scratch (`.work` holds the FIFO and the
+            # staged replay), never a replay; counting them made `limit` read fewer replays than asked.
+            out += [d for d in sorted(parent.iterdir())
+                    if d.is_dir() and not d.name.startswith(".")]
     if limit:
         out = out[:limit]
     return out
