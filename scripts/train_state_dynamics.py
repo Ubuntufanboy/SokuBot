@@ -488,9 +488,15 @@ def eval_rollout(model, S, P, A, E, H, horizons, device, n=256, seed=0,
     gi = CH["guarding"]
     gsig = float(S[:, :, gi].std().clip(1e-6))
     for h in horizons:
-        g_pr = torch.sigmoid(pred[:, h - 1, :, gi])
+        # Already a probability: `rollout` returns the flag it fed back, not a logit.
+        g_pr = pred[:, h - 1, :, gi]
         g_tg = s[:, H + h - 1, :, gi]
         out[f"guard_sigma_h{h}"] = float((g_pr - g_tg).abs().mean() / gsig)
+        # Calibration, read directly: the mean predicted probability against the true rate on the
+        # same windows. pos_weight w moves the first away from the second on purpose (the loss's
+        # minimiser is w*p/(w*p + 1 - p)); this is how far.
+        out[f"guard_mean_h{h}"] = float(g_pr.mean())
+        out[f"guard_true_h{h}"] = float(g_tg.mean())
     return out
 
 
@@ -537,7 +543,8 @@ def block_gain(model, S, P, A, E, H, device, n=512, horizon=8, seed=0,
         af[left, :, :, L] = 1.0
         af[~left, :, :, R] = 1.0
         pred = rollout(model, s[:, :H], p[:, :H], af, horizon, mv)
-        res[tag] = float(torch.sigmoid(pred[:, :, 0, CH["guarding"]]).mean())
+        # A probability already (see `rollout`); a second sigmoid squashed this gain ~4x.
+        res[tag] = float(pred[:, :, 0, CH["guarding"]].mean())
     return {"block_away": res["away"], "block_toward": res["toward"],
             "block_gain": res["away"] - res["toward"], "block_n": len(idx)}
 

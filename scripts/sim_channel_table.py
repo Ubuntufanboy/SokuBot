@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.train_state_dynamics import cached_sequences
 from sokubot.data.state import STATE_CHANNELS
 from sokubot.model.state_dynamics import index_moves, load_sim, rollout
+from sokubot.model.state_head import BINARY, default_pos_weight
 
 STEPS = (1, 2, 4, 8, 16, 24, 32)
 SHOW = ("guarding", "hp", "x", "dx", "spirit", "airborne", "untech",
@@ -48,7 +49,7 @@ SHOW = ("guarding", "hp", "x", "dx", "spirit", "airborne", "untech",
 FLAGS = ("guarding", "airborne")
 
 
-def flag_skill(logit: torch.Tensor, target: torch.Tensor,
+def flag_skill(prob: torch.Tensor, target: torch.Tensor,
                base: float) -> tuple[float, float]:
     """-> (BCE skill against the base rate, AUC). Two numbers, because one of
     them cannot answer the question on its own.
@@ -69,6 +70,10 @@ def flag_skill(logit: torch.Tensor, target: torch.Tensor,
     information about when the flag is set", and that -- not the magnitude of
     the error -- is the claim about partial observability.
     """
+    # `rollout` returns the flag it FED BACK -- a probability, not a logit. This used to call
+    # binary_cross_entropy_with_logits on it, i.e. a second sigmoid, which maps every "no" to 0.5:
+    # the "-2.26" for fix5 and "~0.45 emitted" above were mostly that, not the model (2026-09-27).
+    logit = torch.logit(prob.clamp(1e-6, 1 - 1e-6))
     bce = F.binary_cross_entropy_with_logits(logit, target, reduction="mean")
     b = torch.full_like(logit, float(np.log(base / (1 - base))))
     ref = F.binary_cross_entropy_with_logits(b, target, reduction="mean")
@@ -81,11 +86,24 @@ def flag_skill(logit: torch.Tensor, target: torch.Tensor,
         return skill, float("nan")
     # Rank-sum AUC, ties averaged -- the flags are predicted from a linear head
     # and exact ties do occur.
-    order = torch.argsort(x)
-    ranks = torch.empty_like(x)
-    ranks[order] = torch.arange(1, len(x) + 1, dtype=x.dtype, device=x.device)
+    # (It said "ties averaged" and used a plain argsort, which broke ties by
+    # position: a constant output scored 0.502, not 0.5.)
+    _, inv, counts = torch.unique(x, return_inverse=True, return_counts=True)
+    ends = torch.cumsum(counts, 0).double()
+    ranks = (ends - (counts.double() - 1) / 2)[inv]
     auc = (ranks[y].sum() - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
     return skill, float(auc)
+
+
+def undo_pos_weight(q: torch.Tensor, w: float) -> torch.Tensor:
+    """Invert the minimiser of pos-weighted BCE, q = w*p / (w*p + 1 - p).
+
+    The simulator is trained with pos_weight w on each flag, which inflates its
+    probabilities ON PURPOSE (train_state_dynamics explains why). If the model
+    is calibrated for the loss it was given, this recovers the true rate, and
+    skill measured on it separates "skewed by design" from "wrong".
+    """
+    return q / (w - (w - 1.0) * q)
 
 
 def load_corpus(a):
@@ -131,7 +149,7 @@ def main() -> int:
     Sv, Pv, Av, Ev, Mv = S[vm], P[vm], A[vm], E[vm], M[vm]
     print(f"  val {len(Sv)} steps / {len(val_ep)} replays", flush=True)
 
-    rows, flags, aucs = {}, {}, {}
+    rows, flags, aucs, cal, unw, wts = {}, {}, {}, {}, {}, {}
     for name, path in zip(names, a.sims):
         model, meta = load_sim(path, a.device)
         H = int(meta["history"])
@@ -158,26 +176,32 @@ def main() -> int:
         pred = rollout(model, s[:, :H], p[:, :H], act, max(STEPS), mv,
                        a.flag_feedback)
 
-        tab, fsk, fauc = {}, {}, {}
+        tab, fsk, fauc, fcal, fun = {}, {}, {}, {}, {}
+        pwmax = meta.get("pos_weight_max")
+        pw = None if pwmax is None else default_pos_weight().clamp(max=float(pwmax))
         for ch in FLAGS:
             i = STATE_CHANNELS.index(ch)
             base = float(np.clip(S[:, :, i].mean(), 1e-4, 1 - 1e-4))
+            w = None if pw is None else float(pw[list(BINARY).index(i)])
+            wts[(name, ch)] = w
             for h in STEPS:
-                fsk[(ch, h)], fauc[(ch, h)] = flag_skill(
-                    pred[:, h - 1, :, i], s[:, H + h - 1, :, i], base)
+                q, tg = pred[:, h - 1, :, i], s[:, H + h - 1, :, i]
+                fsk[(ch, h)], fauc[(ch, h)] = flag_skill(q, tg, base)
+                fcal[(ch, h)] = (float(q.mean()), float(tg.mean()))
+                if w is not None:
+                    fun[(ch, h)] = flag_skill(undo_pos_weight(q, w), tg, base)[0]
         for h in STEPS:
             pr, tg = pred[:, h - 1], s[:, H + h - 1]
             for ch in SHOW:
                 i = STATE_CHANNELS.index(ch)
                 v = pr[:, :, i]
-                # Flags come out of the head as logits; comparing a logit to a
-                # 0/1 label would report a large error for a correct model.
-                if ch in ("guarding", "airborne"):
-                    v = torch.sigmoid(v)
+                # Flags are already probabilities here (`rollout` returns what it fed back).
                 tab[(ch, h)] = float((v - tg[:, :, i]).abs().mean()) / sig[i]
         rows[name] = tab
         flags[name] = fsk
         aucs[name] = fauc
+        cal[name] = fcal
+        unw[name] = fun
         print(f"  {name}: history {H} ticks {meta['ticks']} "
               f"move_dim {model.move_dim} n_moves {model.n_moves}", flush=True)
 
@@ -202,6 +226,26 @@ def main() -> int:
         for ch in FLAGS:
             print(f"{name + '/' + ch:<22}" + "".join(
                 f"{flags[name][(ch, h)]:+8.4f}" for h in STEPS))
+
+    print("\nflag calibration -- mean predicted probability / true rate, same windows")
+    print(f"{'model/flag':<22}{hdr}")
+    for name in names:
+        for ch in FLAGS:
+            print(f"{name + '/' + ch:<22}" + "".join(
+                f"{cal[name][(ch, h)][0]:8.3f}" for h in STEPS))
+            print(f"{'  true rate':<22}" + "".join(
+                f"{cal[name][(ch, h)][1]:8.3f}" for h in STEPS))
+
+    print("\nflag BCE skill with pos_weight UNDONE (q -> q / (w - (w-1) q)). Positive: the")
+    print("offset was the loss's, by design, and inverting it calibrates the flag. Still")
+    print("negative: the model is wrong about the rate, not just skewed")
+    print(f"{'model/flag (w)':<22}{hdr}")
+    for name in names:
+        for ch in FLAGS:
+            w = wts[(name, ch)]
+            label = f"{name}/{ch} ({'?' if w is None else f'{w:g}'})"
+            print(f"{label:<22}" + ("".join(f"{unw[name][(ch, h)]:+8.4f}" for h in STEPS)
+                                     if w is not None else "  no pos_weight_max in checkpoint"))
 
     if len(names) == 2:
         b, m = names

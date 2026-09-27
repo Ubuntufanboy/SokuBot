@@ -388,6 +388,12 @@ def rollout(model: StateDynamics, state: torch.Tensor, proj: torch.Tensor,
     the buttons the agent intends to press. Returns the predicted states
     [B,steps,2,C].
 
+    THE BINARY CHANNELS COME BACK AS THEY WERE FED BACK, NOT AS LOGITS: a
+    probability under "sigmoid" feedback, 0/1 under "hard"/"sample". Applying
+    sigmoid again maps every "no" to 0.5: that is how `guarding` read as 0.67
+    against a 5% base rate for months (found 2026-09-27; see
+    tests/test_flag_measurements.py).
+
     Teacher-forced error is not the number that matters: the policy consumes
     the model's own output, so what has to be measured is what happens when the
     model eats its own predictions. This is that path, used by both the
