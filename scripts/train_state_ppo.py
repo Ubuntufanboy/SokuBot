@@ -219,7 +219,7 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
     s_mu, s_sd, p_mu, p_sd = corpus_stats(stat_view(S), stat_view(P))
     obs = StateObs(s_mu, s_sd, p_mu, p_sd, slots).to(dev)
     print(f"simulator {a.sim} [{fp['sim']}] step {meta.get('step')} | history {H} slots {slots} "
-          f"ticks {ticks} | bank [{fp['bank']}] {len(S)} decision steps, {len(names)} replays | "
+          f"ticks {ticks} | bank [{fp['bank']}] {len(S)} decision steps, {len(names) or int(E.max()) + 1} replays | "
           f"obs {obs.dim} | device {dev}", flush=True)
 
     weights = dict(kv.split("=") for kv in a.opponents.split(","))
