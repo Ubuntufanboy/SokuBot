@@ -92,9 +92,9 @@ def rng_state(rng: np.random.Generator) -> dict:
 
 def set_rng_state(rng: np.random.Generator, st: dict) -> None:
     rng.bit_generator.state = st["numpy"]
-    torch.set_rng_state(st["torch"])
+    torch.set_rng_state(st["torch"].cpu())
     if "cuda" in st and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(st["cuda"])
+        torch.cuda.set_rng_state_all([t.cpu() for t in st["cuda"]])
 
 
 def main(argv=None) -> int:
@@ -242,7 +242,11 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
     step0, best = 0, {"net": float("-inf"), "step": -1}
     latest = a.out / "latest.pt"
     if latest.exists() and not a.fresh:
-        ck = torch.load(latest, map_location=dev, weights_only=False)
+        # To CPU, always. Every module and optimiser copies its state onto its own device when
+        # loaded, and the RNG states MUST stay CPU ByteTensors: map_location="cuda" moved them to the
+        # GPU and torch.set_rng_state refused them, which the CPU-only tests could not see and the
+        # first GPU smoke run did. It also keeps the league's snapshots on the CPU, as designed.
+        ck = torch.load(latest, map_location="cpu", weights_only=False)
         if ck["fingerprints"] != fp:
             raise SystemExit(f"refusing to resume {latest}: it was trained against "
                              f"{ck['fingerprints']} and this run has {fp}. Use --fresh or a new "

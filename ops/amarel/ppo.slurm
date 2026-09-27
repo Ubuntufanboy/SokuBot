@@ -27,7 +27,8 @@ set -uo pipefail
 cd ~/SokuBot
 echo "== $(date -Is) job ${SLURM_JOB_ID} restart ${SLURM_RESTART_COUNT:-0} on $(hostname)"
 echo "== deployed: $(cat DEPLOYED 2>/dev/null || echo 'UNKNOWN (run ops/amarel/sync.sh)')"
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+# Only the GPU this job was given: the node's others belong to other jobs.
+nvidia-smi ${CUDA_VISIBLE_DEVICES:+--id=$CUDA_VISIBLE_DEVICES} --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
 srun ~/venvs/sokubot/bin/python -m scripts.train_state_ppo "$@"
 rc=$?

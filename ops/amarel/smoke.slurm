@@ -25,7 +25,8 @@ PY=~/venvs/sokubot/bin/python
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-4}
 echo "== $(date -Is) job ${SLURM_JOB_ID} restart ${SLURM_RESTART_COUNT:-0} on $(hostname)"
 echo "== deployed: $(cat DEPLOYED 2>/dev/null || echo UNKNOWN)"
-nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+# Only the GPU this job was given: the node's others belong to other jobs.
+nvidia-smi ${CUDA_VISIBLE_DEVICES:+--id=$CUDA_VISIBLE_DEVICES} --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
 if [ "${SLURM_RESTART_COUNT:-0}" -eq 0 ]; then
     $PY -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
     srun $PY -m pytest -q -p no:cacheprovider tests/test_ppo.py || exit 1

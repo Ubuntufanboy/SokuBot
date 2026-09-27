@@ -320,3 +320,23 @@ def test_the_bank_fingerprint_sees_a_change_anywhere_it_samples():
     S2 = S.copy(); S2[0, 0, 0] += 1.0
     assert bank_fingerprint(S2, P, A, E, V) != base
     assert bank_fingerprint(S[:-1], P[:-1], A[:-1], E[:-1], V[:-1]) != base    # shape
+
+
+def test_a_resume_loads_the_checkpoint_to_cpu_whatever_the_training_device(assets, tmp_path,
+                                                                            monkeypatch):
+    """A GPU run resuming with map_location="cuda" moved the RNG state onto the GPU and died in
+    torch.set_rng_state. This pins the call, but on a CPU-only machine the buggy form
+    (map_location=device) is indistinguishable, since the device IS "cpu": the GPU smoke job
+    (ops/amarel/smoke.slurm, which stops, requeues and resumes on a GPU) is the real guard."""
+    sim, bank = assets
+    assert run(sim, bank, tmp_path / "c", "--steps", "4", "--stop-at-step", "2") == 99
+    seen = []
+    real = torch.load
+
+    def spy(path, *a, **kw):
+        if str(path).endswith("latest.pt"):
+            seen.append(kw.get("map_location"))
+        return real(path, *a, **kw)
+    monkeypatch.setattr(torch, "load", spy)
+    assert run(sim, bank, tmp_path / "c", "--steps", "4") == 0
+    assert seen == ["cpu"]
