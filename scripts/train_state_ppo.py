@@ -65,8 +65,19 @@ REQUEUE = 99            # exit code: "stopped cleanly to be resumed"
 def load_bank(a, ticks: int, slots: int):
     if a.bank is not None:
         d = np.load(a.bank, allow_pickle=True)
-        S, P, A, E, V = d["S"], d["P"], d["A"], d["E"], d["V"]
+        S, P, A, E = d["S"], d["P"], d["A"], d["E"]
+        if "V" in d.files:
+            V = d["V"]
+        else:
+            # train_state_dynamics' corpus cache (S, P, A, E, M): the same arrays at the same stride,
+            # so the 8.6 h parse of the full Amarel corpus is not done twice. It keeps every row and
+            # has no validity mask, which is right for FRESH captures -- only a sidecar aligned to an
+            # old video is ever padded -- and wrong for an aligned corpus, so say so.
+            V = np.ones(len(S), bool)
+            print(f"bank {a.bank}: no validity mask (a simulator corpus cache); every row taken as "
+                  f"valid, which holds for fresh captures only", flush=True)
         names = [str(x) for x in d["names"]] if "names" in d.files else []
+        A = as_buttons(A)
     else:
         S, P, A, E, V, names = state_bank.load(a.corpus, ticks, slots, a.cache, a.replays)
     # A bank is only valid against the simulator it was built for. Checked here so a mismatch is a
@@ -75,6 +86,32 @@ def load_bank(a, ticks: int, slots: int):
         raise SystemExit(f"bank has {P.shape[2]} projectile slots and {A.shape[1]} ticks per step; "
                          f"the simulator wants {slots} and {ticks}. Rebuild the bank for it.")
     return S, P, A, E, V, names
+
+
+def as_buttons(A: np.ndarray) -> np.ndarray:
+    """The button chunks as uint8, the bank's own dtype. The simulator's cache keeps them float32:
+    10.4 GB for the full corpus instead of 2.6. Checked chunk by chunk, so a value that is not 0 or
+    1 stops the run instead of being truncated, and no full-size temporary is made."""
+    if A.dtype == np.uint8:
+        return A
+    out = np.empty(A.shape, np.uint8)
+    for i in range(0, len(A), 1 << 20):
+        a = A[i:i + (1 << 20)]
+        out[i:i + len(a)] = a
+        if not np.array_equal(out[i:i + len(a)], a):
+            raise SystemExit(f"bank buttons are not 0/1 near row {i}: not a button chunk array")
+    return out
+
+
+# Summary statistics (normalisation, the button prior, button rates) come from at most this many
+# evenly strided rows. The full Amarel bank is 25.9M decision steps: a std over its projectile block
+# allocates a 12 GB temporary, and means over 4M rows are already exact to ~1e-3. Smaller banks are
+# used whole, so every earlier run and test is unchanged.
+STAT_ROWS = 4_000_000
+
+
+def stat_view(x: np.ndarray) -> np.ndarray:
+    return x[::max(1, -(-len(x) // STAT_ROWS))]
 
 
 def atomic_save(obj, path: Path) -> None:
@@ -179,7 +216,7 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
     H, slots, ticks = int(meta["history"]), int(meta["slots"]), int(meta["ticks"])
     S, P, A, E, V, names = load_bank(a, ticks, slots)
     fp = {"sim": file_fingerprint(a.sim), "bank": bank_fingerprint(S, P, A, E, V)}
-    s_mu, s_sd, p_mu, p_sd = corpus_stats(S, P)
+    s_mu, s_sd, p_mu, p_sd = corpus_stats(stat_view(S), stat_view(P))
     obs = StateObs(s_mu, s_sd, p_mu, p_sd, slots).to(dev)
     print(f"simulator {a.sim} [{fp['sim']}] step {meta.get('step')} | history {H} slots {slots} "
           f"ticks {ticks} | bank [{fp['bank']}] {len(S)} decision steps, {len(names)} replays | "
@@ -209,7 +246,7 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
     policy = SokuPolicy(obs.dim, H, ticks).to(dev)
-    init_policy_from_corpus(policy, A, BUTTONS[4:10])
+    init_policy_from_corpus(policy, stat_view(A), BUTTONS[4:10])
     reference = copy.deepcopy(policy).eval()
     for p in reference.parameters():
         p.requires_grad_(False)
@@ -222,20 +259,25 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
     ent_floor = EntropyFloor(cfg, dev) if cfg.entropy_floor_frac > 0 else None
     btn_floor = None
     if a.button_tolerance > 0:
-        cr = A.reshape(-1, 20).astype(np.float32)
+        cr = stat_view(A).reshape(-1, 20).astype(np.float32)
         btn_floor = ButtonRateFloor((cr[:, :10].mean(0) + cr[:, 10:].mean(0)) / 2, dev,
                                     tolerance=a.button_tolerance)
 
-    St, Pt, At = (torch.from_numpy(x).to(dev) for x in (S, P, A))
-    off = torch.arange(H, device=dev) - (H - 1)
+    # The bank stays in HOST memory; each update gathers its windows there and ships only those.
+    # Moving the whole bank to the GPU was fine for a few hundred replays and is ~20 GB for the full
+    # corpus -- more than most of Amarel's cards. A batch is 512 starts x `history` rows: tiny.
+    St, Pt, At = (torch.from_numpy(x) for x in (S, P, A))
+    off = torch.arange(H) - (H - 1)
 
     def context(idx: torch.Tensor):
+        """idx: CPU long tensor of window-end rows -> the three context tensors, on the device."""
         w = idx[:, None] + off[None, :]
-        return St[w], Pt[w], At[w[:, :-1]].float()
+        return (St[w].to(dev, non_blocking=True), Pt[w].to(dev, non_blocking=True),
+                At[w[:, :-1]].to(dev).float())
 
     # The yardstick: FIXED starts, drawn from their own seed, identical across runs and resumes.
     eval_idx = torch.from_numpy(np.random.default_rng(12345).choice(
-        starts, size=min(a.eval_starts, len(starts)), replace=False)).to(dev)
+        starts, size=min(a.eval_starts, len(starts)), replace=False))
     eval_ctx = context(eval_idx)
 
     # ---- resume ------------------------------------------------------------------------------
@@ -320,11 +362,11 @@ def _run(a, ap, dev: str, t_start: float, stop: dict) -> int:
             li = league.sample(rng)
             if li is None:
                 kind = "self"               # nothing banked yet: play the current self
-        idx = torch.from_numpy(rng.choice(starts, size=cfg.starts_per_batch)).to(dev)
+        idx = torch.from_numpy(rng.choice(starts, size=cfg.starts_per_batch))
         side = torch.from_numpy(rng.integers(0, 2, cfg.starts_per_batch)).to(dev).long()
         ctx = context(idx)
         if kind == "replay":
-            fut = At[idx[:, None] + torch.arange(cfg.horizon, device=dev)[None, :]]
+            fut = At[idx[:, None] + torch.arange(cfg.horizon)[None, :]].to(dev)
             opponent = ReplayOpponent(fut.float())
         elif kind == "reference":
             opponent = StatePolicyOpponent(reference)

@@ -340,3 +340,41 @@ def test_a_resume_loads_the_checkpoint_to_cpu_whatever_the_training_device(asset
     monkeypatch.setattr(torch, "load", spy)
     assert run(sim, bank, tmp_path / "c", "--steps", "4") == 0
     assert seen == ["cpu"]
+
+
+def test_the_simulators_corpus_cache_serves_as_the_bank(assets, tmp_path):
+    # train_state_dynamics caches the corpus as S, P, A, E, M (+ key): no validity mask, no names.
+    # PPO must train from it as from a bank whose rows are all valid, rather than re-parse the full
+    # corpus (8.6 h on Amarel) into a second copy of the same arrays.
+    sim, bank = assets
+    d = dict(np.load(bank))
+    d["V"] = np.ones_like(d["V"])
+    full = tmp_path / "all_valid.npz"
+    np.savez(full, **d)
+    cache = tmp_path / "sim_corpus.npz"
+    np.savez(cache, S=d["S"], P=d["P"], A=d["A"].astype(np.float32), E=d["E"],
+             M=np.zeros((len(d["S"]), 2), np.float32), key="sim-cache")
+    assert run(sim, full, tmp_path / "bank", "--steps", "3") == 0
+    assert run(sim, cache, tmp_path / "cache", "--steps", "3") == 0
+    a, b = weights(tmp_path / "bank" / "latest.pt"), weights(tmp_path / "cache" / "latest.pt")
+    for k in a["policy"]:
+        assert torch.equal(a["policy"][k], b["policy"][k]), k
+
+
+def test_summary_statistics_from_a_strided_subsample_still_train(assets, tmp_path, monkeypatch):
+    # The full bank is 25.9M steps; its statistics come from <= STAT_ROWS strided rows. Force the
+    # stride on a small bank so that path runs at all in the suite.
+    import scripts.train_state_ppo as tsp
+    sim, bank = assets
+    monkeypatch.setattr(tsp, "STAT_ROWS", 50)
+    assert len(tsp.stat_view(np.zeros(480))) == 48 and len(tsp.stat_view(np.zeros(50))) == 50
+    assert run(sim, bank, tmp_path / "strided", "--steps", "2") == 0
+
+
+def test_buttons_that_are_not_binary_are_refused_not_truncated():
+    from scripts.train_state_ppo import as_buttons
+    A = np.zeros((10, 5, 20), np.float32)
+    assert as_buttons(A).dtype == np.uint8
+    A[7, 2, 3] = 0.5
+    with pytest.raises(SystemExit, match="not 0/1"):
+        as_buttons(A)

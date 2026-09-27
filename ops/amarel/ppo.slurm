@@ -3,7 +3,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32000
+#SBATCH --mem=64000
 #SBATCH --time=12:00:00
 #SBATCH --signal=USR1@300
 #SBATCH --requeue
@@ -13,10 +13,13 @@
 # PPO self-play in imagination on one GPU. Submit from the directory the log should land in:
 #
 #   cd ~/sokubot-runs && sbatch ~/SokuBot/ops/amarel/ppo.slurm \
-#       --sim ~/sokubot-runs/sim/sim.pt --bank ~/sokubot-runs/bank_state.npz \
-#       --out ~/sokubot-runs/ppo-seed0 --seed 0 --steps 20000
+#       --sim ~/sokubot-runs/sim-full-h8-raw/sim.pt --bank ~/sokubot-runs/sim_corpus_full.npz \
+#       --out ~/sokubot-runs/ppo-full-s0 --seed 0 --steps 20000
 #
-# Every argument goes straight to scripts.train_state_ppo.
+# Every argument goes straight to scripts.train_state_ppo. --bank may be the SIMULATOR's corpus
+# cache (sim.slurm's --cache): the same arrays, so the 8.6 h parse is not done twice. MEMORY: the bank
+# is held in host RAM (only batches go to the GPU). The full corpus is 25.9M steps, ~21 GB resident
+# once the buttons are narrowed to uint8, ~31 GB at the peak of the load; hence 64 GB.
 #
 # TIME LIMITS ARE ROUTINE, NOT FAILURES. Five minutes before the limit Slurm sends SIGUSR1 to the
 # srun step; the trainer finishes its step, writes latest.pt and exits 99, and this script requeues

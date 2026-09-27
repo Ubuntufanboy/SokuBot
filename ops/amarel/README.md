@@ -27,7 +27,8 @@ on 2026-09-26 (the box that made the last ones is gone), so the order is:
 2. **Simulator** (GPU) -- `ops/amarel/sim.slurm` -> `scripts.train_state_dynamics`.
 
 3. **PPO self-play** (GPU) -- `ops/amarel/ppo.slurm` -> `scripts.train_state_ppo`. Resumable:
-   time limits requeue the job and it continues where it stopped.
+   time limits requeue the job and it continues where it stopped. Give it the simulator's corpus
+   cache as `--bank` (no second parse); the bank stays in host RAM and only batches go to the GPU.
 
 `ops/amarel/smoke.slurm` exercises stage 3 end to end on a GPU against synthetic stand-ins
 (`scripts/make_smoke_assets.py`), including a deliberate stop, requeue and resume. Run it after any
