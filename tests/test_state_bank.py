@@ -90,3 +90,20 @@ def test_the_simulators_corpus_cache_is_not_reused_once_the_corpus_grows(tmp_pat
     grown = cached_sequences(corpus, 0, SLOTS, SKIP, cache)
     assert "rebuilding" in capsys.readouterr().out
     assert len(set(grown[3].tolist())) == 3
+
+
+def test_a_required_cache_that_does_not_match_stops_instead_of_rebuilding(tmp_path):
+    import pytest
+    from scripts.train_state_dynamics import cached_sequences
+    corpus, cache = tmp_path / "corpus", tmp_path / "cache.npz"
+    for i in range(2):
+        _capture(corpus / "w0" / f"52630{i:02d}-abcdef12", 400)
+    with pytest.raises(SystemExit, match="no cache"):
+        cached_sequences(corpus, 0, SLOTS, SKIP, cache, require=True)
+    first = cached_sequences(corpus, 0, SLOTS, SKIP, cache)
+    assert len(cached_sequences(corpus, 0, SLOTS, SKIP, cache, require=True)[0]) == len(first[0])
+    _capture(corpus / "w1" / "5263099-abcdef12", 400)
+    before = cache.read_bytes()
+    with pytest.raises(SystemExit, match="refusing to re-parse"):
+        cached_sequences(corpus, 0, SLOTS, SKIP, cache, require=True)
+    assert cache.read_bytes() == before

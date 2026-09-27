@@ -128,7 +128,8 @@ def load_sequences(corpus: Path, replays: int, slots: int, skip: int,
 
 
 def cached_sequences(corpus: Path, replays: int, slots: int, skip: int,
-                     cache: Path | None = None, name: str = ""):
+                     cache: Path | None = None, name: str = "",
+                     require: bool = False):
     """`load_sequences` behind a verified cache.
 
     Parsing hundreds of full-rate state CSVs is the slowest and least reliable
@@ -148,7 +149,12 @@ def cached_sequences(corpus: Path, replays: int, slots: int, skip: int,
         if str(d["key"]) == key:
             print(f"  corpus from cache {cache}", flush=True)
             return d["S"], d["P"], d["A"], d["E"], d["M"]
+        if require:
+            raise SystemExit(f"cache key {str(d['key'])!r} != {key!r} and --require-cache is "
+                             f"set: refusing to re-parse and overwrite {cache}")
         print(f"  cache key {str(d['key'])!r} != {key!r}, rebuilding", flush=True)
+    elif require:
+        raise SystemExit(f"--require-cache: no cache at {cache}")
     out = load_sequences(corpus, replays, slots, skip, name)
     if not np.isfinite(out[0]).all():
         raise SystemExit("loaded state contains non-finite values")
@@ -637,6 +643,10 @@ def main() -> int:
                     help="npz holding the parsed corpus, so sibling arms share "
                          "one parse instead of re-rolling the slowest and "
                          "least reliable step in the run")
+    ap.add_argument("--require-cache", action="store_true",
+                    help="stop if --cache is missing or its key does not match the corpus, "
+                         "instead of re-parsing and overwriting it. The full Amarel cache is a "
+                         "29 GB, 8.6 h parse; a retrain over it must never quietly redo that")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(a.seed)
@@ -647,7 +657,7 @@ def main() -> int:
     print(f"  frame_skip {skip} -> one decision step is {skip*1000/60:.0f} ms",
           flush=True)
     S, P, A, E, M = cached_sequences(a.corpus, a.replays, a.slots, skip,
-                                     a.cache, a.name)
+                                     a.cache, a.name, require=a.require_cache)
     # Held-out replays, not held-out frames: consecutive frames are nearly
     # identical, so a frame split would let the model memorise its own val set.
     n_ep = int(E.max()) + 1
