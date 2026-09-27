@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sokubot.data.soku import BUTTONS
 from sokubot.data.state import CH, STATE_CHANNELS
-from sokubot.model.state_dynamics import feed_proj, load_sim
+from sokubot.model.state_dynamics import feed_proj, load_sim, hold_dead
 from sokubot.model.state_head import BINARY
 
 KIN = ("x", "y", "vx", "vy", "dx", "dy")
@@ -111,6 +111,8 @@ def roll(model, s, p, acts, steps, want_latent=False):
         ns, np_ = model(cur_s, cur_p, a)
         nxt = ns[:, -1:].index_copy(
             -1, binr, torch.sigmoid(ns[:, -1:].index_select(-1, binr)))
+        # Its own loop, so it must hold dead channels itself (state_dynamics.hold_dead).
+        nxt = hold_dead(nxt, cur_s[:, -1:], model)
         cur_s = torch.cat([cur_s[:, 1:], nxt], 1)
         cur_p = torch.cat([cur_p[:, 1:],
                            feed_proj(np_[:, -1:], model.proj_feedback)], 1)
