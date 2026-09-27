@@ -71,3 +71,19 @@ def test_the_runners_scratch_directory_is_not_counted_as_a_replay(tmp_path):
     (tmp_path / "corpus" / "w0" / ".work" / "replay").mkdir(parents=True)
     found = state_bank.find_replays([tmp_path / "corpus"], limit=2)
     assert [d.name for d in found] == ["5262777-11111111", "5263014-22222222"]
+
+
+def test_the_simulators_corpus_cache_is_not_reused_once_the_corpus_grows(tmp_path, capsys):
+    """A cache written while the capture was partway done must not serve the finished corpus."""
+    from scripts.train_state_dynamics import cached_sequences
+    corpus, cache = tmp_path / "corpus", tmp_path / "cache.npz"
+    for i in range(2):
+        _capture(corpus / "w0" / f"52630{i:02d}-abcdef12", 400)
+    first = cached_sequences(corpus, 0, SLOTS, SKIP, cache)
+    assert len(set(first[3].tolist())) == 2
+    again = cached_sequences(corpus, 0, SLOTS, SKIP, cache)       # same corpus: served from cache
+    assert "from cache" in capsys.readouterr().out and len(again[0]) == len(first[0])
+    _capture(corpus / "w1" / "5263099-abcdef12", 400)              # the capture finished more
+    grown = cached_sequences(corpus, 0, SLOTS, SKIP, cache)
+    assert "rebuilding" in capsys.readouterr().out
+    assert len(set(grown[3].tolist())) == 3

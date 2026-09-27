@@ -55,6 +55,9 @@ def find_replays(roots: list[Path], limit: int = 0) -> list[Path]:
     Stable because the frame offsets a gym index into are assigned in this
     order, so a bank rebuilt with the directories enumerated differently would
     make every previously saved index point somewhere else.
+
+    `limit` counts DIRECTORIES, not usable replays: a capture that failed leaves a directory with no
+    sidecar, which `build` skips. So `limit=N` can read fewer than N; use 0 (all) when the count matters.
     """
     out: list[Path] = []
     for root in roots:

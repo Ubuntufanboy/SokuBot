@@ -44,6 +44,31 @@ from sokubot.model.state_head import (BINARY, CONTINUOUS, default_pos_weight,
 BUTTONS = ("up", "down", "left", "right", "a", "b", "c", "d", "change", "spell")
 
 
+def replay_dirs(corpus: Path) -> list[Path]:
+    """Candidate replay directories, in the order they are read. Hidden ones (the capture runner's
+    `.work`) are never replays."""
+    dirs = []
+    for w in sorted(corpus.glob("w*")):
+        dirs += [d for d in sorted(w.iterdir()) if d.is_dir() and not d.name.startswith(".")]
+    if not dirs:
+        dirs = [d for d in sorted(corpus.iterdir()) if d.is_dir() and not d.name.startswith(".")]
+    return dirs
+
+
+def corpus_signature(corpus: Path) -> str:
+    """Which replays a parse would read: a hash of the sidecar-bearing directory names.
+
+    The cache key used to be (replays, slots, skip, name) and nothing else, so a cache written while a
+    capture was a quarter done would be handed, silently, to a run over the finished corpus -- same
+    key, a quarter of the data. Listing directories is cheap; parsing them is the slow part.
+    """
+    import hashlib
+    names = [d.parent.name + "/" + d.name for d in replay_dirs(Path(corpus).expanduser())
+             if any((d / f).exists() for f in ("inputs.csv.gz", "inputs.csv", "state.csv.gz",
+                                              "state_s5.csv"))]
+    return f"{len(names)}:" + hashlib.sha256("\n".join(names).encode()).hexdigest()[:12]
+
+
 def load_sequences(corpus: Path, replays: int, slots: int, skip: int,
                    name: str = "") -> tuple[np.ndarray, ...]:
     """-> (state [N,2,C], proj [N,2,K,F], actions [N,ticks,20], ep [N],
@@ -52,11 +77,7 @@ def load_sequences(corpus: Path, replays: int, slots: int, skip: int,
     `move` is the nominal action id, which `read_state` has always returned and
     every consumer has always thrown away.
     """
-    dirs = []
-    for w in sorted(corpus.glob("w*")):
-        dirs += [d for d in sorted(w.iterdir()) if d.is_dir()]
-    if not dirs:
-        dirs = [d for d in sorted(corpus.iterdir()) if d.is_dir()]
+    dirs = replay_dirs(corpus)
 
     S, P, A, E, M = [], [], [], [], []
     kept = 0
@@ -121,7 +142,7 @@ def cached_sequences(corpus: Path, replays: int, slots: int, skip: int,
     memory fault looks exactly like a good one until something consumes it,
     and by then it is the silent input to everything downstream.
     """
-    key = f"{replays}_{slots}_{skip}_{name}"
+    key = f"{replays}_{slots}_{skip}_{name}_{corpus_signature(corpus)}"
     if cache and Path(cache).exists():
         d = np.load(cache)
         if str(d["key"]) == key:
