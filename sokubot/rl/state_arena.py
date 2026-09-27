@@ -212,6 +212,14 @@ class StateArena:
         # symmetrically separates "learned to fight" from "learned to press the
         # button the model does not understand".
         self.button_mask = tuple(button_mask or ())
+        if getattr(sim, "n_moves", 0):
+            # The bank carries no move ids, so there is nothing to seed the move history
+            # with, and StateDynamics refuses to roll without it. Fail here, with the reason,
+            # rather than at the first forward pass of a job that queued for an hour.
+            raise ValueError(
+                "this simulator was trained with move identity (n_moves "
+                f"{sim.n_moves}); the state bank carries no move ids, so the arena cannot "
+                "roll it. Train the simulator with --move-dim 0.")
         self.sim = sim.eval()
         for p in self.sim.parameters():
             p.requires_grad_(False)
@@ -264,6 +272,10 @@ class StateArena:
             opponent.reset()                # replay opponents are stateful
         s_win, p_win, a_win = s_ctx, p_ctx, a_hist
         states, obs_all, mine_all, theirs_all, joint_all = [], [], [], [], []
+        # The opponent's own view, kept only when it is a policy AND both chairs are being
+        # harvested: an update needs the observation each action was chosen from.
+        keep_opp = two_sided and isinstance(opponent, StatePolicyOpponent)
+        obs_opp_all = []
 
         # T+1 predicted states against the T actions that produced the last T
         # of them: the state sequence stays homogeneous (all simulator output,
@@ -280,8 +292,10 @@ class StateArena:
                 # make self-play asymmetric in a way that has nothing to do
                 # with skill: one copy would read "my health" out of the column
                 # holding the other's.
-                theirs = opponent.policy(self.obs(s_win, p_win, 1 - side),
-                                         1 - side, sample=True).actions
+                obs_o = self.obs(s_win, p_win, 1 - side)
+                theirs = opponent.policy(obs_o, 1 - side, sample=True).actions
+                if keep_opp:
+                    obs_opp_all.append(obs_o)
             else:
                 theirs = opponent.act(obs, side)
             theirs = jitter_actions(theirs, cfg.jitter_sigma)
@@ -306,6 +320,10 @@ class StateArena:
                 a_win = torch.cat([a_win[:, 1:], joint[:, None]], dim=1)
 
         seq = torch.stack(states, dim=1)                     # [B, T+1, 2, C]
+        # The observation of the FINAL window, i.e. of states[:, T]. A critic's bootstrap
+        # value belongs to this state; reading it off the last stored observation instead is
+        # one step stale, which is what the GRPO path settles for.
+        obs_last = self.obs(s_win, p_win, side)
         joint_seq = torch.stack(joint_all[1:], dim=1)        # [B, T, ticks, 20]
         reward, alive, terms = compute_rewards(seq, joint_seq, side, cfg.reward)
         out = {"obs": torch.stack(obs_all[1:], dim=1),       # [B, T, H, dim]
@@ -316,7 +334,8 @@ class StateArena:
                "joint": joint_seq,
                "reward": reward, "alive": alive, "terms": terms,
                "states": seq, "side": side,
-               "terminal": terminal_mask(seq, side, cfg.reward)}
+               "terminal": terminal_mask(seq, side, cfg.reward),
+               "obs_last": obs_last}
         if two_sided:
             # One imagined rollout already IS a two-player game -- the
             # simulator is conditioned on both players' twenty buttons -- so
@@ -328,5 +347,9 @@ class StateArena:
                                                     cfg.reward)
             out.update({"mine_opp": torch.stack(theirs_all[1:], dim=1),
                         "reward_opp": r_o, "alive_opp": alive_o,
-                        "terms_opp": terms_o, "side_opp": opp_side})
+                        "terms_opp": terms_o, "side_opp": opp_side,
+                        "terminal_opp": terminal_mask(seq, opp_side, cfg.reward)})
+            if keep_opp:
+                out["obs_opp"] = torch.stack(obs_opp_all[1:], dim=1)
+                out["obs_last_opp"] = self.obs(s_win, p_win, opp_side)
         return out
