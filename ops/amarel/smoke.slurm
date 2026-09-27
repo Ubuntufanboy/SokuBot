@@ -17,7 +17,8 @@
 # run that deliberately stops itself at step 40 and exits 99, so this script requeues it and the
 # second pass must resume from latest.pt and finish. A clean smoke log therefore shows: the unit
 # tests passing on the node, a first pass ending "exit 99 ... requeued", and a second pass
-# "resumed from ... at step 40" ending "done: 80 steps".
+# "resumed from ... at step 40 (..., league 4)" ending "done: 80 steps". First clean run:
+# job 61881960 on an RTX 3090, 2026-09-26, ~3 it/s at 1024 starts on the tiny synthetic sim.
 set -uo pipefail
 cd ~/SokuBot
 OUT=${SMOKE_DIR:-$HOME/sokubot-runs/smoke}
@@ -36,7 +37,8 @@ fi
 # run whose simulator fingerprint changed.
 [ -f "$OUT/sim.pt" ] || $PY -m scripts.make_smoke_assets --out "$OUT" --replays 40 --steps 400
 srun $PY -m scripts.train_state_ppo --sim "$OUT/sim.pt" --bank "$OUT/bank.npz" --out "$OUT/ppo" \
-    --steps 80 --stop-at-step 40 --starts 1024 --eval-every 20 --ckpt-every 20 --device cuda
+    --steps 80 --stop-at-step 40 --starts 1024 --eval-every 20 --ckpt-every 20 \
+    --snapshot-every 10 --device cuda
 rc=$?
 echo "== $(date -Is) trainer exited ${rc}"
 if [ "$rc" -eq 99 ] && [ "${SLURM_RESTART_COUNT:-0}" -lt 3 ]; then
