@@ -54,7 +54,7 @@ import torch
 import torch.nn as nn
 
 from ..data.state import PROJ_FEATURES, STATE_CHANNELS
-from ..model.state_dynamics import feed_proj
+from ..model.state_dynamics import feed_proj, hold_dead
 from ..model.state_head import BINARY
 from .policy import SokuPolicy, jitter_actions, to_joint
 from .state_reward import StateRewardConfig, compute_rewards, terminal_mask
@@ -245,6 +245,7 @@ class StateArena:
         binr = torch.tensor(BINARY, device=ns.device)
         nxt_s = ns[:, -1:].index_copy(
             -1, binr, torch.sigmoid(ns[:, -1:].index_select(-1, binr)))
+        nxt_s = hold_dead(nxt_s, s_win[:, -1:], self.sim)
         return nxt_s, feed_proj(np_[:, -1:], self.proj_feedback)
 
     @torch.no_grad()

@@ -748,6 +748,10 @@ def main() -> int:
             if live_np[j] == 0]
     print(f"  {int(live_np.sum())}/{len(cont_idx)} continuous channels carry "
           f"signal; dropped {dead}", flush=True)
+    # Dropped from the loss means untrained, so the rollout -- this run's unroll
+    # loss included -- holds them instead of feeding their output back
+    # (state_dynamics.hold_dead). Saved as "hold" for every consumer.
+    model.hold = tuple(STATE_CHANNELS.index(n) for n in dead)
     print(f"  delta scale over live channels: min {sc_np[live_np>0].min():.5f} "
           f"max {sc_np[live_np>0].max():.5f}", flush=True)
     rng = np.random.default_rng(a.seed)
@@ -815,7 +819,7 @@ def main() -> int:
                             # Architecture, not bookkeeping: load_sim rebuilds
                             # from these keys, and an absent act_skip silently
                             # reconstructs a DIFFERENT model than was trained.
-                            "act_skip": a.action_skip},
+                            "act_skip": a.action_skip, "hold": dead},
                            a.out / "best_h1.pt")
             # `ticks` goes into sim.pt too. Leaving it out was survivable
             # only because every run so far used the config default; a run
@@ -833,7 +837,7 @@ def main() -> int:
                         "arrival_weight": a.arrival_weight,
                         "act_skip": a.action_skip,
                         "pos_weight_max": a.pos_weight_max,
-                        "horizon_weights": a.horizon_weights},
+                        "horizon_weights": a.horizon_weights, "hold": dead},
                        a.out / "sim.pt")
     print(f"\n-> {a.out}/sim.pt")
     return 0

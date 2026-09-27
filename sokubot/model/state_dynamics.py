@@ -100,6 +100,13 @@ class StateDynamics(nn.Module):
     not a meaningful quantity.
     """
 
+    # Continuous channels the rollout HOLDS at their last value instead of
+    # feeding back the model's prediction: the ones train_state_dynamics found
+    # dead (per-step delta std <= DEAD_STD) and so left out of the loss. Their
+    # residual output is untrained, and feeding it back was the bug: see
+    # `hold_dead`. Set by load_sim from the checkpoint's "hold" names.
+    hold: tuple[int, ...] = ()
+
     def __init__(self, cfg: Config, slots: int = 8, width: int = 384,
                  depth: int = 6, heads: int = 8, history: int = 8,
                  ticks: int | None = None, proj_feedback: str = "sigmoid",
@@ -348,6 +355,14 @@ def load_sim(path, device="cpu") -> tuple[StateDynamics, dict]:
     m.to(device).eval()
     for p in m.parameters():
         p.requires_grad_(False)
+    # Absent in checkpoints written before 2026-09-27: they hold nothing, which
+    # is how they were trained and measured. scripts/stamp_sim_hold.py adds it.
+    hold = list(d.get("hold") or ())
+    unknown = [n for n in hold if n not in STATE_CHANNELS
+               or STATE_CHANNELS.index(n) not in CONTINUOUS]
+    if unknown:
+        raise ValueError(f"{path}: 'hold' names {unknown} are not continuous channels")
+    m.hold = tuple(STATE_CHANNELS.index(n) for n in hold)
     meta = {k: v for k, v in d.items() if k != "model"}
     meta["ticks"] = ticks
     meta["proj_feedback"] = m.proj_feedback
@@ -407,6 +422,29 @@ def rollout(model: StateDynamics, state: torch.Tensor, proj: torch.Tensor,
                         flag_feedback)
 
 
+def hold_dead(nxt: torch.Tensor, last: torch.Tensor, model) -> torch.Tensor:
+    """The predicted next row with the model's `hold` channels copied from `last`.
+
+    A dead channel is excluded from the loss, so its residual head is never
+    trained -- and the rollout fed that output back. On the full-corpus sim the
+    one dead channel, `ax` (always -0.0 in the corpus), came out 3,666 sigma off
+    at step 1. No real row ever carries such a value, so from step 2 the model
+    could tell it was reading its own output, and the flag heads, trained only
+    on real rows, fired: guarding 0.85 against a 5% rate, wrongblock 0.91
+    against 0.9%. Teacher-forcing `ax` alone put every flag back (guarding
+    0.08-0.10) and lifted flag AUC at step 8 from 0.887 to 0.944 (guarding) and
+    0.636 to 0.954 (wrongblock), at a cost of ~0.01 sigma of dx (2026-09-27).
+
+    One function for the training unroll, the evaluation rollout and the PPO
+    arena, like `feed_proj`. `getattr`, because test doubles are plain modules.
+    """
+    hold = getattr(model, "hold", ())
+    if not hold:
+        return nxt
+    h = torch.tensor(hold, device=nxt.device)
+    return nxt.index_copy(-1, h, last.index_select(-1, h))
+
+
 def _unroll_impl(model: StateDynamics, state: torch.Tensor, proj: torch.Tensor,
                  actions: torch.Tensor, steps: int,
                  moves: torch.Tensor | None = None,
@@ -450,7 +488,7 @@ def _unroll_impl(model: StateDynamics, state: torch.Tensor, proj: torch.Tensor,
             soft = soft + ((soft > 0.5).to(soft.dtype) - soft).detach()
         elif flag_feedback == "sample":
             soft = soft + (torch.bernoulli(soft) - soft).detach()
-        nxt = ns[:, -1:].index_copy(-1, binr, soft)
+        nxt = hold_dead(ns[:, -1:].index_copy(-1, binr, soft), s[:, -1:], model)
         s = torch.cat([s[:, 1:], nxt], dim=1)
         p = torch.cat([p[:, 1:], feed_proj(np_[:, -1:], model.proj_feedback)],
                       dim=1)
