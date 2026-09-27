@@ -39,16 +39,19 @@ def test_a_fresh_gzipped_capture_is_read(tmp_path):
     assert A[:, :, 4].sum() > 0                      # the buttons came through too
 
 
-def test_an_uncompressed_capture_is_read(tmp_path):
+def test_a_plain_inputs_csv_is_not_read_it_is_a_failed_or_killed_capture(tmp_path):
+    """The runner gzips a capture only after it passes validation. A plain inputs.csv is what a
+    capture killed mid-replay leaves behind, and must not enter the bank as a (truncated) match."""
     _capture(tmp_path / "corpus" / "w3" / "5262777-12345678", 400, gz=False)
+    _capture(tmp_path / "corpus" / "w3" / "5263014-12345678", 400)
     *_, names = state_bank.build([tmp_path / "corpus"], SKIP, SLOTS, verbose=False)
-    assert names == ["5262777-12345678"]
+    assert names == ["5263014-12345678"]
 
 
 def test_a_buttons_only_inputs_csv_is_still_rejected(tmp_path):
     """Old corpus captures hold only buttons in inputs.csv. They must be skipped, not misread."""
     buttons_only = HEADER[:24]
-    _capture(tmp_path / "corpus" / "old", 400, header=buttons_only)
+    _capture(tmp_path / "corpus" / "old", 400, header=buttons_only)          # gzipped, no state
     _capture(tmp_path / "corpus" / "new", 400)
     *_, names = state_bank.build([tmp_path / "corpus"], SKIP, SLOTS, verbose=False)
     assert names == ["new"]

@@ -83,12 +83,13 @@ def build(roots: list[Path], skip: int, slots: int, replays: int = 0,
     for d in find_replays(roots, replays):
         # A capture aligned to a corpus video carries its state in `state.csv*`; a FRESH capture
         # (runner.collect --no-video, as the Amarel regeneration makes them) carries it inside
-        # `inputs.csv[.gz]`, which is what train_state_dynamics already reads. Without the last two
-        # the PPO bank found no sidecars at all in a capture the simulator trained on happily.
-        # `has_state_columns` below still rejects an old inputs.csv that holds only buttons.
+        # `inputs.csv.gz`, which is what train_state_dynamics reads too. GZIPPED ONLY: the runner
+        # compresses a capture after it passes validation, so a plain `inputs.csv` is a capture that
+        # failed or was killed mid-replay -- 37 of them after the first Amarel array was cancelled.
+        # Reading those fed truncated matches into the bank. `has_state_columns` below still
+        # rejects an old inputs.csv.gz that holds only buttons.
         sc = next((c for c in (d / "state.csv.gz", d / "state.csv",
-                               d / "state_s5.csv", d / "inputs.csv.gz",
-                               d / "inputs.csv") if c.exists()), None)
+                               d / "state_s5.csv", d / "inputs.csv.gz") if c.exists()), None)
         inp = next((c for c in (d / "inputs.csv", d / "inputs.csv.gz")
                     if c.exists()), None)
         if sc is None or inp is None:
