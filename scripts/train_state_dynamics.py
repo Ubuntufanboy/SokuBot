@@ -61,7 +61,9 @@ def load_sequences(corpus: Path, replays: int, slots: int, skip: int,
     S, P, A, E, M = [], [], [], [], []
     kept = 0
     for d in dirs:
-        if kept >= replays:
+        # 0 means ALL, as it does in state_bank.find_replays. Read literally it meant "stop
+        # before the first one", and `--replays 0` trained on nothing.
+        if replays and kept >= replays:
             break
         sc = next((c for c in ([d / name] if name else
                                [d / "state_s5.csv", d / "state.csv.gz",
@@ -522,7 +524,7 @@ def block_gain(model, S, P, A, E, H, device, n=512, horizon=8, seed=0,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--corpus", type=Path, default=Path("~/corpus").expanduser())
-    ap.add_argument("--replays", type=int, default=400)
+    ap.add_argument("--replays", type=int, default=400, help="replay directories to read; 0 = all")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--history", type=int, default=8)

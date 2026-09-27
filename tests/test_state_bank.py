@@ -52,3 +52,13 @@ def test_a_buttons_only_inputs_csv_is_still_rejected(tmp_path):
     _capture(tmp_path / "corpus" / "new", 400)
     *_, names = state_bank.build([tmp_path / "corpus"], SKIP, SLOTS, verbose=False)
     assert names == ["new"]
+
+
+def test_the_simulator_trainer_reads_the_same_captures_and_zero_means_all(tmp_path):
+    """--replays 0 used to read nothing at all (`kept >= 0` stops before the first replay)."""
+    from scripts.train_state_dynamics import load_sequences
+    for i in range(3):
+        _capture(tmp_path / "corpus" / "w0" / f"52630{i:02d}-abcdef12", 400)
+    for limit, want in ((0, 3), (2, 2)):
+        out = load_sequences(tmp_path / "corpus", limit, SLOTS, SKIP)
+        assert len(set(out[3].tolist())) == want, (limit, want)
