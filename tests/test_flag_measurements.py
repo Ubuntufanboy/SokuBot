@@ -3,9 +3,10 @@ read them as such.
 
 Found 2026-09-27: `sim_channel_table` (sigma table and BCE skill) and `train_state_dynamics`
 (`guard_sigma_h*`, `block_gain`) all applied a second sigmoid to `rollout`'s output. That maps every
-"not guarding" to 0.5, so the full-corpus simulator read as predicting guarding at ~0.67 against a
-5% base rate (BCE skill -2.2, 2.3 sigma of error at one step) while its AUC was 0.997, and it
-squashed the BLOCK gate's gain by the sigmoid's slope (~4x).
+"not guarding" to 0.5. At ONE step that was the whole story: the full-corpus sim read BCE skill
+-2.24 / 2.34 sigma, and read correctly it is +0.81 / 0.11 sigma (0.070 predicted vs 0.054 true).
+From step 2 on it was not: read correctly, guarding is ~0.85 against 0.05, which is a real rollout
+pathology the double sigmoid had been masking, not creating.
 """
 from __future__ import annotations
 

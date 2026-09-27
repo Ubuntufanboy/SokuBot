@@ -44,9 +44,10 @@ from sokubot.model.state_head import BINARY, default_pos_weight
 STEPS = (1, 2, 4, 8, 16, 24, 32)
 SHOW = ("guarding", "hp", "x", "dx", "spirit", "airborne", "untech",
         "action_frame", "vx", "combo_hits")
-# Flags, whose head emits logits and whose sigma-error is dominated by
-# calibration rather than by knowledge -- see `flag_skill`.
-FLAGS = ("guarding", "airborne")
+# Every binary channel. They all feed the next step, and wrongblock / crushed /
+# knockdown carry the same pos_weight as guarding, so looking at two of them
+# says nothing about the other three. `rollout` returns them as probabilities.
+FLAGS = tuple(STATE_CHANNELS[i] for i in BINARY)
 
 
 def flag_skill(prob: torch.Tensor, target: torch.Tensor,
@@ -72,7 +73,9 @@ def flag_skill(prob: torch.Tensor, target: torch.Tensor,
     """
     # `rollout` returns the flag it FED BACK -- a probability, not a logit. This used to call
     # binary_cross_entropy_with_logits on it, i.e. a second sigmoid, which maps every "no" to 0.5:
-    # the "-2.26" for fix5 and "~0.45 emitted" above were mostly that, not the model (2026-09-27).
+    # Read correctly (2026-09-27, full-corpus sim) the one-step figure was the artifact -- skill
+    # +0.81, not -2.24 -- but step 2+ is genuinely off (~0.85 predicted vs 0.05). The fix5 numbers
+    # above were taken through the double sigmoid and cannot be split into the two after the fact.
     logit = torch.logit(prob.clamp(1e-6, 1 - 1e-6))
     bce = F.binary_cross_entropy_with_logits(logit, target, reduction="mean")
     b = torch.full_like(logit, float(np.log(base / (1 - base))))

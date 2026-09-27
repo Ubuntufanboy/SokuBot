@@ -390,9 +390,13 @@ def rollout(model: StateDynamics, state: torch.Tensor, proj: torch.Tensor,
 
     THE BINARY CHANNELS COME BACK AS THEY WERE FED BACK, NOT AS LOGITS: a
     probability under "sigmoid" feedback, 0/1 under "hard"/"sample". Applying
-    sigmoid again maps every "no" to 0.5: that is how `guarding` read as 0.67
-    against a 5% base rate for months (found 2026-09-27; see
-    tests/test_flag_measurements.py).
+    sigmoid again maps every "no" to 0.5. Three instruments did, which hid what
+    the flags really do (2026-09-27, tests/test_flag_measurements.py): read
+    correctly, `guarding` on the full-corpus sim is calibrated at step 1 (0.070
+    vs 0.054) and then jumps to ~0.85 against 0.05 from step 2 on, once the
+    model consumes its own output. That part is REAL, and the unroll loss is a
+    suspect: it supervises continuous channels only, so a fed-back flag at step
+    2+ has no loss of its own while gradient still flows through it.
 
     Teacher-forced error is not the number that matters: the policy consumes
     the model's own output, so what has to be measured is what happens when the

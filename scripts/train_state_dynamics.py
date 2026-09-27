@@ -543,7 +543,10 @@ def block_gain(model, S, P, A, E, H, device, n=512, horizon=8, seed=0,
         af[left, :, :, L] = 1.0
         af[~left, :, :, R] = 1.0
         pred = rollout(model, s[:, :H], p[:, :H], af, horizon, mv)
-        # A probability already (see `rollout`); a second sigmoid squashed this gain ~4x.
+        # A probability already (see `rollout`); it used to be sigmoided again. NOTE the gain is
+        # read over 8 rollout steps, and from step 2 the guard channel is inflated (~0.85 vs 0.05 on
+        # the full-corpus sim), so both arms sit near 0.7: a gain inside a broken regime, and not in
+        # the unit of the game's measured +0.564 (arriving attacks blocked).
         res[tag] = float(pred[:, :, 0, CH["guarding"]].mean())
     return {"block_away": res["away"], "block_toward": res["toward"],
             "block_gain": res["away"] - res["toward"], "block_n": len(idx)}
