@@ -102,3 +102,17 @@ def test_undoing_pos_weight_inverts_the_losss_minimiser():
     for w in (1.0, 1.33, 5.0, 50.0):
         q = w * p / (w * p + 1 - p)
         assert torch.allclose(undo_pos_weight(q, w), p, atol=1e-5)
+
+
+def test_corpus_statistics_are_float64_accurate_where_float32_axis0_is_not():
+    # A float32 std(0) adds row by row; with a large offset it drifts well before the full
+    # corpus's 51.8M rows (where hp's std came out x1.20 and combo_rate's x2.41).
+    rng = np.random.default_rng(0)
+    x = (1000.0 + rng.standard_normal((2_000_000, 1, 3))).astype(np.float32)
+    x[..., 1] *= 3.0
+    truth_m = x.reshape(-1, 3).astype(np.float64).mean(0)
+    truth_s = x.reshape(-1, 3).astype(np.float64).std(0)
+    naive = x.reshape(-1, 3).std(0)
+    assert np.abs(naive / truth_s - 1).max() > 0.01         # the old path really is wrong here
+    m, sd = tsd.channel_mean_std(x, chunk=1 << 16)
+    assert np.allclose(m, truth_m, rtol=1e-9) and np.allclose(sd, truth_s, rtol=1e-6)

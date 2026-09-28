@@ -36,7 +36,7 @@ import torch.nn.functional as F
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.train_state_dynamics import cached_sequences
+from scripts.train_state_dynamics import cached_sequences, channel_mean_std
 from sokubot.data.state import STATE_CHANNELS
 from sokubot.model.state_dynamics import index_moves, load_sim, rollout
 from sokubot.model.state_head import BINARY, default_pos_weight
@@ -148,7 +148,10 @@ def main() -> int:
     vm = np.isin(E, list(val_ep))
     # Sigma comes from the WHOLE corpus, not the validation slice, so the unit
     # is the same one the training run reported and the two are comparable.
-    sig = S.reshape(-1, S.shape[-1]).std(0).clip(1e-6)
+    # float64: a float32 std(0) over the full corpus was off by up to 2.4x per
+    # channel (channel_mean_std). Tables printed before 2026-09-27 carry that.
+    ch_mean, sig = channel_mean_std(S)
+    sig = sig.clip(1e-6)
     Sv, Pv, Av, Ev, Mv = S[vm], P[vm], A[vm], E[vm], M[vm]
     print(f"  val {len(Sv)} steps / {len(val_ep)} replays", flush=True)
 
@@ -184,7 +187,7 @@ def main() -> int:
         pw = None if pwmax is None else default_pos_weight().clamp(max=float(pwmax))
         for ch in FLAGS:
             i = STATE_CHANNELS.index(ch)
-            base = float(np.clip(S[:, :, i].mean(), 1e-4, 1 - 1e-4))
+            base = float(np.clip(ch_mean[i], 1e-4, 1 - 1e-4))
             w = None if pw is None else float(pw[list(BINARY).index(i)])
             wts[(name, ch)] = w
             for h in STEPS:

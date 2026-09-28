@@ -266,6 +266,28 @@ def batches(S, P, A, E, H, bs, steps, rng, device, M=None, guard_frac=0.0,
 DEAD_STD = 1e-4
 
 
+def channel_mean_std(S: np.ndarray, chunk: int = 1 << 20) -> tuple[np.ndarray, np.ndarray]:
+    """Per-channel mean and std over every row of S [..., C], accumulated in float64.
+
+    NOT `S.reshape(-1, C).std(0)`. A float32 reduction along axis 0 adds row by
+    row with no pairwise summation, and over the full Amarel corpus (51.8M rows)
+    it was wrong by channel: hp's std x1.20, facing x0.80, airborne x0.81,
+    combo_rate x2.41, and hp's MEAN off by 0.24 (checked against float64,
+    2026-09-27). Every sigma-unit error the channel table printed carried that
+    factor. Chunked, so no float64 copy of the whole array is made.
+    """
+    x = S.reshape(-1, S.shape[-1])
+    n = len(x)
+    tot = np.zeros(x.shape[1])
+    for i in range(0, n, chunk):
+        tot += x[i:i + chunk].sum(0, dtype=np.float64)
+    mean = tot / max(n, 1)
+    sq = np.zeros(x.shape[1])
+    for i in range(0, n, chunk):
+        sq += ((x[i:i + chunk].astype(np.float64) - mean) ** 2).sum(0)
+    return mean, np.sqrt(sq / max(n, 1))
+
+
 def delta_scale(S, E, cont_idx):
     """-> (scale, live_mask) for standardising the continuous loss.
 
@@ -463,8 +485,8 @@ def eval_rollout(model, S, P, A, E, H, horizons, device, n=256, seed=0,
     # leaves under 1% for position, velocity, health and every flag combined.
     # That number reported -5.42 for a model whose kinematic skill at the same
     # horizon was +0.61, and three runs were abandoned or redesigned on it.
-    sc = torch.as_tensor(S[:, :, np.array(CONTINUOUS)].reshape(
-        -1, len(CONTINUOUS)).std(0).clip(1e-6)).to(device)
+    sd = channel_mean_std(S)[1]
+    sc = torch.as_tensor(sd[np.array(CONTINUOUS)].clip(1e-6).astype(np.float32)).to(device)
     names = [STATE_CHANNELS[i] for i in CONTINUOUS]
     KIN = [names.index(x) for x in
            ("dx", "dy", "x", "y", "vx", "vy", "ay") if x in names]
@@ -492,7 +514,7 @@ def eval_rollout(model, S, P, A, E, H, horizons, device, n=256, seed=0,
     # of a variable the model cannot see, and it is invisible inside a mean
     # over 28 channels.
     gi = CH["guarding"]
-    gsig = float(S[:, :, gi].std().clip(1e-6))
+    gsig = float(sd[gi].clip(1e-6))
     for h in horizons:
         # Already a probability: `rollout` returns the flag it fed back, not a logit.
         g_pr = pred[:, h - 1, :, gi]
