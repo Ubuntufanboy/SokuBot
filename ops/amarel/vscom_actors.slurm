@@ -25,8 +25,10 @@ echo "== sfe $(cat ~/sfe/DEPLOYED) | dll $(sha256sum ~/sfe-vscom-dll/SokuFrameEx
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1
 pids=()
 for i in $(seq 0 $((P - 1))); do
+    # Game clones (~22 MB each, hundreds of them across a wide run) go to /scratch, not home.
     ~/venvs/sokubot/bin/python -m scripts.vscom_actor --run-dir "$RUN_DIR" --games "$G" \
         --cpus-per-game "$C" --game-offset $((i * G)) --seed $((S * 100000 + t * 100 + i)) \
+        --work "/scratch/$USER/vscom-work/$(basename "$RUN_DIR")/${t}_$i" \
         > "$RUN_DIR/actor-${SLURM_ARRAY_JOB_ID:-x}_${t}_$i.log" 2>&1 &
     pids+=($!)
     sleep 20          # staggered: simultaneous first launches exit early more often
