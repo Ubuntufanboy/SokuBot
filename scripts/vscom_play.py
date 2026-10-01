@@ -55,21 +55,32 @@ def prepare_game(k: int, a) -> Path:
     subprocess.run([str(a.sfe / "ops/bwrap/clone-game.sh"), str(a.game_base), str(g)],
                    check=True, stdout=subprocess.DEVNULL)
     shutil.copy2(a.dll, g / "modules/SokuFrameExtractor/SokuFrameExtractor.dll")
+    # clone-game.sh hard-links every *.dat, the game's save files included, so all clones and the
+    # base share one inode -- and the game saves with CREATE_ALWAYS, which rewrites that inode in
+    # place. Unchanged after 30+ vs-COM matches (checked 2026-10-01), but config123.dat names the
+    # profiles that decide P1's deck, so each game gets copies of its own.
+    for name in ("config123.dat", "score123.dat", "score123Backup.dat"):
+        f = g / name
+        if f.exists():
+            data = f.read_bytes()
+            f.unlink()
+            f.write_bytes(data)
     return g
 
 
 def game_for(k: int, a, replays: Path) -> VsComGame:
     g = prepare_game(k, a)
+    slot = a.game_offset + k          # node-wide: CPU block and X display must not collide
     prefix = a.local / f"prefix{k}"
     out = a.work / f"out{k}"
     for d in (prefix, out):
         d.mkdir(parents=True, exist_ok=True)
     env = {
         "SFE_GAME": str(g), "SFE_PREFIX": str(prefix), "SFE_OUT": str(out),
-        "SFE_REPLAYS": str(replays), "SFE_CPU_BLOCK": str(k),
+        "SFE_REPLAYS": str(replays), "SFE_CPU_BLOCK": str(slot),
         # The link is TCP to this process, so the sandbox shares the network namespace; each game
         # then needs its own X display block (sfe-bwrap explains the collision this avoids).
-        "SFE_UNSHARE_NET": "0", "SFE_DISPLAY_BASE": str(100 + 20 * k),
+        "SFE_UNSHARE_NET": "0", "SFE_DISPLAY_BASE": str(100 + 20 * slot),
         "SFE_WIRE_KEYMGR": "1",
         "SFE_COM_LEVEL": str(a.level), "SFE_P1_CHAR": str(a.p1_char),
         "SFE_P2_CHAR": str(a.p2_char), "SFE_P1_DECK": str(a.p1_deck),
@@ -199,6 +210,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--p2-char", type=int, default=CIRNO)
     ap.add_argument("--p1-deck", type=int, default=0, help="profile deck slot for P1")
     ap.add_argument("--cpus-per-game", type=int, default=4)
+    ap.add_argument("--game-offset", type=int, default=0,
+                    help="index of this run's first game among all runs sharing the node; each "
+                         "game takes CPU block and X display block (offset + k)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--sfe", type=Path, default=Path("~/sfe").expanduser())
     ap.add_argument("--game-base", type=Path, default=Path("~/sfe-game").expanduser())
