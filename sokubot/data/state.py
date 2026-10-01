@@ -233,19 +233,32 @@ def read_state(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
     filled in.
     """
     with _open(path) as fh:
-        reader = csv.DictReader(fh)
-        cols = reader.fieldnames or []
-        for i in (1, 2):
-            missing = [c for c in (*_PER_PLAYER, *_PROJ_COUNTS)
-                       if f"p{i}_{c}" not in cols]
-            if missing:
-                raise ValueError(
-                    f"{path}: missing state columns for p{i}: {missing[:4]}. "
-                    f"This capture predates the full state sidecar; use "
-                    f"has_state_columns() to skip it, or re-run the capture.")
-        slots = n_proj_slots(cols)
-        has_valid = LABEL_VALID in cols
-        raw = list(reader)
+        return parse_state(fh, str(path))
+
+
+def parse_state(lines, path: str = "<rows>") -> tuple[np.ndarray, np.ndarray, np.ndarray,
+                                                       np.ndarray]:
+    """`read_state` on any iterable of CSV text lines, header first.
+
+    The live vs-COM environment receives the extractor's rows one decision at a
+    time, formatted by the same function that writes the capture CSVs. Parsing
+    them here, through the corpus's own code, keeps the policy's live
+    observations identical to the ones it was trained and evaluated on: a
+    second parser would be a second definition of every channel.
+    """
+    reader = csv.DictReader(lines)
+    cols = reader.fieldnames or []
+    for i in (1, 2):
+        missing = [c for c in (*_PER_PLAYER, *_PROJ_COUNTS)
+                   if f"p{i}_{c}" not in cols]
+        if missing:
+            raise ValueError(
+                f"{path}: missing state columns for p{i}: {missing[:4]}. "
+                f"This capture predates the full state sidecar; use "
+                f"has_state_columns() to skip it, or re-run the capture.")
+    slots = n_proj_slots(cols)
+    has_valid = LABEL_VALID in cols
+    raw = list(reader)
 
     if not raw:
         raise ValueError(f"{path}: no rows")

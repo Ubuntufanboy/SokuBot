@@ -65,6 +65,7 @@ from sokubot.live.memstate import Frame, LiveState, find_game_pid
 from sokubot.live.pad import BUTTONS, VirtualKeypad
 from sokubot.live.status import StatusWriter, fields_from
 from sokubot.rl.policy import SokuPolicy
+from sokubot.rl.policy_io import load_agent
 from sokubot.rl.state_arena import StateObs
 # Reused rather than reimplemented: the recorder finalises the mp4 properly on
 # exit and the FIFO reader survives writers coming and going, both of which
@@ -347,25 +348,6 @@ def describe(ls: LiveState) -> str:
             f"kd {s[CH['knockdown']]:.0f} air {s[CH['airborne']]:.0f} "
             f"hb {s[CH['hitboxes']]*10:.0f} proj {s[CH['proj_n']]*10:.0f}")
     return "\n".join(out)
-
-
-def load_agent(path: Path, device="cpu"):
-    """Policy + its OWN observation normalisation, from the checkpoint.
-
-    The normalisation travels with the weights rather than being recomputed:
-    the policy's input space is defined by the statistics it trained under, and
-    a live reader feeding it differently-scaled numbers is asking it to play a
-    game it has never seen.
-    """
-    ck = torch.load(path, map_location=device, weights_only=False)
-    H, ticks, slots = int(ck["history"]), int(ck["ticks"]), int(ck["slots"])
-    obs = StateObs(np.zeros(33, np.float32), np.ones(33, np.float32),
-                   np.zeros(7, np.float32), np.ones(7, np.float32), slots)
-    obs.load_state_dict(ck["obs"])
-    pol = SokuPolicy(obs.dim, H, ticks)
-    pol.load_state_dict(ck["policy"])
-    pol.eval()
-    return pol, obs, H, ticks, slots, ck
 
 
 def decide(ls, pol, obs, hist, side, H):

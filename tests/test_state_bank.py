@@ -107,3 +107,15 @@ def test_a_required_cache_that_does_not_match_stops_instead_of_rebuilding(tmp_pa
     with pytest.raises(SystemExit, match="refusing to re-parse"):
         cached_sequences(corpus, 0, SLOTS, SKIP, cache, require=True)
     assert cache.read_bytes() == before
+
+
+def test_parse_state_on_streamed_lines_is_read_state_on_the_file(tmp_path):
+    """The live env parses rows as they arrive; it must be the corpus parser, row for row."""
+    import numpy as np
+    from sokubot.data.state import parse_state, read_state
+    _capture(tmp_path / "cap", 120, gz=False)
+    path = tmp_path / "cap" / "inputs.csv"
+    a = read_state(path)
+    b = parse_state(iter(path.read_text().splitlines(keepends=True)), "live")
+    for x, y in zip(a, b):
+        assert np.array_equal(x, y)

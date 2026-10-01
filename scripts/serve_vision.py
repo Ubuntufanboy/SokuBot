@@ -66,7 +66,7 @@ class Session:
 
     def __init__(self, encoder: Path, policy: Path, device: str):
         from sokubot.live.visionstate import VisionState
-        from scripts.play_cheat_match import load_agent
+        from sokubot.rl.policy_io import load_agent
         self.vs = VisionState.load(encoder, device=device)
         self.pol, self.obs, self.H, self.ticks, _slots, ck = load_agent(
             policy, device=device)
