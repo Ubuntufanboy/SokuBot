@@ -92,6 +92,9 @@ def game_for(k: int, a, replays: Path) -> VsComGame:
         # SFE_OUT/<replay id>/ -- one file for all of this game's matches, rounds back to back.
         env["SFE_AGENT_CAPTURE"] = "1"
         env["SFE_MAX_FRAMES"] = str(10 ** 8)
+        # The game is taken down by signal when the session ends, so the video must survive that:
+        # a plain MP4 killed mid-write has no index and will not open.
+        env["SFE_VIDEO_FRAGMENTED"] = "1"
     argv = [str(a.sfe / "ops/bwrap/sfe-bwrap"), "/app/docker/entrypoint.sh",
             "--replay-dir", "/replays", "--out", "/out", "--shard", "0/1",
             "--cpus", str(a.cpus_per_game), "--timeout", "864000", "--min-free-gb", "1",
