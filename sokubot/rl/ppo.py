@@ -227,7 +227,14 @@ def ppo_update(policy: SokuPolicy, critic: StateCritic, opt, critic_opt, batch: 
     if N == 0:
         return {"samples": 0}
     with torch.no_grad():
-        old_logp, _ = policy.log_prob_of(batch["obs"], batch["side"], batch["act"])
+        # `logp_old` is the BEHAVIOUR policy's log-probability, recorded when the action was taken.
+        # The real-game trainer's actors act with weights a few updates behind the learner, so
+        # re-scoring under the current policy would put every ratio at 1 and hide the staleness.
+        # The simulator trainers are on-policy and leave it out.
+        if "logp_old" in batch:
+            old_logp = batch["logp_old"]
+        else:
+            old_logp, _ = policy.log_prob_of(batch["obs"], batch["side"], batch["act"])
         ref_logp, _ = reference.log_prob_of(batch["obs"], batch["side"], batch["act"])
     mb = max(1, N // max(1, cfg.minibatches))
     agg: dict[str, list] = {}
