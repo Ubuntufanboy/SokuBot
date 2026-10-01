@@ -16,6 +16,9 @@
 # shared by every game on the node. Actors are stateless: a task that dies costs its games, nothing
 # else, and resubmitting the array adds them back. They exit when the learner reports DONE.
 set -uo pipefail
+# Clones hard-link the base's .dat archives, which only works on ONE filesystem: the base must
+# live on /scratch with the clones (ops/amarel/README.md: make it once with cp -a ~/sfe-game).
+[ -f "/scratch/$USER/sfe-game-base/th123.exe" ] || { echo "no /scratch/$USER/sfe-game-base"; exit 2; }
 cd ~/SokuBot
 : "${RUN_DIR:?set RUN_DIR}"
 P=${PROCS:-2}; G=${GAMES:-8}; C=${CPG:-2}; S=${SEED:-0}
@@ -29,6 +32,7 @@ for i in $(seq 0 $((P - 1))); do
     ~/venvs/sokubot/bin/python -m scripts.vscom_actor --run-dir "$RUN_DIR" --games "$G" \
         --cpus-per-game "$C" --game-offset $((i * G)) --seed $((S * 100000 + t * 100 + i)) \
         --work "/scratch/$USER/vscom-work/$(basename "$RUN_DIR")/${t}_$i" \
+        --game-base "/scratch/$USER/sfe-game-base" \
         > "$RUN_DIR/actor-${SLURM_ARRAY_JOB_ID:-x}_${t}_$i.log" 2>&1 &
     pids+=($!)
     sleep 20          # staggered: simultaneous first launches exit early more often

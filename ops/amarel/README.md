@@ -36,6 +36,11 @@ change to the trainer, before a real job.
 
 ## Rules that cost something to learn
 
+* **Game clones must share a filesystem with their base.** `clone-game.sh` hard-links the ~2 GB of
+  `.dat` archives; across filesystems it copies them. vs-COM work lives on /scratch, so make the base
+  there once: `cp -a ~/sfe-game /scratch/$USER/sfe-game-base`. Cloning from the home base put ~2 TB
+  on /scratch on 2026-10-01 before the quota stopped it; `vscom_play` now refuses a cross-device clone.
+
 * **Deploy before submitting**, and read the `deployed:` line at the top of the job log. A committed
   change that was never synced runs the old code, silently.
 * **Two seeds** for anything compared (`--seed 0` and `--seed 1`, separate `--out`).

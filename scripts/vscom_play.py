@@ -54,6 +54,15 @@ def prepare_game(k: int, a) -> Path:
     g = a.work / f"game{k}"
     if g.exists():
         shutil.rmtree(g)
+    a.work.mkdir(parents=True, exist_ok=True)
+    # clone-game.sh HARD-LINKS the ~2 GB of .dat archives, and a hard link cannot cross filesystems:
+    # with the base in home and the clone on /scratch it silently copied them instead, ~2 GB a game,
+    # which put ~2 TB on a 96%-full shared filesystem before the quota stopped it (2026-10-01).
+    if os.stat(a.game_base).st_dev != os.stat(a.work).st_dev:
+        raise RuntimeError(f"game base {a.game_base} and work dir {a.work} are on different "
+                           f"filesystems, so every clone would COPY the 2 GB of .dat archives. "
+                           f"Use a base on the work dir's filesystem (e.g. "
+                           f"/scratch/$USER/sfe-game-base for work on /scratch).")
     subprocess.run([str(a.sfe / "ops/bwrap/clone-game.sh"), str(a.game_base), str(g)],
                    check=True, stdout=subprocess.DEVNULL)
     shutil.copy2(a.dll, g / "modules/SokuFrameExtractor/SokuFrameExtractor.dll")

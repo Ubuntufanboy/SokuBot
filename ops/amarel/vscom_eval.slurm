@@ -15,6 +15,9 @@
 #   cd ~/sokubot-runs && PLAN=~/sokubot-runs/vscom-eval/plan.txt OUT=~/sokubot-runs/vscom-eval \
 #       sbatch --array=1-120 ~/SokuBot/ops/amarel/vscom_eval.slurm
 set -uo pipefail
+# Clones hard-link the base's .dat archives, which only works on ONE filesystem: the base must
+# live on /scratch with the clones (ops/amarel/README.md: make it once with cp -a ~/sfe-game).
+[ -f "/scratch/$USER/sfe-game-base/th123.exe" ] || { echo "no /scratch/$USER/sfe-game-base"; exit 2; }
 cd ~/SokuBot
 : "${PLAN:?}"; : "${OUT:?}"
 M=${MATCHES:-10}
@@ -24,4 +27,5 @@ echo "== $(date -Is) $tag on $(hostname) | $(cat DEPLOYED)"
 mkdir -p "$OUT"
 ~/venvs/sokubot/bin/python -m scripts.vscom_play --agent policy --policy "$path" --level "$level" \
     --p2-char "$char" --games 2 --matches "$M" --cpus-per-game 4 \
+    --game-base "/scratch/$USER/sfe-game-base" \
     --work "/scratch/$USER/vscom-eval/$tag" --out "$OUT/$tag.json" 2>&1 | tail -3
