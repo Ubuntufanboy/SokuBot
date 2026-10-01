@@ -84,6 +84,8 @@ def game_for(k: int, a, replays: Path) -> VsComGame:
         "SFE_WIRE_KEYMGR": "1",
         "SFE_COM_LEVEL": str(a.level), "SFE_P1_CHAR": str(a.p1_char),
         "SFE_P2_CHAR": str(a.p2_char), "SFE_P1_DECK": str(a.p1_deck),
+        # Each game its own opponent schedule when the COM's character is random (-1).
+        "SFE_SEED": str(a.seed * 1000 + slot + 1),
     }
     argv = [str(a.sfe / "ops/bwrap/sfe-bwrap"), "/app/docker/entrypoint.sh",
             "--replay-dir", "/replays", "--out", "/out", "--shard", "0/1", "--no-video",
@@ -101,8 +103,9 @@ def make_agent(a, k: int):
 
 
 class Tally:
-    def __init__(self, matches: int, out: Path | None):
+    def __init__(self, matches: int, out: Path | None, seconds: float = 0.0):
         self.lock = threading.Lock()
+        self.deadline = time.monotonic() + seconds if seconds else 0.0
         self.target = matches
         self.matches: list[dict] = []
         self.rounds: list[dict] = []
@@ -113,7 +116,7 @@ class Tally:
 
     def claim_match(self) -> bool:
         with self.lock:
-            if self.started >= self.target:
+            if self.started >= self.target or (self.deadline and time.monotonic() > self.deadline):
                 return False
             self.started += 1
             return True
@@ -132,7 +135,8 @@ class Tally:
             n = len(self.matches)
             w = sum(m["won"] for m in self.matches)
             dt = time.monotonic() - self.t0
-            print(f"  match {n}/{self.target}: {'WIN ' if rec['won'] else 'loss'} "
+            print(f"  match {n}/{self.target} vs char {rec['opponent']:>2}: "
+                  f"{'WIN ' if rec['won'] else 'loss'} "
                   f"{rec['score'][0]}-{rec['score'][1]} p1 hp {rec['p1_hp']:.2f} | "
                   f"won {w}/{n} | {self.decisions / max(dt, 1e-9):.0f} decisions/s", flush=True)
 
@@ -142,7 +146,18 @@ class Tally:
         wins = [x for x in m if x["won"]]
         healthy = sum(x["p1_hp"] >= 0.2 for x in wins)
         rw = sum(r["won"] for r in self.rounds)
+        per_char: dict[int, list[int]] = {}
+        for x in m:
+            c = per_char.setdefault(x["opponent"], [0, 0, 0, 0])
+            c[0] += x["won"]
+            c[1] += 1
+        for r in self.rounds:
+            c = per_char.setdefault(r["opponent"], [0, 0, 0, 0])
+            c[2] += r["won"]
+            c[3] += 1
         return {
+            "per_opponent": {str(k): {"match_wins": v[0], "matches": v[1], "round_wins": v[2],
+                                      "rounds": v[3]} for k, v in sorted(per_char.items())},
             "matches": n, "match_wins": len(wins), "match_win_rate": len(wins) / n if n else None,
             "match_win_ci95": wilson(len(wins), n),
             "wins_with_20pct_hp": healthy,
@@ -178,7 +193,8 @@ def play(k: int, a, replays: Path, tally: Tally, errors: list) -> None:
                     t = env.step(agent.act(t))
                     n += 1
                 won = t.score[0] > start[0]
-                rec = {"game": k, "round": t.round, "won": bool(won), "p1_hp": t.hp_frac[0],
+                rec = {"game": k, "opponent": t.chars[1], "cards": list(link.match[3:5]),
+                       "round": t.round, "won": bool(won), "p1_hp": t.hp_frac[0],
                        "p2_hp": t.hp_frac[1], "decisions": n, "seconds": time.monotonic() - t0,
                        "match_state": t.match_state, "score": list(t.score)}
                 tally.round_done(rec)
@@ -186,7 +202,8 @@ def play(k: int, a, replays: Path, tally: Tally, errors: list) -> None:
                 score = t.score
                 if t.match_state == MATCH_OVER:
                     break
-            tally.match_done({"game": k, "won": score[0] > score[1], "score": list(score),
+            tally.match_done({"game": k, "opponent": match_rounds[-1]["opponent"],
+                              "won": score[0] > score[1], "score": list(score),
                               "p1_hp": match_rounds[-1]["p1_hp"],
                               "rounds": len(match_rounds)})
     except Exception as e:                       # one dead game must not end the run
@@ -207,13 +224,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--matches", type=int, default=20)
     ap.add_argument("--level", type=int, default=3, help="COM difficulty 0-3; 3 is Lunatic")
     ap.add_argument("--p1-char", type=int, default=CIRNO)
-    ap.add_argument("--p2-char", type=int, default=CIRNO)
+    ap.add_argument("--p2-char", type=int, default=CIRNO,
+                    help="the COM's character; -1 draws one of the 20 per match")
     ap.add_argument("--p1-deck", type=int, default=0, help="profile deck slot for P1")
     ap.add_argument("--cpus-per-game", type=int, default=4)
     ap.add_argument("--game-offset", type=int, default=0,
                     help="index of this run's first game among all runs sharing the node; each "
                          "game takes CPU block and X display block (offset + k)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seconds", type=float, default=0.0,
+                    help="start no new match after this long (0: only --matches limits)")
     ap.add_argument("--sfe", type=Path, default=Path("~/sfe").expanduser())
     ap.add_argument("--game-base", type=Path, default=Path("~/sfe-game").expanduser())
     ap.add_argument("--dll", type=Path,
@@ -240,7 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"vs COM: {a.agent}{' ' + str(a.policy) if a.policy else ''} | level {a.level} | "
           f"P1 char {a.p1_char} vs COM char {a.p2_char} | {a.games} games, {a.matches} matches",
           flush=True)
-    tally, errors = Tally(a.matches, a.out), []
+    tally, errors = Tally(a.matches, a.out, a.seconds), []
     threads = [threading.Thread(target=play, args=(k, a, replays, tally, errors), daemon=True)
                for k in range(a.games)]
     for t in threads:

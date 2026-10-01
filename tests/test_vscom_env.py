@@ -62,8 +62,9 @@ class FakeGame(threading.Thread):
     def _play(self) -> None:
         s = socket.create_connection(("127.0.0.1", self.port))
         f = s.makefile("r")
-        self._send(s, f"H 1 16 16 3 {TICKS}")
+        self._send(s, f"H 2 16 -1 3 {TICKS}")
         self._send(s, "C " + ",".join(HEADER))
+        self._send(s, "M 16 7 3 20 20")           # a match vs Yuyuko: no reply expected
         for i in range(self.n):
             self.state(s, f, 2, (0, 0), 10000 - 1000 * i, 100.0 + i)
         self.state(s, f, 3, (0, 1), 0, 150.0)          # P1 KO'd: the round is over
@@ -82,10 +83,11 @@ def make_link():
 
 def test_a_round_ends_on_the_ko_and_every_state_is_answered():
     link, game = make_link()
-    assert link.hello == (1, 16, 16, 3, TICKS) and link.ticks == TICKS
+    assert link.hello == (2, 16, -1, 3, TICKS) and link.ticks == TICKS
     env, agent = VsComEnv(link, timeout=10.0), NeutralAgent(TICKS)
     t = env.reset()
     assert t.fight and t.hp == (10000, 10000)
+    assert t.chars == (16, 7) and link.match == (16, 7, 3, 20, 20)    # from the M line
     n = 0
     while t.fight:
         t = env.step(agent.act(t))

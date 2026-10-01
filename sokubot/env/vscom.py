@@ -32,7 +32,7 @@ import torch
 from sokubot.data.soku import BUTTONS
 from sokubot.data.state import FULL_HP, parse_state
 
-PROTOCOL = 1
+PROTOCOL = 2
 # BattleManager matchState, read off the game in the probe: 0 init, 1 round intro, 2 fight,
 # 3 round over, 5 match over, 6 results. Decisions are only ever asked for during 2.
 FIGHT, ROUND_OVER, MATCH_OVER = 2, 3, 5
@@ -60,6 +60,7 @@ class Tick:
     state: np.ndarray               # [2, C], the corpus's state channels
     proj: np.ndarray                # [2, K, F]
     hp: tuple[int, int]             # raw HP, FULL_HP = full
+    chars: tuple[int, int] = (-1, -1)   # this match's characters, P1 then the COM
 
     @property
     def fight(self) -> bool:
@@ -89,6 +90,9 @@ class AgentLink:
         self.hello: tuple[int, ...] = ()
         self.header = ""
         self._hp_cols: tuple[int, int] = (-1, -1)
+        # The current match, from the game's M line: p1 char, COM char, level, p1 cards, COM cards.
+        self.match: tuple[int, int, int, int, int] = (-1, -1, -1, -1, -1)
+        self.matches_seen = 0
 
     def accept(self, timeout: float, alive=lambda: True) -> None:
         """Wait for the game. `alive()` returning False (the game process died) ends the wait."""
@@ -137,6 +141,10 @@ class AgentLink:
 
     def recv(self, timeout: float = 60.0) -> Tick:
         line = self._line(timeout)
+        while line.startswith("M "):           # a new match: who is playing whom. No reply.
+            self.match = tuple(int(x) for x in line.split()[1:6])
+            self.matches_seen += 1
+            line = self._line(timeout)
         if not line.startswith("S "):
             raise ConnectionError(f"expected a state line, got {line[:40]!r}")
         parts = line.split(" ", 5 + 2 * self.ticks)
@@ -146,7 +154,7 @@ class AgentLink:
         state, proj, _, _ = parse_state([self.header + "\n", row + "\n"], "vscom")
         cells = row.split(",")
         hp = (int(cells[self._hp_cols[0]]), int(cells[self._hp_cols[1]]))
-        return Tick(ms, rnd, (s1, s2), words, state[0], proj[0], hp)
+        return Tick(ms, rnd, (s1, s2), words, state[0], proj[0], hp, self.match[:2])
 
     def send(self, words) -> None:
         assert self._conn is not None, "not connected"
