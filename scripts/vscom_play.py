@@ -18,7 +18,9 @@ import argparse
 import json
 import math
 import os
+import random
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -68,6 +70,29 @@ def prepare_game(k: int, a) -> Path:
     return g
 
 
+def free_display(seed: int) -> int:
+    """An X display number nobody on this NODE is using.
+
+    The link needs the sandbox to share the host's network namespace, and abstract unix sockets --
+    which every X server binds -- are per network namespace. So games in different jobs on one node
+    collide on a display number even though each sandbox has a private /tmp, where the runner looks
+    for lock files: an evaluation grid packed six jobs to a node failed 185 Xvfb starts that way.
+    Test the abstract socket itself, from candidates spread by `seed` (job, slot, process).
+    """
+    rng = random.Random(seed)
+    for _ in range(500):
+        n = rng.randrange(200, 30000)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.bind(f"\0/tmp/.X11-unix/X{n}")
+        except OSError:
+            continue
+        finally:
+            s.close()
+        return n
+    raise RuntimeError("no free X display found")
+
+
 def game_for(k: int, a, replays: Path) -> VsComGame:
     g = prepare_game(k, a)
     slot = a.game_offset + k          # node-wide: CPU block and X display must not collide
@@ -80,7 +105,9 @@ def game_for(k: int, a, replays: Path) -> VsComGame:
         "SFE_REPLAYS": str(replays), "SFE_CPU_BLOCK": str(slot),
         # The link is TCP to this process, so the sandbox shares the network namespace; each game
         # then needs its own X display block (sfe-bwrap explains the collision this avoids).
-        "SFE_UNSHARE_NET": "0", "SFE_DISPLAY_BASE": str(100 + 20 * slot),
+        "SFE_UNSHARE_NET": "0",
+        "SFE_DISPLAY_BASE": str(free_display(
+            hash((os.environ.get("SLURM_JOB_ID", ""), os.getpid(), slot, time.time_ns())))),
         "SFE_WIRE_KEYMGR": "1",
         "SFE_COM_LEVEL": str(a.level), "SFE_P1_CHAR": str(a.p1_char),
         "SFE_P2_CHAR": str(a.p2_char), "SFE_P1_DECK": str(a.p1_deck),
