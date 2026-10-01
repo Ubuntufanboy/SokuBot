@@ -216,12 +216,7 @@ class SokuPolicy(nn.Module):
         parameters that produce them.
         """
         d_lr, d_ud, d_btn = self.distributions(z_hist, side)
-        lr_i = (actions[..., IDX_LEFT] > 0.5).long() + 2 * (actions[..., IDX_RIGHT] > 0.5).long()
-        ud_i = (actions[..., IDX_UP] > 0.5).long() + 2 * (actions[..., IDX_DOWN] > 0.5).long()
-        free = actions[..., list(FREE_BUTTONS)]
-        lp = (d_lr.log_prob(lr_i) + d_ud.log_prob(ud_i)).sum(-1) \
-            + d_btn.log_prob(free).sum((-1, -2))
-        ent = (d_lr.entropy() + d_ud.entropy()).sum(-1) + d_btn.entropy().sum((-1, -2))
+        lp, ent = self._score((d_lr, d_ud, d_btn), actions)
         if not return_rates:
             return lp, ent
         # Same ten-slot order `_assemble` writes: the direction bits come from
@@ -232,6 +227,33 @@ class SokuPolicy(nn.Module):
                              lrp[..., 1].mean(), lrp[..., 2].mean()]
                             + [bp[..., i].mean() for i in range(N_FREE)])
         return lp, ent, rates
+
+
+    @staticmethod
+    def _score(dists, actions: torch.Tensor):
+        """(log-prob, entropy) of stored ten-wide actions under given distributions."""
+        d_lr, d_ud, d_btn = dists
+        lr_i = (actions[..., IDX_LEFT] > 0.5).long() + 2 * (actions[..., IDX_RIGHT] > 0.5).long()
+        ud_i = (actions[..., IDX_UP] > 0.5).long() + 2 * (actions[..., IDX_DOWN] > 0.5).long()
+        free = actions[..., list(FREE_BUTTONS)]
+        lp = (d_lr.log_prob(lr_i) + d_ud.log_prob(ud_i)).sum(-1) \
+            + d_btn.log_prob(free).sum((-1, -2))
+        ent = (d_lr.entropy() + d_ud.entropy()).sum(-1) + d_btn.entropy().sum((-1, -2))
+        return lp, ent
+
+    def act_and_score(self, z_hist: torch.Tensor, side: torch.Tensor, sigma_frames: float,
+                      generator: torch.Generator | None = None):
+        """Sample, jitter, and score the EXECUTED chunk, from one forward pass.
+
+        The same three steps as `forward` + `jitter_actions` + `log_prob_of`, which an actor in
+        the real game pays per decision under one interpreter lock; the second forward was half
+        of it. Returns (executed actions [B, ticks, 10], their log-prob [B]).
+        """
+        dists = self.distributions(z_hist, side)
+        d_lr, d_ud, d_btn = dists
+        act = self._assemble(d_lr.sample(), d_ud.sample(), d_btn.sample())
+        act = jitter_actions(act, sigma_frames, generator=generator)
+        return act, self._score(dists, act)[0]
 
 
 def jitter_actions(actions: torch.Tensor, sigma_frames: float = 1.0,

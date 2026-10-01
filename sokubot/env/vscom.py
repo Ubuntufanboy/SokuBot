@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from sokubot.data.soku import BUTTONS
-from sokubot.data.state import FULL_HP, parse_state
+from sokubot.data.state import FULL_HP, RowParser
 
 PROTOCOL = 2
 # BattleManager matchState, read off the game in the probe: 0 init, 1 round intro, 2 fight,
@@ -136,6 +136,7 @@ class AgentLink:
         if not c.startswith("C "):
             raise ConnectionError(f"expected the CSV header, got {c[:40]!r}")
         self.header = c[2:]
+        self.parser = RowParser(self.header, "vscom")
         cols = self.header.split(",")
         self._hp_cols = (cols.index("p1_hp"), cols.index("p2_hp"))
 
@@ -151,10 +152,10 @@ class AgentLink:
         ms, rnd, s1, s2 = (int(x) for x in parts[1:5])
         words = np.array(parts[5:5 + 2 * self.ticks], dtype=np.uint16).reshape(2, self.ticks)
         row = parts[5 + 2 * self.ticks]
-        state, proj, _, _ = parse_state([self.header + "\n", row + "\n"], "vscom")
+        state, proj = self.parser.parse(row)
         cells = row.split(",")
         hp = (int(cells[self._hp_cols[0]]), int(cells[self._hp_cols[1]]))
-        return Tick(ms, rnd, (s1, s2), words, state[0], proj[0], hp, self.match[:2])
+        return Tick(ms, rnd, (s1, s2), words, state, proj, hp, self.match[:2])
 
     def send(self, words) -> None:
         assert self._conn is not None, "not connected"

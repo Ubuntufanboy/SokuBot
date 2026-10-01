@@ -119,3 +119,16 @@ def test_parse_state_on_streamed_lines_is_read_state_on_the_file(tmp_path):
     b = parse_state(iter(path.read_text().splitlines(keepends=True)), "live")
     for x, y in zip(a, b):
         assert np.array_equal(x, y)
+
+
+def test_the_streaming_row_parser_is_parse_state_row_for_row(tmp_path):
+    """The vs-COM actors' fast parser shares parse_state's channel code; check it on many rows."""
+    import numpy as np
+    from sokubot.data.state import RowParser, parse_state
+    _capture(tmp_path / "cap", 200, gz=False)
+    lines = (tmp_path / "cap" / "inputs.csv").read_text().splitlines()
+    s, p, _, _ = parse_state([l + "\n" for l in lines])
+    rp = RowParser(lines[0])
+    for i, row in enumerate(lines[1:]):
+        a, b = rp.parse(row)
+        assert np.array_equal(a, s[i]) and np.array_equal(b, p[i]), i

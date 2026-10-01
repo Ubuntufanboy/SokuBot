@@ -63,14 +63,44 @@ def test_joint_puts_p1s_ten_buttons_first():
     assert j[0, 0] == 1 and j[0, 19] == 1 and j[0].sum() == 2     # p1 up, p2 spell
 
 
-def test_segments_cut_at_their_length_and_keep_round_ends():
-    b = SegmentBuilder(3)
+def test_segments_cut_at_their_length_keep_round_ends_and_pay_the_outcome_once():
+    cfg = StateRewardConfig()
+    s = round_states(3)
+    joint = np.zeros((TICKS, 20), np.float32)
+    b = SegmentBuilder(3, cfg)
     for i in range(3):
-        b.add(np.full((2, 4), i, np.float32), np.zeros((TICKS, 10)), -1.0, 0.5, i == 1, 7)
+        out = cfg.lose if i == 1 else 0.0
+        b.add(np.full((2, 4), i, np.float32), np.zeros((TICKS, 10)), -1.0, s[i], s[i + 1], joint,
+              out, i == 1, 7)
     assert b.full()
     seg = b.pop(np.zeros((2, 4), np.float32))
     assert seg["obs"].shape == (3, 2, 4) and seg["terminal"].tolist() == [0, 1, 0]
+    want = [step_reward(s[i], s[i + 1], joint, cfg)[0] + (cfg.lose if i == 1 else 0.0)
+            for i in range(3)]
+    assert np.allclose(seg["reward"], want, atol=1e-6)
     assert not b.full() and b.obs == []
+
+
+def test_batched_transition_rewards_are_the_per_step_ones():
+    from sokubot.rl.real_ppo import transition_rewards
+    cfg = StateRewardConfig(combo=0.3)
+    s = round_states(20, seed=3)
+    joint = (np.random.default_rng(2).random((20, TICKS, 20)) < 0.3).astype(np.float32)
+    batch = transition_rewards(s[:-1], s[1:], joint, cfg)
+    one = [step_reward(s[t], s[t + 1], joint[t], cfg)[0] for t in range(20)]
+    assert np.allclose(batch, one, atol=1e-6)
+
+
+def test_one_pass_sampling_scores_exactly_what_log_prob_of_would():
+    torch.manual_seed(0)
+    pol = SokuPolicy(16, 2, TICKS)
+    z = torch.randn(32, 2, 16)
+    side = torch.zeros(32, dtype=torch.long)
+    with torch.no_grad():
+        act, lp = pol.act_and_score(z, side, 1.0, generator=torch.Generator().manual_seed(1))
+        ref, _ = pol.log_prob_of(z, side, act)
+    assert act.shape == (32, TICKS, 10)
+    assert torch.allclose(lp, ref)
 
 
 def test_a_window_pads_a_rounds_start_with_its_first_state():

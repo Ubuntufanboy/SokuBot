@@ -82,6 +82,18 @@ def round_outcome(before: tuple[int, int], after: tuple[int, int],
     return 0.0
 
 
+def transition_rewards(s0: np.ndarray, s1: np.ndarray, joint: np.ndarray,
+                       cfg: StateRewardConfig) -> np.ndarray:
+    """`step_reward` for T transitions at once: s0, s1 [T, 2, C], joint [T, ticks, 20] -> [T].
+    Each transition is its own two-state window, so the batch is exactly T `step_reward` calls;
+    one `compute_rewards` call instead of T is what keeps it off the actor's per-decision path."""
+    no_outcome = dataclasses.replace(cfg, win=0.0, lose=0.0)
+    states = torch.from_numpy(np.stack([s0, s1], axis=1).astype(np.float32))      # [T, 2, 2, C]
+    j = torch.from_numpy(joint.astype(np.float32))[:, None]                       # [T, 1, ticks, 20]
+    total, _, _ = compute_rewards(states, j, torch.zeros(len(s0), dtype=torch.long), no_outcome)
+    return total[:, 0].numpy()
+
+
 def step_reward(s0: np.ndarray, s1: np.ndarray, joint: np.ndarray,
                 cfg: StateRewardConfig) -> tuple[float, dict[str, float]]:
     """Every term of `compute_rewards` but the outcome, for the transition s0 -> s1 under `joint`
@@ -105,21 +117,29 @@ class SegmentBuilder:
     the critic's bootstrap; it is ignored when that step was terminal.
     """
 
-    def __init__(self, length: int):
+    def __init__(self, length: int, cfg: StateRewardConfig | None = None):
         self.length = length
+        self.cfg = cfg or StateRewardConfig()
         self._clear()
 
     def _clear(self) -> None:
-        self.obs, self.act, self.logp, self.reward, self.terminal, self.version = \
-            [], [], [], [], [], []
+        self.obs, self.act, self.logp, self.terminal, self.version = [], [], [], [], []
+        self.s0, self.s1, self.joint, self.outcome = [], [], [], []
         self.rounds: list[dict] = []
 
-    def add(self, obs: np.ndarray, act: np.ndarray, logp: float, reward: float, terminal: bool,
+    def add(self, obs: np.ndarray, act: np.ndarray, logp: float, s0: np.ndarray,
+            s1: np.ndarray, joint: np.ndarray, outcome: float, terminal: bool,
             version: int) -> None:
+        """One decision. The reward is computed at `pop`, for the whole segment in one batch:
+        every term of compute_rewards over s0 -> s1 under `joint`, plus `outcome` (from the
+        score, nonzero only on a round's last step)."""
         self.obs.append(obs)
         self.act.append(act)
         self.logp.append(logp)
-        self.reward.append(reward)
+        self.s0.append(s0)
+        self.s1.append(s1)
+        self.joint.append(joint)
+        self.outcome.append(outcome)
         self.terminal.append(terminal)
         self.version.append(version)
 
@@ -127,10 +147,12 @@ class SegmentBuilder:
         return len(self.obs) >= self.length
 
     def pop(self, obs_last: np.ndarray) -> dict:
+        reward = transition_rewards(np.stack(self.s0), np.stack(self.s1), np.stack(self.joint),
+                                    self.cfg) + np.asarray(self.outcome, np.float32)
         seg = {"obs": np.stack(self.obs).astype(np.float32),          # [T, H, dim]
                "act": np.stack(self.act).astype(np.uint8),            # [T, ticks, 10]
                "logp": np.asarray(self.logp, np.float32),             # [T] behaviour log-probs
-               "reward": np.asarray(self.reward, np.float32),
+               "reward": reward.astype(np.float32),
                "terminal": np.asarray(self.terminal, np.float32),
                "version": np.asarray(self.version, np.int64),
                "obs_last": obs_last.astype(np.float32),               # [H, dim]

@@ -279,6 +279,14 @@ def parse_state(lines, path: str = "<rows>") -> tuple[np.ndarray, np.ndarray, np
     def col(name: str) -> np.ndarray:
         return np.array([r[name] for r in raw], dtype=np.float32)
 
+    valid = (np.array([int(float(r[LABEL_VALID])) for r in raw], dtype=bool)
+             if has_valid else np.ones(n, dtype=bool))
+    return (*_channels(col, n, slots, path), valid)
+
+
+def _channels(col, n: int, slots: int, path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Capture columns -> (state, proj, action), given `col(name)` -> float32 [n]. The whole
+    definition of every channel lives here, once, whatever the rows came from."""
     state = np.zeros((n, 2, len(STATE_CHANNELS)), dtype=np.float32)
     proj = np.zeros((n, 2, slots, len(PROJ_FEATURES)), dtype=np.float32)
     action = np.zeros((n, 2), dtype=np.int32)
@@ -344,29 +352,32 @@ def parse_state(lines, path: str = "<rows>") -> tuple[np.ndarray, np.ndarray, np
 
         # --- this player's objects, relative to who they are flying at -----
         n_live = col(p + "proj_n")
-        tx, ty = x[them], y[them]
-        for k in range(slots):
-            q = f"{p}pr{k}_"
-            present = (n_live > k).astype(np.float32)
-            pdir = col(q + "dir")
-            pdir = np.where(pdir > 0, 1.0, np.where(pdir < 0, -1.0, 0.0))
-            pdx = np.clip((col(q + "x") - tx) / STAGE_SPAN, -POS_CLAMP, POS_CLAMP)
-            pdy = np.clip((col(q + "y") - ty) / STAGE_SPAN, -POS_CLAMP, POS_CLAMP)
-            pvx = np.clip(col(q + "vx") * pdir / VEL_SCALE, -POS_CLAMP, POS_CLAMP)
-            pvy = np.clip(col(q + "vy") / VEL_SCALE, -POS_CLAMP, POS_CLAMP)
-            f = proj[:, me, k]
-            f[:, PF["present"]] = present
-            f[:, PF["dx"]] = pdx * present
-            f[:, PF["dy"]] = pdy * present
-            f[:, PF["vx"]] = pvx * present
-            f[:, PF["vy"]] = pvy * present
-            f[:, PF["hb"]] = (col(q + "hb") > 0).astype(np.float32) * present
-            # Moving toward the target is -sign(dx)*sign(vx): if the target is
-            # to the projectile's left (dx < 0) then closing means vx < 0.
-            f[:, PF["closing"]] = (-np.sign(pdx) * np.sign(pvx)) * present
+        tx, ty = x[them][:, None], y[them][:, None]
+        if slots == 0:
+            continue
 
-    valid = (np.array([int(float(r[LABEL_VALID])) for r in raw], dtype=bool)
-             if has_valid else np.ones(n, dtype=bool))
+        # All slots at once, [n, slots]: elementwise, so the same numbers as one slot at a time,
+        # but ~15 array operations instead of ~15 per slot. A row a decision is what the vs-COM
+        # actors parse, and the per-slot loop was most of it (24 slots: ~4 ms a row).
+        def pcol(field: str) -> np.ndarray:
+            return np.stack([col(f"{p}pr{k}_{field}") for k in range(slots)], axis=1)
+        present = (n_live[:, None] > np.arange(slots)[None, :]).astype(np.float32)
+        pdir = pcol("dir")
+        pdir = np.where(pdir > 0, 1.0, np.where(pdir < 0, -1.0, 0.0))
+        pdx = np.clip((pcol("x") - tx) / STAGE_SPAN, -POS_CLAMP, POS_CLAMP)
+        pdy = np.clip((pcol("y") - ty) / STAGE_SPAN, -POS_CLAMP, POS_CLAMP)
+        pvx = np.clip(pcol("vx") * pdir / VEL_SCALE, -POS_CLAMP, POS_CLAMP)
+        pvy = np.clip(pcol("vy") / VEL_SCALE, -POS_CLAMP, POS_CLAMP)
+        f = proj[:, me]                                        # [n, slots, F]
+        f[:, :, PF["present"]] = present
+        f[:, :, PF["dx"]] = pdx * present
+        f[:, :, PF["dy"]] = pdy * present
+        f[:, :, PF["vx"]] = pvx * present
+        f[:, :, PF["vy"]] = pvy * present
+        f[:, :, PF["hb"]] = (pcol("hb") > 0).astype(np.float32) * present
+        # Moving toward the target is -sign(dx)*sign(vx): if the target is
+        # to the projectile's left (dx < 0) then closing means vx < 0.
+        f[:, :, PF["closing"]] = (-np.sign(pdx) * np.sign(pvx)) * present
 
     # `dx` is the channel that would expose a wrong position offset, and it is
     # checked rather than trusted: a stage is about 1200 units across, so a
@@ -379,7 +390,39 @@ def parse_state(lines, path: str = "<rows>") -> tuple[np.ndarray, np.ndarray, np
             f"{path}: dx spans [{lo:.2f}, {hi:.2f}] in stage widths, which is "
             f"not a position. Check CHAR_POSITION_X_OFFSET against the game "
             f"build before trusting any of these labels.")
-    return state, proj, action, valid
+    return state, proj, action
+
+
+class RowParser:
+    """`parse_state` for one row at a time, for a stream with a fixed header.
+
+    The vs-COM actors parse a row per decision, and through DictReader that was ~4 ms of the ~10 ms
+    an actor spends per decision under one interpreter lock. This splits the row ONCE into a float32
+    array -- the same `np.array(..., dtype=np.float32)` conversion `parse_state` applies to each
+    column -- and hands `_channels` views of it, so the channels come from the very same code.
+    """
+
+    def __init__(self, header: str, path: str = "<stream>"):
+        cols = header.strip().split(",")
+        for i in (1, 2):
+            missing = [c for c in (*_PER_PLAYER, *_PROJ_COUNTS) if f"p{i}_{c}" not in cols]
+            if missing:
+                raise ValueError(f"{path}: missing state columns for p{i}: {missing[:4]}")
+        self.index = {c: i for i, c in enumerate(cols)}
+        self.width = len(cols)
+        self.slots = n_proj_slots(cols)
+        self.path = path
+
+    def parse(self, row: str) -> tuple[np.ndarray, np.ndarray]:
+        """-> (state [2, C], proj [2, slots, F]) for one row."""
+        cells = row.strip().split(",")
+        if len(cells) != self.width:
+            raise ValueError(f"{self.path}: row has {len(cells)} fields, header {self.width}")
+        arr = np.array(cells, dtype=np.float32)
+        idx = self.index
+        state, proj, _ = _channels(lambda name: arr[idx[name]:idx[name] + 1], 1, self.slots,
+                                   self.path)
+        return state[0], proj[0]
 
 
 # --- the camera, and the world -> screen map it makes possible --------------

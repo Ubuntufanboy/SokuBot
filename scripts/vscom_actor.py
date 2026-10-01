@@ -30,9 +30,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sokubot.env.vscom import MATCH_OVER, VsComEnv, buttons_to_words
-from sokubot.rl.policy import SokuPolicy, jitter_actions
+from sokubot.rl.policy import SokuPolicy
 from sokubot.rl.real_ppo import (PROTOCOL, SegmentBuilder, Window, joint_from_words, recv_msg,
-                                 round_outcome, send_msg, step_reward)
+                                 round_outcome, send_msg)
 from sokubot.rl.state_arena import StateObs
 
 
@@ -152,9 +152,7 @@ def sample(pol: SokuPolicy, o: np.ndarray, sigma: float, gen: torch.Generator):
     side = torch.zeros(1, dtype=torch.long)
     x = torch.from_numpy(o)[None]
     with torch.no_grad():
-        out = pol(x, side, sample=True)
-        act = jitter_actions(out.actions, sigma, generator=gen)
-        lp, _ = pol.log_prob_of(x, side, act)
+        act, lp = pol.act_and_score(x, side, sigma, generator=gen)
     return act[0].numpy().astype(np.uint8), float(lp[0])
 
 
@@ -171,7 +169,7 @@ def play_game(k: int, client: LearnerClient, make_game, seed: int, stats: dict) 
         try:
             game = make_game(k)
             env = VsComEnv(game.start(), timeout=120.0)
-            builder = SegmentBuilder(meta["segment"])
+            builder = SegmentBuilder(meta["segment"], cfg)
             win = Window(meta["history"], meta["slots"])
             failures = 0
             while not client.stop.is_set():
@@ -183,12 +181,11 @@ def play_game(k: int, client: LearnerClient, make_game, seed: int, stats: dict) 
                     version, pol = client.current
                     act, lp = sample(pol, o, meta["jitter_sigma"], gen)
                     t2 = env.step(buttons_to_words(act))
-                    r, _ = step_reward(t.state, t2.state, joint_from_words(t2.words), cfg)
                     terminal = not t2.fight
                     n += 1
+                    out = 0.0
                     if terminal:
                         out = round_outcome(start, t2.score, cfg)
-                        r += out
                         builder.rounds.append({
                             "opponent": int(t2.chars[1]), "won": out > 0, "lost": out < 0,
                             "p1_hp": t2.hp_frac[0], "p2_hp": t2.hp_frac[1], "decisions": n,
@@ -198,7 +195,8 @@ def play_game(k: int, client: LearnerClient, make_game, seed: int, stats: dict) 
                         o_next = o                     # unused: the step is terminal
                     else:
                         o_next = observe(client.obs, *win.push(t2))
-                    builder.add(o, act, lp, r, terminal, version)
+                    builder.add(o, act, lp, t.state, t2.state, joint_from_words(t2.words),
+                                out, terminal, version)
                     if builder.full():
                         client.put(builder.pop(o_next))
                     stats["decisions"] += 1
