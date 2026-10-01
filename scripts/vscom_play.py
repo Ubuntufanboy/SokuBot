@@ -87,10 +87,15 @@ def game_for(k: int, a, replays: Path) -> VsComGame:
         # Each game its own opponent schedule when the COM's character is random (-1).
         "SFE_SEED": str(a.seed * 1000 + slot + 1),
     }
+    if a.capture or a.video:
+        # Record the matches: the capture CSV of every tick (and the video with --video), in
+        # SFE_OUT/<replay id>/ -- one file for all of this game's matches, rounds back to back.
+        env["SFE_AGENT_CAPTURE"] = "1"
+        env["SFE_MAX_FRAMES"] = str(10 ** 8)
     argv = [str(a.sfe / "ops/bwrap/sfe-bwrap"), "/app/docker/entrypoint.sh",
-            "--replay-dir", "/replays", "--out", "/out", "--shard", "0/1", "--no-video",
+            "--replay-dir", "/replays", "--out", "/out", "--shard", "0/1",
             "--cpus", str(a.cpus_per_game), "--timeout", "864000", "--min-free-gb", "1",
-            "--limit", "1"]
+            "--limit", "1"] + ([] if a.video else ["--no-video"])
     return VsComGame(argv, env, log_path=a.work / f"game{k}.log")
 
 
@@ -232,6 +237,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="index of this run's first game among all runs sharing the node; each "
                          "game takes CPU block and X display block (offset + k)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--capture", action="store_true",
+                    help="record every tick's capture row (work/out<k>/<id>/inputs.csv*)")
+    ap.add_argument("--video", action="store_true", help="also record video.mp4 (implies --capture)")
     ap.add_argument("--seconds", type=float, default=0.0,
                     help="start no new match after this long (0: only --matches limits)")
     ap.add_argument("--sfe", type=Path, default=Path("~/sfe").expanduser())
